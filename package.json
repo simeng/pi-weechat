@@ -1,0 +1,13 @@
+{
+  "name": "pi-weechat",
+  "version": "0.1.0",
+  "description": "Mirror pi agent output/input through a WeeChat buffer via a local Unix socket",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
