@@ -54,14 +54,13 @@ non-blocking fd APIs (`hook_fd` on WeeChat, `node:net` on pi).
 
 | type             | payload                          | meaning                                        |
 |------------------|----------------------------------|------------------------------------------------|
-| `hello`          | `{protocol, name, version}`      | handshake                                      |
-| `status`         | `{state, detail?}`               | state ∈ idle / thinking / tool / error; drives buffer title + status line |
-| `assistant_delta`| `{msgId, text}`                  | streaming token chunk (from `message_update`)  |
-| `assistant_end`  | `{msgId, text?}`                 | final assistant message (replaces buffered stream) |
+| `hello`          | `{protocol, name}`               | handshake                                      |
+| `status`         | `{state, detail?}`               | state ∈ idle / thinking / tool:\<name\> / error; drives buffer title + status line |
+| `assistant_line` | `{msgId, text}`                  | one **complete line** of assistant text. Pi accumulates the `message_update` deltas locally and flushes each line as soon as it is complete (WeeChat has no partial-line redraw, so raw token deltas are meaningless to it) |
+| `assistant_flush`| `{msgId}`                        | this assistant message is done; drop any partial tail state on the WeeChat side |
 | `user_echo`      | `{text}`                         | user prompt as accepted by pi (mirror back if input originated in the pi terminal) |
 | `tool_start`     | `{toolCallId, toolName, args}`   | from `tool_execution_start`                    |
-| `tool_update`    | `{toolCallId, partialResult?}`   | from `tool_execution_update` (throttled)       |
-| `tool_end`       | `{toolCallId, isError, output}`  | from `tool_execution_end`; `output` chunked if > 8 KiB |
+| `tool_end`       | `{toolCallId, isError, output}`  | from `tool_execution_end`; `output` truncated at a whole-line boundary if > 8 KiB (… \\"N more characters truncated\\") |
 | `session_info`   | `{name?, model?, cwd}`           | on `session_start` / `model_select` / `session_info_changed` |
 | `error`          | `{code, message}`                | protocol or runtime error                      |
 | `ping`           | `{ts}`                           | keepalive every 30 s (WeeChat answers with pong) |
@@ -72,7 +71,7 @@ non-blocking fd APIs (`hook_fd` on WeeChat, `node:net` on pi).
 |-------------|----------------------------------|------------------------------------------------|
 | `hello`     | as above                         | handshake                                      |
 | `user_input`| `{text, deliverAs?}`             | typed line; `deliverAs` ∈ undefined (normal), `"steer"` (`!s ...` prefix → mid-stream steering), `"followUp"` (`!q ...`) |
-| `command`   | `{name}`                         | name ∈ `new_session`, `compact`, `abort`, `reload`; mapped to pi session controls from a registered extension command handler (never called from event handlers, to avoid deadlock) |
+| `command`   | `{name}`                         | name ∈ `new_session`, `compact`, `abort`, `status`, `model`; `abort` runs `ctx.abort()` directly (safe from event handlers), the rest are routed through a registered extension command handler so session-control methods run in the safe command context |
 | `pong`      | `{ts}`                           | keepalive response                             |
 
 Buffer-local commands typed in the WeeChat buffer (all start with `!` so they
@@ -83,8 +82,8 @@ never reach the LLM):
 - `!new`       — new session (`ctx.newSession()`)
 - `!compact`   — compaction (`ctx.compact()`)
 - `!abort`     — abort current turn (`ctx.abort()`)
-- `!model`     — print available scoped models; `!model <provider/id>` selects
-- `!status`    — force a status refresh (session file, model, context usage)
+- `!model`     — list available scoped models; `!model <provider/id>` routes to pi's built-in `/model`
+- `!status`    — force a status refresh (session file, model)
 
 ## 3. WeeChat side — `weechat/pi_bridge.py`
 
@@ -118,16 +117,14 @@ Design:
   dispatch on `type`. Partial reads wait for more data (return `RC_OK`).
 - **Writer:** `sendall()` is safe enough at these volumes; if the socket ever
   becomes writable-blocked, queue and re-send via `hook_fd` write flag.
-- **Rendering** (`buffer_print` with WeeChat color tags):
-  - `assistant_delta`: append to a "current stream" line using
-    `buffer_set(buf, "clear_last_line", "1")` + reprint, or print deltas as
-    short segments and rely on buffer scroll. (Decision: segment printing —
-    simpler, no flicker, matches how pi's own TUI streams.)
-  - `tool_start`: dim line `⚙ tool_name(arg summary)`; `tool_end`:
-    green/red prefix + first N lines of output, remainder as "… (k more lines)".
-  - `status`: update buffer `title` (`pi: idle`, `pi: thinking…`,
-    `pi: tool: bash`) and print a dim separator on transitions.
-  - `session_info`: one bold line with cwd + model.
+- **Rendering** (one `weechat.prnt(buf, "\t\t" + text)` per line; the
+  `\t\t` prefix suppresses timestamp/numbering; color tags for roles):
+  - `assistant_line`: print as-is (default color), one buffer line each.
+  - `tool_start`: blue line `⚙ tool_name {args…}`; `tool_end`:
+    green ✔ / red ✘ prefix + dim indented output lines.
+  - `status`: update buffer `title` (`pi: (idle)`, `pi: (thinking…)`,
+    `pi: (tool: bash)`, `pi: (disconnected — waiting for pi)`).
+  - `session_info`: one cyan line with cwd + model + session name.
 - **Connection state in the buffer title:** `(idle)`, `(thinking…)`,
   `(tool: X)`, `(disconnected — waiting for pi)`.
 - **Cleanup:** on close callback / WeeChat quit, unhook fd, unlink socket file.
@@ -161,9 +158,9 @@ Structure (single file is fine at this size; split if it grows):
   | pi event              | emits                                   |
   |-----------------------|------------------------------------------|
   | `session_start`       | connect + `session_info` + `status{idle}`|
-  | `message_update`      | `assistant_delta` (throttle ~30 ms batches) |
+  | `message_update`      | `assistant_line` (deltas assembled locally; each completed line flushed immediately) + `assistant_flush` at message end |
   | `message_end`         | `assistant_end` / tool result text       |
-  | `tool_execution_*`    | `tool_start` / `tool_update`(throttled)/ `tool_end` |
+  | `tool_execution_*`    | `tool_start` / `tool_end` (output truncated at 8 KiB, whole-line boundary) |
   | `agent_start`/`agent_settled` | `status{thinking}` / `status{idle}` |
   | `model_select`, `session_info_changed` | `session_info`          |
   | `input` (source ≠ "extension") | `user_echo` (mirror prompts typed in the pi terminal itself, so both surfaces stay in sync) |
@@ -187,8 +184,9 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 
 - All pi→WeeChat messages for a single assistant turn are sent in event order;
   WeeChat renders in arrival order, so no sequence numbers needed (v1).
-- Streaming deltas are batched on the pi side (flush every ~30 ms or 2 KiB) to
-  keep WeeChat's redrawing cheap.
+- Streaming text is flushed per completed line on the pi side: line
+  boundaries are natural flush points, so no timer batching is needed and
+  WeeChat's redrawing stays cheap.
 - Tool output > 8 KiB is truncated for display but chunked intact if the
   WeeChat side later requests it (`!tool <id>` → fetch full output; v2).
 - If pi reconnects mid-turn, WeeChat prints a `— reconnected —` separator and
@@ -213,18 +211,18 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 
 ## 8. Milestones
 
-1. **M0 — protocol spike (½ day):** both sides stubbed; pi prints, weechat
-   echoes; NDJSON + hello over the unix socket. ✅ done when typing in the
-   buffer shows up as a pi notification and vice versa.
-2. **M1 — output mirroring (1 day):** all pi→WeeChat message types; streaming
-   deltas, tool lines, status/title updates; reconnect logic on pi side.
-3. **M2 — input path (½ day):** `user_input` → `sendUserMessage`, `!s`/`!q`
-   steer/followUp, echo-loop suppression via `event.source`.
-4. **M3 — commands + polish (½ day):** `!new`/`!compact`/`!abort`/`!status`/
-   `!model`, ping/pong, truncation rules, colors.
-5. **M4 — packaging (½ day):** `pi install /path/to/pi-weechat` works; weechat
-   script install instructions in README; publish to npm with
-   `"pi-package"` keyword for the pi.dev gallery.
+1. **M0 — protocol spike:** both sides stubbed; pi prints, weechat echoes;
+   NDJSON + hello over the unix socket. ✅
+2. **M1 — output mirroring:** all pi→WeeChat message types; line-based
+   streaming, tool lines, status/title updates; reconnect logic on pi side.
+   ✅
+3. **M2 — input path:** `user_input` → `sendUserMessage`, `!s`/`!q`
+   steer/followUp, echo of terminal-typed prompts via `event.source`. ✅
+4. **M3 — commands + polish:** `!new`/`!compact`/`!abort`/`!status`/
+   `!model`, ping/pong, truncation rules, colors. ✅
+5. **M4 — packaging:** `pi install /path/to/pi-weechat` works; weechat script
+   install instructions in README. ✅ (npm publish for the pi.dev gallery:
+   optional follow-up.)
 
 ## 9. Repo layout
 
@@ -232,13 +230,19 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 pi-weechat/
 ├── PLAN.md                  # this file
 ├── README.md                # install + usage
-├── package.json             # pi package manifest
+├── package.json             # pi package manifest ("pi-package" keyword)
+├── tsconfig.json            # typecheck only (noEmit)
+├── lib/
+│   └── codec.mjs            # shared NDJSON codec + protocol constants
 ├── extensions/
 │   └── weechat-bridge.ts    # pi extension (socket client + mirroring)
 ├── weechat/
 │   └── pi_bridge.py         # WeeChat script (socket server + buffer)
 └── test/
-    └── protocol.test.mjs    # NDJSON codec + handshake unit tests
+    ├── protocol.test.mjs    # codec unit tests + extension end-to-end (mock peer)
+    ├── smoke_weechat.py     # weechat script smoke test (stub weechat module, stdlib only)
+    ├── py_driver.py         # stdin/stdout driver used by the integration test
+    └── integration.test.mjs # REAL extension ↔ REAL weechat script over a live socket
 ```
 
 ## 10. Open questions

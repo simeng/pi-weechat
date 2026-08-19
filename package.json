@@ -1,13 +1,28 @@
 {
   "name": "pi-weechat",
+  "type": "module",
   "version": "0.1.0",
   "description": "Mirror pi agent output/input through a WeeChat buffer via a local Unix socket",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
+  "scripts": {
+    "test": "node --experimental-strip-types --test \"test/*.test.mjs\" && python3 test/smoke_weechat.py",
+    "test:js": "node --experimental-strip-types --test \"test/*.test.mjs\"",
+    "test:py": "python3 test/smoke_weechat.py",
+    "typecheck": "tsc -p tsconfig.json"
+  },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
   }
 }
