@@ -371,7 +371,11 @@ export default function weechatBridge(pi: ExtensionAPI) {
     // flush complete lines as they form
     const nl = cur.indexOf("\n");
     if (nl !== -1) {
-      send({ type, msgId: currentMsgId, text: cur.slice(0, nl) });
+      const line = cur.slice(0, nl);
+      // blank lines are paragraph separators in text but pure noise in thinking
+      if (line.trim() || type === "assistant_line") {
+        send({ type, msgId: currentMsgId, text: line });
+      }
       bufs.set(key, cur.slice(nl + 1));
     }
   }
