@@ -73,15 +73,57 @@ def _color(name):
         return ""
 
 
-# Colors (binary codes; C_PI empty = buffer default foreground)
-C_USER = _color("white")
-C_PI = ""
-C_TOOL = _color("blue")
-C_STATUS = _color("cyan")
-C_ERR = _color("red")
-C_OK = _color("green")
-C_DIM = _color("darkgray")
+def _theme(theme_name, fallback):
+    """Binary color code for a *theme* color name (weechat.conf [color]).
+
+    `theme_name` is one of the colors defined in the [color] section of
+    weechat.conf — the user's theme, changeable live with /color. WeeChat's
+    weechat.color() accepts those names directly and returns a reference the
+    display layer resolves at render time, so the buffer follows whatever
+    palette the user configured. If the name is not defined (other WeeChat
+    versions, minimal configs), fall back to a fixed palette color; outside
+    WeeChat everything resolves to "".
+    """
+    return _color(theme_name) or _color(fallback)
+
+
+# Colors: (theme name from weechat.conf [color], palette fallback).
+# Fallbacks mirror the 4.x default theme values for each role.
+C_USER = _theme("chat_nick_self", "white")          # user's own input lines
+C_PI = _theme("chat", "")                           # assistant text (default fg)
+C_TOOL = _theme("chat_prefix_network", "magenta")   # tool activity lines
+C_STATUS = _theme("chat_value", "cyan")             # info lines (session, modes)
+C_ERR = _theme("chat_prefix_error", "yellow")       # errors
+C_OK = _theme("chat_status_enabled", "green")       # successes
+C_DIM = _theme("separator", "236")                  # dim output / thinking
 R = _color("reset")
+
+# Per-tool summary of tool_start args: the "main content" of each tool's
+# argument struct, in display order (see format_tool_args).
+TOOL_ARG_KEYS = {
+    "bash": ("command",),
+    "read": ("path",),
+    "write": ("path", "content"),
+    "edit": ("path",),  # + edit count, handled in format_tool_args
+    "memory_write": ("target", "content"),
+    "memory_read": ("target",),
+    "memory_search": ("query",),
+    "memory_forget": ("match",),
+    "scratchpad": ("action", "text"),
+    "todo": ("action", "subject"),
+    "web_search": ("query",),
+    "web_fetch": ("url",),
+}
+ARG_VALUE_LIMIT = 300  # clip a single arg value beyond this many characters
+
+
+def _clip(value, limit=ARG_VALUE_LIMIT):
+    """Single-line, length-limited rendering of one arg value."""
+    s = " ".join(str(value).split())  # newlines/indent → single spaces
+    if len(s) > limit:
+        return s[:limit].rstrip() + "…(+%d)" % (len(s) - limit)
+    return s
+
 
 # Tool output display mode (pi_bridge.tool_output option)
 TOOL_OUTPUT_MODES = ("full", "summary", "off")
@@ -377,14 +419,9 @@ class Bridge(object):
             return  # lines already complete; nothing to render
         if t == "tool_start":
             name = msg.get("toolName", "?")
-            args = msg.get("args") or {}
-            summary = ""
-            try:
-                s = json.dumps(args, separators=(",", ":"))
-                summary = (" " + s[:120] + "…") if len(s) > 120 else (" " + s if s and s != "{}" else "")
-            except (TypeError, ValueError):
-                pass
-            self._print(C_TOOL + "⚙ " + name + C_DIM + summary + R)
+            summary = format_tool_args(name, msg.get("args") or {})
+            self._print(C_TOOL + "⚙ " + name + C_DIM +
+                        (" " + summary if summary else "") + R)
             return
         if t == "tool_end":
             ok = not msg.get("isError")
@@ -514,6 +551,53 @@ class Bridge(object):
             pass
 
 
+def format_tool_args(name, args):
+    """Human-oriented summary of a tool call's args (one line).
+
+    Known tools show their main content (bash: command, edit: path + number
+    of edits, memory_write: target + content, …); unknown tools get compact
+    key=value pairs. Values longer than ARG_VALUE_LIMIT characters are
+    clipped with an "…(+N)" marker. Returns "" when there is nothing to show.
+    """
+    if not isinstance(args, dict) or not args:
+        return ""
+    parts = []
+    keys = TOOL_ARG_KEYS.get(name)
+    if keys:
+        for key in keys:
+            value = args.get(key)
+            if value is None or value == "":
+                continue
+            parts.append(_clip(value))
+        if name == "edit":
+            edits = args.get("edits")
+            if isinstance(edits, list):
+                n = len(edits)
+                parts.append("%d edit%s" % (n, "" if n == 1 else "s"))
+    else:
+        # unknown tool: scalar key=value pairs (values clipped harder), with
+        # compact JSON as a last resort for struct-only args
+        rendered = []
+        for key, value in args.items():
+            if isinstance(value, str) and value != "":
+                rendered.append("%s=%s" % (key, _clip(value, 120)))
+            elif isinstance(value, (int, float)):
+                rendered.append("%s=%s" % (key, value))
+            if len(rendered) >= 3:
+                break
+        if rendered:
+            parts.extend(rendered)
+            if len(args) > 3:
+                parts.append("…")
+        else:
+            try:
+                parts.append(_clip(
+                    json.dumps(args, separators=(",", ":"), default=str), 200))
+            except (TypeError, ValueError):
+                return ""
+    return " ".join(parts)
+
+
 BRIDGE = Bridge()
 
 
@@ -555,7 +639,7 @@ def pi_shutdown_cb():
 
 def main():
     dbg("main(): loading (sock=%s, debug=%s)" % (default_socket_path(), bool(_DBG_PATH)))
-    weechat.register("pi_bridge", "simeng", "0.2.0", "MIT",
+    weechat.register("pi_bridge", "simeng", "0.3.0", "MIT",
                      "mirror a pi coding agent session through a WeeChat buffer",
                      "pi_shutdown_cb", "")
     # plugin options (auto-created on first run; /set pi_bridge.<name> …)

@@ -39,8 +39,11 @@ class WeechatStub:
 
     # -- colors / plugin options -----------------------------------------
     def color(self, name):
-        # tests run without a WeeChat display: binary codes are empty strings
-        return ""
+        # Emulate weechat.color(): palette names → marker codes; theme names
+        # ([color] section of weechat.conf) are undefined in the test env,
+        # so the bridge's palette fallbacks are exercised end-to-end.
+        return {"white": "W", "magenta": "M", "cyan": "C",
+                "yellow": "E", "green": "G", "236": "D"}.get(name, "")
 
     def config_is_set_plugin(self, name):
         return name in self.plugin_opts
@@ -174,6 +177,11 @@ def main():
           "args": {"command": "ls"}})
     send({"type": "tool_end", "toolCallId": "t1", "isError": False,
           "output": "a.txt\nb.txt"})
+    # tool_start arg summaries: main content per tool, clipped at 300 chars
+    send({"type": "tool_start", "toolCallId": "t4", "toolName": "memory_write",
+          "args": {"target": "long_term", "content": "remembered fact"}})
+    send({"type": "tool_start", "toolCallId": "t5", "toolName": "bash",
+          "args": {"command": "echo " + "z" * 400}})
     pump_and_drain()
 
     def plain():
@@ -190,7 +198,45 @@ def main():
     assert "Hello from pi" in text, "assistant line missing"
     assert "bash" in text and "ls" in text, "tool start missing"
     assert "a.txt" in text and "b.txt" in text, "tool output missing"
+    assert "long_term remembered fact" in text, \
+        "memory_write args must show target + content"
+    assert "…(+105)" in text, \
+        "long bash commands must be clipped (405 - 300 = 105 more chars)"
     assert stub.title == "pi: (thinking…)", stub.title
+
+    # ------------------------------------------------- arg summary unit test
+    fmt = ns["format_tool_args"]
+    assert fmt("bash", {"command": "ls -la"}) == "ls -la"
+    assert fmt("bash", {"command": "a\nb\nc"}) == "a b c", \
+        "multi-line values are flattened to one line"
+    long_cmd = "echo " + "x" * 500
+    out = fmt("bash", {"command": long_cmd})
+    assert out.startswith("echo x") and out.endswith("…(+205)"), out[-20:]
+    assert fmt("edit", {"path": "/tmp/x.py",
+                        "edits": [{"oldText": "a", "newText": "b"},
+                                  {"oldText": "c", "newText": "d"}]}) \
+        == "/tmp/x.py 2 edits"
+    assert fmt("memory_read", {"target": "daily", "date": "2026-08-21"}) \
+        == "daily"
+    assert fmt("memory_search", {"query": "weechat colors", "mode": "deep"}) \
+        == "weechat colors"
+    out = fmt("memory_write", {"target": "long_term",
+                               "content": "#decision\n" + "y" * 400})
+    assert out.startswith("long_term #decision y") and out.endswith("…(+110)"), \
+        out[-20:]
+    out = fmt("custom_tool", {"a": "1", "b": "x" * 200, "c": [1, 2], "d": "z"})
+    assert out.startswith("a=1 b=" + "x" * 120) and out.endswith("d=z …"), \
+        "unknown tools get compact k=v pairs (strings clipped at 120)"
+    assert fmt("bash", {}) == "" and fmt("bash", None) == "" and \
+        fmt("bash", {"command": ""}) == "", "empty args → no summary"
+
+    # _theme: a defined theme name wins over the palette fallback
+    stub.color = lambda name: ("T" if name in ("chat", "chat_nick_self")
+                               else {"white": "W", "cyan": "C"}.get(name, ""))
+    assert ns["_theme"]("chat_nick_self", "white") == "T", \
+        "theme names must take precedence over palette fallbacks"
+    assert ns["_theme"]("no_such_name", "white") == "W", \
+        "undefined theme names fall back to the palette color"
 
     # weechat → pi: user input over the wire
     ns["pi_input_cb"]("", "buffer", "hello from weechat")

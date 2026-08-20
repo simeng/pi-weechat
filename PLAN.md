@@ -123,12 +123,23 @@ Design:
   becomes writable-blocked, queue and re-send via `hook_fd` write flag.
 - **Colors:** built with `weechat.color(name)` (binary codes), NOT legacy
   `"color:xxx"` text tags — WeeChat 4.x prints those literally. Empty string
-  = buffer default foreground.
+  = buffer default foreground. Colors use the user's *theme*: names from the
+  `[color]` section of weechat.conf (changeable live with `/color`), resolved
+  at render time; each has a palette fallback mirroring the 4.x theme default.
+  Role → theme name: user input `chat_nick_self`, assistant text `chat`,
+  tool lines `chat_prefix_network`, info/status `chat_value`, errors
+  `chat_prefix_error`, success `chat_status_enabled`, dim output/thinking
+  `separator` (see `_theme()` in pi_bridge.py).
 - **Rendering** (one `weechat.prnt(buf, "\t\t" + text)` per line; the
   `\t\t` prefix suppresses timestamp/numbering): 
   - `assistant_line`: print as-is (default color), one buffer line each.
-  - `tool_start`: blue line `⚙ tool_name {args…}`; `tool_end`:
-    green ✔ / red ✘ prefix + dim indented output lines, filtered by the
+  - `tool_start`: `⚙ tool_name <summary>` where `<summary>` is the main
+    content of the args struct, per tool (`format_tool_args()`): bash→
+    command, read/write→path (+content), edit→path + edit count,
+    memory_write→target + content, memory_search→query, … unknown tools get
+    compact `k=v` pairs. Values are flattened to one line and clipped at
+    300 chars with an `…(+N)` marker.
+  - `tool_end`: green ✔ / red ✘ prefix + dim indented output lines, filtered by the
     `pi_bridge.tool_output` option (`full` | `summary` | `off`; default
     `summary` = first 3 + last 3 lines with `… (N more lines)` in between).
 - **Hook lifecycle:** every `hook_fd` handle (listen, client read, write) is

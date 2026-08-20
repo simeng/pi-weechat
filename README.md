@@ -59,7 +59,10 @@ listens on the socket. In a running WeeChat:
 Open the `pi` buffer:
 
 - **Output**: assistant messages stream in as whole lines; tool calls show as
-  `⚙ name {args}` with indented results (`✔` ok / `✘` error); the buffer title
+  `⚙ name` + the main content of the call (bash: command, read/write: path,
+  edit: path + edit count, memory tools: target/query/content — long values
+  are clipped at 300 chars with a `…(+N)` marker), with indented results
+  (`✔` ok / `✘` error); the buffer title
   tracks state — `(idle)`, `(thinking…)`, `(tool: bash)` — and shows
   `(disconnected — waiting for pi)` when pi is not connected.
 - **Input**: type a line and press enter to send it as a prompt to pi. Plain
@@ -103,8 +106,13 @@ file is created `0700`; only local users who can read/write it can connect.
 - Tool output is truncated to ~8 KiB per result (whole-line boundary, pi side)
   and can be further filtered in the buffer: `/set pi_bridge.tool_output
 full|summary|off` (default `summary`) or `!tools <mode>` from the buffer.
-- Colors use WeeChat's binary color codes (`weechat.color()`); legacy text tags
-  like `color:cyan` are not interpreted by WeeChat 4.x and would print literally.
+- Colors follow your **WeeChat theme**: the bridge uses color names from the
+  `[color]` section of weechat.conf (`chat_nick_self`, `chat_value`,
+  `chat_prefix_error`, …) via `weechat.color()`, so `/color chat_value red`
+  restyles the buffer too. Each role has a palette fallback for WeeChat
+  versions where a name is missing (mapping in `_theme()` in
+  `weechat/pi_bridge.py`). Legacy text tags like `color:cyan` are NOT used —
+  WeeChat 4.x would print them literally.
 
 ### Debugging the wire
 
