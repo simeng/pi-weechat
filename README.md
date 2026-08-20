@@ -2,10 +2,16 @@
 
 Mirror a [pi](https://pi.dev) coding agent session into a WeeChat buffer — and type back at pi — over a local Unix socket.
 
-- **WeeChat side**: Python script that creates a `pi` buffer and serves an NDJSON protocol on a Unix socket (the *server*).
-- **pi side**: TypeScript extension installed as a pi package; connects as *client*, mirrors assistant output / tool calls / status into the buffer, and forwards lines you type back to pi as user input.
+- **WeeChat side**: Python script that creates a `pi` buffer and serves an NDJSON protocol on a Unix socket (the _server_).
+- **pi side**: TypeScript extension installed as a pi package; connects as _client_, mirrors assistant output / tool calls / status into the buffer, and forwards lines you type back to pi as user input.
 
 Architecture and wire protocol: [PLAN.md](./PLAN.md).
+
+## Screenshots
+
+![Used in Glowing Bear](./pi-weechat1.jpg)
+![View from weechat with commands](./pi-weechat2.png)
+![View from weechat with tool output and thinking](./pi-weechat3.png)
 
 ## Layout
 
@@ -96,7 +102,7 @@ file is created `0700`; only local users who can read/write it can connect.
   the extension batches token deltas and flushes completed lines.
 - Tool output is truncated to ~8 KiB per result (whole-line boundary, pi side)
   and can be further filtered in the buffer: `/set pi_bridge.tool_output
-  full|summary|off` (default `summary`) or `!tools <mode>` from the buffer.
+full|summary|off` (default `summary`) or `!tools <mode>` from the buffer.
 - Colors use WeeChat's binary color codes (`weechat.color()`); legacy text tags
   like `color:cyan` are not interpreted by WeeChat 4.x and would print literally.
 
