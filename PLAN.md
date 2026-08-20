@@ -83,7 +83,7 @@ never reach the LLM):
 - `!new`       — new session (`ctx.newSession()`)
 - `!compact`   — compaction (`ctx.compact()`)
 - `!abort`     — abort current turn (`ctx.abort()`)
-- `!model`     — list available scoped models; `!model <provider/id>` selects via `pi.setModel()`
+- `!model`     — list available models (scoped via `ctx.scopedModels` when scoping is configured, else the full catalogue via `ctx.modelRegistry.getAvailable()` — mirrors pi's `/model`); `!model <provider/id>` selects via `pi.setModel()`
 - `!status`    — force a status refresh (session file, model)
 - `!tools [full|summary|off]` — tool output verbosity in the buffer (`pi_bridge.tool_output`)
 - `!think [on|off]`           — show/hide thinking lines (`pi_bridge.thinking`, default off)
@@ -194,7 +194,8 @@ Structure (single file is fine at this size; split if it grows):
   commands throw "cannot be queued"). With it on, commands execute immediately,
   even mid-stream.
 - **Model selection:** `!model <provider/id>` is handled by the weechat-ctl
-  command: the id is matched against `ctx.model` + `ctx.scopedModels` and applied
+  command: the id is matched against `ctx.model` + `ctx.scopedModels` (or the full catalogue via
+  `ctx.modelRegistry.getAvailable()` when no scoping is configured) and applied
   with `pi.setModel(model)` (`model_select` re-sends `session_info`).
 - **Keepalive:** 30 s ping; drop and reconnect if no pong for 90 s.
 

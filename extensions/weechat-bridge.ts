@@ -510,13 +510,19 @@ export default function weechatBridge(pi: ExtensionAPI) {
             send({ type: "status", state: ctx.isIdle() ? "idle" : "thinking" });
             return;
           case "model": {
-            const models = ctx.scopedModels ?? [];
+            // Mirror the TUI /model behavior: scoped models when scoping is
+            // configured, otherwise the full available catalogue.
+            const scoped: readonly any[] = ctx.scopedModels ?? [];
+            const models: any[] =
+              scoped.length > 0
+                ? scoped.map((m: any) => m.model).filter(Boolean)
+                : (ctx.modelRegistry?.getAvailable?.() ?? []);
             if (arg) {
               // !model provider/id → select via pi.setModel()
               const want = arg;
               const candidates: any[] = [
                 ...(ctx.model ? [ctx.model] : []),
-                ...models.map((m: any) => m.model).filter(Boolean),
+                ...models,
               ];
               const found = candidates.find(
                 (m) => `${m.provider}/${m.id}` === want || m.id === want,
@@ -554,13 +560,16 @@ export default function weechatBridge(pi: ExtensionAPI) {
               return;
             }
             if (models.length === 0) {
-              send({ type: "assistant_line", msgId: 0, text: "(no scoped models)" });
+              send({ type: "assistant_line", msgId: 0, text: "(no available models)" });
             } else {
               for (const m of models) {
+                const label = `${m.provider ?? ""}/${m.id ?? "?"}`;
+                const current =
+                  ctx.model && m.id === ctx.model.id && m.provider === ctx.model.provider;
                 send({
                   type: "assistant_line",
                   msgId: 0,
-                  text: `model: ${m.model?.provider ?? ""}/${m.model?.id ?? "?"}`,
+                  text: `model: ${label}${current ? "  (current)" : ""}`,
                 });
               }
             }

@@ -66,7 +66,7 @@ Open the `pi` buffer:
   - `!compact` — compact the session
   - `!abort` — abort the current run
   - `!status` — resend session info (works even mid-turn)
-  - `!model` — list available scoped models; `!model <provider/model>` switches model
+  - `!model` — list available models (scoped models if model scoping is configured, otherwise the full catalogue — same as pi's `/model`); `!model <provider/model>` switches model
   - `!tools [full|summary|off]` — tool output verbosity in the buffer
     (`summary` is the default: first/last 3 lines, middle elided like a smart
     filter; also settable via `/set pi_bridge.tool_output …`)
