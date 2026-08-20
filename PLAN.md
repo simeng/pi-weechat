@@ -57,6 +57,7 @@ non-blocking fd APIs (`hook_fd` on WeeChat, `node:net` on pi).
 | `hello`          | `{protocol, name}`               | handshake                                      |
 | `status`         | `{state, detail?}`               | state ∈ idle / thinking / tool:\<name\> / error; drives buffer title + status line |
 | `assistant_line` | `{msgId, text}`                  | one **complete line** of assistant text. Pi accumulates the `message_update` deltas locally and flushes each line as soon as it is complete (WeeChat has no partial-line redraw, so raw token deltas are meaningless to it) |
+| `thinking_line`  | `{msgId, text}`                  | one **complete line** of assistant *thinking* (reasoning models). Assembled from `thinking_*` deltas exactly like `assistant_line`; the WeeChat side renders it only when `pi_bridge.thinking = on` (`!think`) and drops it otherwise |
 | `assistant_flush`| `{msgId}`                        | this assistant message is done; drop any partial tail state on the WeeChat side |
 | `user_echo`      | `{text}`                         | user prompt as accepted by pi (mirror back if input originated in the pi terminal) |
 | `tool_start`     | `{toolCallId, toolName, args}`   | from `tool_execution_start`                    |
@@ -70,8 +71,8 @@ non-blocking fd APIs (`hook_fd` on WeeChat, `node:net` on pi).
 | type        | payload                          | meaning                                        |
 |-------------|----------------------------------|------------------------------------------------|
 | `hello`     | as above                         | handshake                                      |
-| `user_input`| `{text, deliverAs?}`             | typed line; `deliverAs` ∈ undefined (normal), `"steer"` (`!s ...` prefix → mid-stream steering), `"followUp"` (`!q ...`) |
-| `command`   | `{name}`                         | name ∈ `new_session`, `compact`, `abort`, `status`, `model`; `abort` runs `ctx.abort()` directly (safe from event handlers), the rest are routed through a registered extension command handler so session-control methods run in the safe command context |
+| `user_input`| `{text, deliverAs?}`             | typed line; `deliverAs` ∈ undefined (normal), `"steer"` (`!s ...` prefix → mid-stream steering), `"followUp"` (`!q ...`). The pi side fills in `"followUp"` for plain input that arrives while a turn is running, so nothing is dropped |
+| `command`   | `{name, arg?}`                   | name ∈ `new_session`, `compact`, `abort`, `status`, `model`; `arg` carries the optional argument (e.g. model id for `model`). `abort` runs `ctx.abort()` directly (safe from event handlers); the rest are routed through a registered extension command (`/weechat-ctl <name> [arg]`) sent with `expandPromptTemplates: true` so it executes immediately — even mid-stream |
 | `pong`      | `{ts}`                           | keepalive response                             |
 
 Buffer-local commands typed in the WeeChat buffer (all start with `!` so they
@@ -82,8 +83,11 @@ never reach the LLM):
 - `!new`       — new session (`ctx.newSession()`)
 - `!compact`   — compaction (`ctx.compact()`)
 - `!abort`     — abort current turn (`ctx.abort()`)
-- `!model`     — list available scoped models; `!model <provider/id>` routes to pi's built-in `/model`
+- `!model`     — list available scoped models; `!model <provider/id>` selects via `pi.setModel()`
 - `!status`    — force a status refresh (session file, model)
+- `!tools [full|summary|off]` — tool output verbosity in the buffer (`pi_bridge.tool_output`)
+- `!think [on|off]`           — show/hide thinking lines (`pi_bridge.thinking`, default off)
+- `!help` / `?`               — print this command list (answered locally, never reaches pi)
 
 ## 3. WeeChat side — `weechat/pi_bridge.py`
 
@@ -117,11 +121,20 @@ Design:
   dispatch on `type`. Partial reads wait for more data (return `RC_OK`).
 - **Writer:** `sendall()` is safe enough at these volumes; if the socket ever
   becomes writable-blocked, queue and re-send via `hook_fd` write flag.
+- **Colors:** built with `weechat.color(name)` (binary codes), NOT legacy
+  `"color:xxx"` text tags — WeeChat 4.x prints those literally. Empty string
+  = buffer default foreground.
 - **Rendering** (one `weechat.prnt(buf, "\t\t" + text)` per line; the
-  `\t\t` prefix suppresses timestamp/numbering; color tags for roles):
+  `\t\t` prefix suppresses timestamp/numbering): 
   - `assistant_line`: print as-is (default color), one buffer line each.
   - `tool_start`: blue line `⚙ tool_name {args…}`; `tool_end`:
-    green ✔ / red ✘ prefix + dim indented output lines.
+    green ✔ / red ✘ prefix + dim indented output lines, filtered by the
+    `pi_bridge.tool_output` option (`full` | `summary` | `off`; default
+    `summary` = first 3 + last 3 lines with `… (N more lines)` in between).
+- **Hook lifecycle:** every `hook_fd` handle (listen, client read, write) is
+  stored and unhooked on disconnect — stale hooks make WeeChat poll closed fds
+  ("Bad file descriptor used in hook_fd") and double-fire when fd numbers are
+  reused by the next client.
   - `status`: update buffer `title` (`pi: (idle)`, `pi: (thinking…)`,
     `pi: (tool: bash)`, `pi: (disconnected — waiting for pi)`).
   - `session_info`: one cyan line with cwd + model + session name.
@@ -165,13 +178,24 @@ Structure (single file is fine at this size; split if it grows):
   | `model_select`, `session_info_changed` | `session_info`          |
   | `input` (source ≠ "extension") | `user_echo` (mirror prompts typed in the pi terminal itself, so both surfaces stay in sync) |
 - **Input handling:** on `user_input`, call
-  `pi.sendUserMessage(text, { deliverAs })`. Because injected messages arrive
-  back at pi with `event.source === "extension"`, the `input` handler skips
-  them for `user_echo` — no echo loops.
+  `pi.sendUserMessage(text, { deliverAs })`. Plain input that arrives while a
+  turn is streaming (`agent_start` without `agent_settled`) gets
+  `deliverAs: "followUp"` — otherwise pi's `prompt()` throws "Agent is already
+  processing" and the message would vanish with no error visible in WeeChat.
+  Because injected messages arrive back at pi with
+  `event.source === "extension"`, the `input` handler skips them for
+  `user_echo` — no echo loops.
 - **Commands:** on `command`, route to a registered extension command's handler
-  (`pi.registerCommand("weechat:ctl", ...)` whose `ExtensionCommandContext` has
-  `newSession` / `compact` / `abort`). Commands run outside event handlers so
-  session-control calls can't deadlock.
+  (`pi.registerCommand("weechat-ctl", ...)` whose `ExtensionCommandContext` has
+  `newSession` / `compact` / `abort`) via `sendUserMessage("/weechat-ctl …",
+  { expandPromptTemplates: true })`. That flag is load-bearing: the default
+  (`false`) skips extension-command dispatch entirely, so the slash text would
+  be sent to the LLM as a literal prompt (and `followUp`-queued extension
+  commands throw "cannot be queued"). With it on, commands execute immediately,
+  even mid-stream.
+- **Model selection:** `!model <provider/id>` is handled by the weechat-ctl
+  command: the id is matched against `ctx.model` + `ctx.scopedModels` and applied
+  with `pi.setModel(model)` (`model_select` re-sends `session_info`).
 - **Keepalive:** 30 s ping; drop and reconnect if no pong for 90 s.
 
 ### Mode note
@@ -205,9 +229,8 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 
 | setting              | where                          | default                             |
 |----------------------|--------------------------------|-------------------------------------|
-| `pi_bridge.socket`   | WeeChat option                 | `$XDG_RUNTIME_DIR/pi-weechat.sock`  |
-| `pi_bridge.show_tools`| WeeChat option                | `on`                                |
-| socket path          | pi extension: `PI_WEECHAT_SOCK` env or `.pi/settings.json` extension setting | same as above |
+| `pi_bridge.tool_output` | WeeChat option (`/set pi_bridge.tool_output full\|summary\|off`, or `!tools <mode>` in the buffer) | `summary` |
+| socket path          | pi extension: `PI_WEECHAT_SOCK` env or `.pi/settings.json` extension setting; weechat side: same env / XDG dirs | `$XDG_RUNTIME_DIR/pi-weechat.sock` |
 
 ## 8. Milestones
 

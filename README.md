@@ -56,14 +56,23 @@ Open the `pi` buffer:
   `⚙ name {args}` with indented results (`✔` ok / `✘` error); the buffer title
   tracks state — `(idle)`, `(thinking…)`, `(tool: bash)` — and shows
   `(disconnected — waiting for pi)` when pi is not connected.
-- **Input**: type a line and press enter to send it as a prompt to pi.
+- **Input**: type a line and press enter to send it as a prompt to pi. Plain
+  messages typed while a turn is running are queued as follow-ups (delivered
+  when pi settles) instead of being dropped.
+  - `!help` — list all buffer commands (answered locally, never reaches the LLM)
   - `!s <text>` — steer the current run (interrupts, injects)
   - `!q <text>` — queue a follow-up message for after the current turn
   - `!new` — new session
   - `!compact` — compact the session
   - `!abort` — abort the current run
-  - `!status` / `!model` — resend session info / list scoped models
-  - `!model <provider/model>` — switch model (routes to pi's `/model`)
+  - `!status` — resend session info (works even mid-turn)
+  - `!model` — list available scoped models; `!model <provider/model>` switches model
+  - `!tools [full|summary|off]` — tool output verbosity in the buffer
+    (`summary` is the default: first/last 3 lines, middle elided like a smart
+    filter; also settable via `/set pi_bridge.tool_output …`)
+  - `!think [on|off]` — show/hide the model's thinking lines (rendered dim,
+    prefixed with 💭). Off by default; also settable via
+    `/set pi_bridge.thinking on`
 - Prompts you type directly in pi's own terminal are echoed into the buffer too,
   so both surfaces stay in sync.
 
@@ -85,9 +94,24 @@ file is created `0700`; only local users who can read/write it can connect.
   (`client_already_connected`). Multi-session multiplexing is on the roadmap (PLAN §10).
 - Assistant text is rendered in whole lines (WeeChat has no partial-line redraw);
   the extension batches token deltas and flushes completed lines.
-- Tool output is truncated to ~8 KiB per result (whole-line boundary) to keep
-  buffers readable.
-- WeeChat config options (`/set`) are a v2 item; v1 uses constants + env var.
+- Tool output is truncated to ~8 KiB per result (whole-line boundary, pi side)
+  and can be further filtered in the buffer: `/set pi_bridge.tool_output
+  full|summary|off` (default `summary`) or `!tools <mode>` from the buffer.
+- Colors use WeeChat's binary color codes (`weechat.color()`); legacy text tags
+  like `color:cyan` are not interpreted by WeeChat 4.x and would print literally.
+
+### Debugging the wire
+
+Enable a detailed NDJSON wire log on **both** sides at once:
+
+```sh
+touch $XDG_RUNTIME_DIR/pi-weechat.debug   # default: /run/user/UID/pi-weechat.debug
+```
+
+Then reload both sides (`/python reload pi_bridge` in WeeChat, `/reload` in pi).
+Every connection event and every message in both directions is appended to that
+file (auto-rotates at ~1 MiB). Remove the file and reload to disable, or point
+`PI_BRIDGE_DEBUG=/path/to/log` at an explicit file instead (per side).
 
 ## Development
 

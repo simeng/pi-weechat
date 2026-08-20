@@ -35,6 +35,22 @@ class WeechatStub:
         self.fd_hooks = {}        # callback name -> [fd, read, write]
         self.buffer_name = None
         self.registered = None
+        self.plugin_opts = {}     # config_*_plugin storage
+
+    # -- colors / plugin options -----------------------------------------
+    def color(self, name):
+        # tests run without a WeeChat display: binary codes are empty strings
+        return ""
+
+    def config_is_set_plugin(self, name):
+        return name in self.plugin_opts
+
+    def config_get_plugin(self, name):
+        return self.plugin_opts.get(name, "")
+
+    def config_set_plugin(self, name, value):
+        self.plugin_opts[name] = value
+        return 1
 
     def register(self, name, author, version, license, desc, shutdown_function, charset):
         self.registered = name
@@ -221,6 +237,54 @@ def main():
     send({"type": "assistant_line", "msgId": 2, "text": "still alive"})
     pump_and_drain(0.5)
     assert any("still alive" in t for k, t in stub.prints), "connection lost after oversize"
+
+    # tool output filtering: 'off' hides the body, 'full' shows it again
+    ns["pi_input_cb"]("", "buffer", "!tools off")
+    pump_and_drain(0.2)
+    assert recv_lines == [], "!tools must not send anything to pi"
+    send({"type": "tool_end", "toolCallId": "t2", "isError": False,
+          "output": "hidden line"})
+    pump_and_drain(0.3)
+    text = plain()
+    assert "hidden line" not in text, "tool_output=off must hide the body"
+    ns["pi_input_cb"]("", "buffer", "!tools summary")
+    pump_and_drain(0.2)
+    many = "\n".join("l%d" % i for i in range(10))
+    send({"type": "tool_end", "toolCallId": "t3", "isError": False,
+          "output": many})
+    pump_and_drain(0.3)
+    text = plain()
+    assert "l0" in text and "l9" in text, "summary keeps first/last lines"
+    assert "more lines" in text, "summary elides the middle"
+
+    # thinking lines are hidden by default; !think on enables them
+    send({"type": "thinking_line", "msgId": 3, "text": "hidden thought"})
+    pump_and_drain(0.3)
+    text = plain()
+    assert "hidden thought" not in text, "thinking must be hidden by default"
+    ns["pi_input_cb"]("", "buffer", "!think on")
+    pump_and_drain(0.2)
+    assert recv_lines == [], "!think must not send anything to pi"
+    text = plain()
+    assert "thinking: on" in text, "!think on confirms the mode"
+    send({"type": "thinking_line", "msgId": 3, "text": "visible thought"})
+    pump_and_drain(0.3)
+    text = plain()
+    assert "visible thought" in text, "!think on must render thinking lines"
+
+    # !help is answered locally (nothing hits the wire)
+    ns["pi_input_cb"]("", "buffer", "!help")
+    pump_and_drain(0.3)
+    assert recv_lines == [], "!help must not send anything to pi"
+    text = plain()
+    assert "steer" in text and "!tools" in text and "!think" in text, \
+        "!help prints the command list"
+
+    # !model <provider/id> → command with arg
+    ns["pi_input_cb"]("", "buffer", "!model prov/model-b")
+    pump_and_drain(0.4)
+    msg = json.loads(recv_lines.pop(0))
+    assert msg == {"type": "command", "name": "model", "arg": "prov/model-b"}, msg
 
     # client disconnect → title back to waiting
     client.close()

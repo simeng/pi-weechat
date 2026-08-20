@@ -19,24 +19,86 @@ import errno
 import json
 import os
 import socket
+import time
 
 try:
     import weechat
 except ImportError:  # allows importing this module outside WeeChat (tests)
     weechat = None
 
+# Opt-in wire debug log — same convention as the pi extension:
+# PI_BRIDGE_DEBUG=<path>, or the marker file $XDG_RUNTIME_DIR/pi-weechat.debug.
+_DBG_PATH = os.environ.get("PI_BRIDGE_DEBUG")
+if not _DBG_PATH and os.environ.get("XDG_RUNTIME_DIR"):
+    _candidate = os.path.join(os.environ["XDG_RUNTIME_DIR"], "pi-weechat.debug")
+    if os.path.exists(_candidate):
+        _DBG_PATH = _candidate
+_DBG_MAX = 1_000_000
+_T0 = time.time()
+
+
+def dbg(msg):
+    if not _DBG_PATH:
+        return
+    try:
+        try:
+            if os.path.getsize(_DBG_PATH) > _DBG_MAX:
+                with open(_DBG_PATH, "rb") as f:
+                    data = f.read()
+                with open(_DBG_PATH, "wb") as f:
+                    f.write(b"\n... (log rotated) ...\n" + data[-400_000:])
+        except OSError:
+            pass
+        with open(_DBG_PATH, "a") as f:
+            f.write("[wc %.3f] %s\n" % (time.time() - _T0, msg))
+    except Exception:
+        pass  # debug must never break the bridge
+
 PROTOCOL = 1
 MAX_LINE = 1024 * 1024  # must match MAX_LINE_BYTES in lib/codec.mjs
 
-# Colors (WeeChat color tags; "gray" is dim)
-C_USER = "color:white"
-C_PI = "color:default"
-C_TOOL = "color:blue"
-C_STATUS = "color:cyan"
-C_ERR = "color:red"
-C_OK = "color:green"
-C_DIM = "color:gray"
-R = "color:reset"
+
+def _color(name):
+    """Binary WeeChat color code for `name` ("" outside WeeChat or on error).
+
+    WeeChat 4.x does NOT interpret legacy text tags like "color:cyan" in
+    printed messages — they would be displayed literally. weechat.color()
+    returns the internal binary code that the display layer decodes.
+    """
+    if weechat is None:
+        return ""
+    try:
+        return weechat.color(name) or ""
+    except Exception:
+        return ""
+
+
+# Colors (binary codes; C_PI empty = buffer default foreground)
+C_USER = _color("white")
+C_PI = ""
+C_TOOL = _color("blue")
+C_STATUS = _color("cyan")
+C_ERR = _color("red")
+C_OK = _color("green")
+C_DIM = _color("darkgray")
+R = _color("reset")
+
+# Tool output display mode (pi_bridge.tool_output option)
+TOOL_OUTPUT_MODES = ("full", "summary", "off")
+DEFAULT_TOOL_OUTPUT = "summary"
+
+# Thinking visibility (pi_bridge.thinking option)
+THINKING_MODES = ("on", "off")
+DEFAULT_THINKING = "off"
+
+HELP_TEXT = (
+    "!s <text> steer current turn · !q <text> queue follow-up\n"
+    "!new new session · !compact compact context · !abort abort current turn\n"
+    "!status refresh session/model info · !model [provider/id] list or set model\n"
+    "!tools [full|summary|off] tool output verbosity (default: summary)\n"
+    "!think [on|off] show/hide thinking lines (default: off)\n"
+    "anything else is sent to pi as a normal message"
+)
 
 
 def default_socket_path():
@@ -57,6 +119,8 @@ class Bridge(object):
         self.sock_path = default_socket_path()
         self.listen_sock = None
         self.client = None            # accepted client socket (or None)
+        self.listen_hook = None       # hook_fd handle for the listen socket
+        self.client_hook = None       # hook_fd handle for the client read side
         self.write_hook = None        # hook_fd handle for the write side
         self.rxbuff = b""
         self.outq = b""
@@ -70,8 +134,7 @@ class Bridge(object):
         weechat.buffer_set(self.buffer, "localvar_set_no_log", "1")
         self.alive = True
         self._print(C_STATUS + "pi bridge ready — socket %s%s" % (self.sock_path, R))
-        self._print(C_DIM + "type a line to send it to pi; "
-                         "!s <text> steer · !q <text> queue · !new !compact !abort !status !model%s" % R)
+        self._print(C_DIM + "type a line to send it to pi; !help lists commands%s" % R)
 
     def _print(self, text):
         """Print one plain line (no time, no prefix)."""
@@ -113,7 +176,7 @@ class Bridge(object):
         sock.listen(1)
         sock.setblocking(False)
         self.listen_sock = sock
-        weechat.hook_fd(sock.fileno(), 1, 0, 0, "pi_listen_cb", "")
+        self.listen_hook = weechat.hook_fd(sock.fileno(), 1, 0, 0, "pi_listen_cb", "")
         return True
 
     def accept_pending(self):
@@ -133,13 +196,15 @@ class Bridge(object):
                         "client_already_connected"}) + "\n").encode())
                 except OSError:
                     pass
+                dbg("accept: rejected second client")
                 client.close()
                 continue
             client.setblocking(False)
+            dbg("accept: new client fd=%s" % client.fileno())
             self.client = client
             self.rxbuff = b""
             self.outq = b""
-            weechat.hook_fd(client.fileno(), 1, 0, 0, "pi_client_cb", "")
+            self.client_hook = weechat.hook_fd(client.fileno(), 1, 0, 0, "pi_client_cb", "")
             self._send({"type": "hello", "protocol": PROTOCOL,
                         "name": "weechat-pi-bridge"})
             self.set_state("idle")
@@ -157,11 +222,14 @@ class Bridge(object):
             data = self.client.recv(65536)
         except BlockingIOError:
             return
-        except OSError:
+        except OSError as e:
+            dbg("recv error: %s" % e)
             data = b""
         if not data:  # peer closed (recv == 0) or error → disconnect
+            dbg("recv 0 bytes — peer closed, dropping client")
             self.drop_client()
             return
+        dbg("recv %d bytes" % len(data))
         self.rxbuff += data
         while b"\n" in self.rxbuff:
             line, self.rxbuff = self.rxbuff.split(b"\n", 1)
@@ -182,12 +250,19 @@ class Bridge(object):
             self.rxbuff = b""
 
     def drop_client(self):
+        dbg("drop_client")
         if self.client is not None:
             try:
                 self.client.close()
             except OSError:
                 pass
             self.client = None
+        # unhook BOTH fd hooks for the old client; leaving them behind makes
+        # WeeChat poll a closed fd ("Bad file descriptor used in hook_fd")
+        # and re-fire stale callbacks if a new client reuses the fd number.
+        if self.client_hook:
+            weechat.unhook(self.client_hook)
+            self.client_hook = None
         if self.write_hook:
             weechat.unhook(self.write_hook)
             self.write_hook = None
@@ -200,30 +275,62 @@ class Bridge(object):
 
     def _send(self, obj):
         if self.client is None:
+            dbg("_send %s DROPPED (no client)" % obj.get("type"))
             return
-        self.outq += (json.dumps(obj, separators=(",", ":")) + "\n").encode()
-        if self.write_hook is None:
-            self.write_hook = weechat.hook_fd(self.client.fileno(), 0, 1, 0, "pi_write_cb", "")
+        line = (json.dumps(obj, separators=(",", ":")) + "\n").encode()
+        self.outq += line
+        dbg(">> send %s (%d bytes, outq=%d)" % (obj.get("type"), len(line), len(self.outq)))
+        # Flush synchronously: do not rely on the write-readiness hook to
+        # fire — if it ever doesn't, outbound messages (user input, pongs)
+        # would sit in outq forever. The hook is kept only as a backpressure
+        # fallback for the rare case the socket buffer is full.
+        self._try_flush()
 
-    def flush_outq(self, fd):
-        if self.client is None or not self.outq:
-            if self.write_hook:
-                weechat.unhook(self.write_hook)
-                self.write_hook = None
-            return
-        try:
-            n = self.client.send(self.outq)
-        except BlockingIOError:
-            return
-        except OSError:
-            self.drop_client()
-            return
-        self.outq = self.outq[n:]
-        if not self.outq and self.write_hook:
+    def _try_flush(self):
+        while self.outq:
+            if self.client is None:
+                return
+            try:
+                n = self.client.send(self.outq)
+            except BlockingIOError:
+                dbg("flush: backpressure (outq=%d), waiting for write hook" % len(self.outq))
+                if self.write_hook is None:
+                    self.write_hook = weechat.hook_fd(
+                        self.client.fileno(), 0, 1, 0, "pi_write_cb", "")
+                return
+            except OSError as e:
+                dbg("flush: send error %s — dropping client" % e)
+                self.drop_client()
+                return
+            self.outq = self.outq[n:]
+        dbg("flush: outq empty")
+        if self.write_hook:
             weechat.unhook(self.write_hook)
             self.write_hook = None
 
+    def flush_outq(self, fd):
+        # write-readiness event: only matters after a backpressure pause
+        dbg("write_cb fired (outq=%d)" % len(self.outq))
+        self._try_flush()
+
     # ---------------------------------------------------------- dispatching
+
+    def tool_output_mode(self):
+        """pi_bridge.tool_output option: full | summary | off."""
+        return self._plugin_option("tool_output", TOOL_OUTPUT_MODES, DEFAULT_TOOL_OUTPUT)
+
+    def thinking_enabled(self):
+        """pi_bridge.thinking option: on | off."""
+        return self._plugin_option("thinking", THINKING_MODES, DEFAULT_THINKING) == "on"
+
+    def _plugin_option(self, name, modes, default):
+        if weechat is None:
+            return default
+        try:
+            v = (weechat.config_get_plugin(name) or "").strip().lower()
+        except Exception:
+            v = ""
+        return v if v in modes else default
 
     def dispatch(self, msg):
         t = msg.get("type")
@@ -261,6 +368,11 @@ class Bridge(object):
             text = msg.get("text", "")
             self._print(C_PI + text + R)
             return
+        if t == "thinking_line":
+            if not self.thinking_enabled():
+                return  # hidden; the line is dropped entirely
+            self._print(C_DIM + "  💭 " + msg.get("text", "") + R)
+            return
         if t == "assistant_flush":
             return  # lines already complete; nothing to render
         if t == "tool_start":
@@ -279,7 +391,7 @@ class Bridge(object):
             color = C_OK if ok else C_ERR
             self._print(color + ("✔ " if ok else "✘ ") +
                         (msg.get("toolName", "tool") or "tool") + R)
-            for line in str(msg.get("output") or "").splitlines():
+            for line in self._tool_output_lines(msg.get("output")):
                 self._print(C_DIM + "  " + line + R)
             return
         if t == "error":
@@ -287,6 +399,21 @@ class Bridge(object):
                 msg.get("code", "?"), msg.get("message", ""), R))
             return
         # unknown type: ignore (forward-compat)
+
+    def _tool_output_lines(self, output):
+        """Apply the pi_bridge.tool_output mode to a tool result."""
+        mode = self.tool_output_mode()
+        lines = str(output or "").splitlines()
+        if mode == "off":
+            return []
+        if mode == "full":
+            return lines
+        # summary: first 3 + last 3 lines, elide the middle (smart-filter style)
+        if len(lines) > 6:
+            return (lines[:3]
+                    + ["… (%d more lines)" % (len(lines) - 6)]
+                    + lines[-3:])
+        return lines
 
     # ---------------------------------------------------------- user input
 
@@ -297,19 +424,51 @@ class Bridge(object):
         line = line.strip()
         if not line:
             return
+        # buffer-local commands (handled here, never reach pi)
+        if line in ("!help", "?"):
+            for h in HELP_TEXT.splitlines():
+                self._print(C_STATUS + h + R)
+            return
+        if line == "!tools":
+            self._print(C_STATUS + "tool output mode: %s (full | summary | off)%s"
+                        % (self.tool_output_mode(), R))
+            return
+        if line.startswith("!tools "):
+            arg = line[7:].strip().lower()
+            if arg in TOOL_OUTPUT_MODES:
+                self._set_plugin_option("tool_output", arg)
+                self._print(C_STATUS + "tool output mode: %s%s" % (arg, R))
+            else:
+                self._print(C_ERR + "unknown tool output mode: %s (full | summary | off)%s"
+                            % (arg, R))
+            return
+        if line == "!think":
+            self._print(C_STATUS + "thinking: %s (!think on|off)%s" % (
+                "on" if self.thinking_enabled() else "off", R))
+            return
+        if line.startswith("!think "):
+            arg = line[7:].strip().lower()
+            if arg in THINKING_MODES:
+                self._set_plugin_option("thinking", arg)
+                self._print(C_STATUS + "thinking: %s%s" % (arg, R))
+            else:
+                self._print(C_ERR + "unknown thinking mode: %s (on | off)%s" % (arg, R))
+            return
         # buffer-local control commands → protocol 'command' messages
         command_map = {
             "!new": "new_session",
             "!compact": "compact",
             "!abort": "abort",
             "!status": "status",
-            "!model": "model",
         }
         if line in command_map:
             self._send({"type": "command", "name": command_map[line]})
+        elif line == "!model":
+            self._send({"type": "command", "name": "model"})
         elif line.startswith("!model "):
-            # let pi's built-in /model command do the selection
-            self._send({"type": "user_input", "text": "/model " + line[7:].strip()})
+            # pi's setModel via the weechat-ctl extension command
+            self._send({"type": "command", "name": "model",
+                        "arg": line[7:].strip()})
         elif line.startswith("!s "):
             self._send({"type": "user_input", "text": line[3:], "deliverAs": "steer"})
         elif line.startswith("!q "):
@@ -317,6 +476,15 @@ class Bridge(object):
         else:
             self._send({"type": "user_input", "text": line})
         self._print(C_USER + "> " + R + line)
+
+    @staticmethod
+    def _set_plugin_option(name, value):
+        if weechat is None:
+            return
+        try:
+            weechat.config_set_plugin(name, value)
+        except Exception:
+            pass
 
     # -------------------------------------------------------------- cleanup
 
@@ -327,15 +495,19 @@ class Bridge(object):
             except OSError:
                 pass
             self.client = None
+        for attr in ("client_hook", "write_hook"):
+            if getattr(self, attr):
+                weechat.unhook(getattr(self, attr))
+                setattr(self, attr, None)
         if self.listen_sock is not None:
             try:
                 self.listen_sock.close()
             except OSError:
                 pass
             self.listen_sock = None
-        if self.write_hook:
-            weechat.unhook(self.write_hook)
-            self.write_hook = None
+        if self.listen_hook:
+            weechat.unhook(self.listen_hook)
+            self.listen_hook = None
         try:
             os.unlink(self.sock_path)
         except OSError:
@@ -372,18 +544,25 @@ def pi_write_cb(data, fd):
     return weechat.WEECHAT_RC_OK
 
 
-def pi_signal_cb(data, signal_name, _signal_data):
-    if signal_name in ("quit", "upgrade"):
-        BRIDGE.cleanup()
+def pi_shutdown_cb():
+    # /python unload pi_bridge → release fd hooks + unlink the socket so a
+    # fresh load can rebind cleanly
+    BRIDGE.cleanup()
     return weechat.WEECHAT_RC_OK
 
 
 # -------------------------------------------------------------------- main
 
 def main():
-    weechat.register("pi_bridge", "simeng", "0.1.0", "MIT",
+    dbg("main(): loading (sock=%s, debug=%s)" % (default_socket_path(), bool(_DBG_PATH)))
+    weechat.register("pi_bridge", "simeng", "0.2.0", "MIT",
                      "mirror a pi coding agent session through a WeeChat buffer",
-                     "", "")
+                     "pi_shutdown_cb", "")
+    # plugin options (auto-created on first run; /set pi_bridge.<name> …)
+    if not weechat.config_is_set_plugin("tool_output"):
+        weechat.config_set_plugin("tool_output", DEFAULT_TOOL_OUTPUT)
+    if not weechat.config_is_set_plugin("thinking"):
+        weechat.config_set_plugin("thinking", DEFAULT_THINKING)
     BRIDGE.make_buffer()
     try:
         BRIDGE.make_server()

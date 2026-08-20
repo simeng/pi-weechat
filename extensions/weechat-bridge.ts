@@ -7,6 +7,7 @@
  * back to pi as user input. Wire format: NDJSON, see PLAN.md §2.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,6 +15,55 @@ import * as path from "node:path";
 import { LineDecoder, PROTOCOL_VERSION } from "../lib/codec.mjs";
 
 const MAX_TOOL_OUTPUT = 8192;
+const DEBUG_LOG_MAX_BYTES = 1_000_000; // rotate above this
+
+// Opt-in wire debug log. Enabled by PI_BRIDGE_DEBUG=<path>, or by the
+// existence of a marker file $XDG_RUNTIME_DIR/pi-weechat.debug (the WeeChat
+// script honors the same marker, so one file enables both sides).
+function resolveDebugLogPath(): string | null {
+  const env = process.env.PI_BRIDGE_DEBUG;
+  if (env) return env;
+  const xdg = process.env.XDG_RUNTIME_DIR;
+  if (!xdg) return null;
+  const marker = path.join(xdg, "pi-weechat.debug");
+  try {
+    fs.accessSync(marker);
+    return marker;
+  } catch {
+    return null;
+  }
+}
+
+let debugLogPath: string | null = null;
+
+function dbg(msg: string): void {
+  const p = debugLogPath;
+  if (!p) return;
+  try {
+    let st: fs.Stats | null = null;
+    try {
+      st = fs.statSync(p);
+    } catch {
+      /* file may not exist yet */
+    }
+    if (st && st.size > DEBUG_LOG_MAX_BYTES) {
+      const data = fs.readFileSync(p, "utf8");
+      fs.writeFileSync(p, "\n… (log rotated) …\n" + data.slice(-400_000));
+    }
+    fs.appendFileSync(p, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch {
+    /* debug must never break the bridge */
+  }
+}
+
+function reinitDebugLog(): void {
+  const p = resolveDebugLogPath();
+  if (p !== debugLogPath) {
+    dbg(`debug log ${p ? "ENABLED" : "disabled"}: ${p ?? "(no marker)"}`);
+    debugLogPath = p;
+  }
+}
+
 const PING_INTERVAL_MS = 30_000;
 const PONG_TIMEOUT_MS = 90_000;
 const RECONNECT_BASE_MS = 1_000;
@@ -27,6 +77,7 @@ function resolveSocketPath(): string {
 }
 
 export default function weechatBridge(pi: ExtensionAPI) {
+  reinitDebugLog();
   let socketPath = resolveSocketPath();
   let sock: net.Socket | null = null;
   let decoder: LineDecoder | null = null;
@@ -36,10 +87,12 @@ export default function weechatBridge(pi: ExtensionAPI) {
   let pingTimer: NodeJS.Timeout | null = null;
   let lastPongAt = 0;
   let ctxRef: any = null; // latest ExtensionContext (for ctx.abort())
+  let busy = false;           // agent_start seen without agent_settled
   let pendingOut: string[] = []; // messages emitted before the socket is up
 
-  // Streaming assembly: assistant text blocks, keyed by contentIndex.
+  // Streaming assembly: assistant text + thinking blocks, keyed by contentIndex.
   let blockBufs = new Map<number, string>();
+  let thinkBufs = new Map<number, string>();
   let msgSeq = 0;
   let currentMsgId = 0;
 
@@ -47,6 +100,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
 
   function send(obj: Record<string, unknown>): void {
     const line = JSON.stringify(obj) + "\n";
+    dbg(">> " + line.trim().slice(0, 400));
     if (sock && !sock.destroyed) {
       sock.write(line);
     } else if (!shutdown) {
@@ -81,6 +135,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
     if (shutdown || sock?.destroyed === false) return;
     attempt += 1;
     const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** (attempt - 1));
+    dbg(`reconnect scheduled: attempt=${attempt} delay=${delay}ms`);
     connectTimer = setTimeout(() => connect(), delay);
     void connectTimer.unref?.();
   }
@@ -100,6 +155,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
     if (shutdown) return;
     if (sock && !sock.destroyed) return;
 
+    dbg(`dialing ${socketPath}`);
     const s = net.connect(socketPath);
     sock = s;
     decoder = new LineDecoder(onMessage, {
@@ -108,6 +164,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
     });
 
     s.once("connect", () => {
+      dbg(`connected (flushing ${pendingOut.length} pending)`);
       attempt = 0;
       lastPongAt = Date.now();
       flushPending(); // session_info/status emitted before connect
@@ -124,12 +181,14 @@ export default function weechatBridge(pi: ExtensionAPI) {
       void pingTimer.unref?.();
     });
     s.on("data", (chunk) => decoder?.feed(chunk));
-    s.once("error", () => {
+    s.once("error", (err) => {
       // ECONNREFUSED etc. — weechat not running yet; retry with backoff.
+      dbg(`socket error: ${String((err as Error)?.message ?? err)}`);
       disconnect();
       scheduleReconnect();
     });
-    s.once("close", () => {
+    s.once("close", (hadError) => {
+      dbg(`socket closed (hadError=${hadError})`);
       if (!shutdown) scheduleReconnect();
     });
   }
@@ -143,6 +202,11 @@ export default function weechatBridge(pi: ExtensionAPI) {
   // -------------------------------------------------------------- receive
 
   function onMessage(msg: Record<string, any>): void {
+    dbg(
+      "<< " +
+        JSON.stringify(msg).slice(0, 400) +
+        (typeof msg.text === "string" && msg.text.length > 200 ? ` …(+${msg.text.length - 200} chars)` : ""),
+    );
     switch (msg.type) {
       case "hello":
         if (intOf(msg.protocol) !== PROTOCOL_VERSION) {
@@ -160,20 +224,39 @@ export default function weechatBridge(pi: ExtensionAPI) {
       case "user_input": {
         const text = typeof msg.text === "string" ? msg.text : "";
         if (!text) return;
-        const deliverAs =
+        let deliverAs =
           msg.deliverAs === "steer" || msg.deliverAs === "followUp" ? msg.deliverAs : undefined;
-        pi.sendUserMessage(text, deliverAs ? { deliverAs } : undefined);
+        // Plain input while a turn is running: queue it as a follow-up.
+        // Without this, pi's prompt() throws ("Agent is already processing")
+        // and the message is lost — with no error visible in WeeChat.
+        if (!deliverAs && busy) deliverAs = "followUp";
+        dbg(
+          `sendUserMessage: deliverAs=${deliverAs ?? "(default)"} text=${JSON.stringify(text.slice(0, 200))}`,
+        );
+        try {
+          pi.sendUserMessage(text, deliverAs ? { deliverAs } : undefined);
+          dbg("sendUserMessage: ok");
+        } catch (err) {
+          const msgText = String((err as Error)?.message ?? err);
+          dbg(`sendUserMessage THREW: ${msgText}`);
+          send({
+            type: "error",
+            code: "input_failed",
+            message: msgText,
+          });
+        }
         return;
       }
       case "command":
-        handleCommand(msg.name as string | undefined);
+        dbg(`command: ${msg.name} ${String(msg.arg ?? "")}`);
+        handleCommand(msg.name as string | undefined, msg.arg as string | undefined);
         return;
       default:
         // unknown type from weechat: ignore (forward-compat)
     }
   }
 
-  function handleCommand(name?: string): void {
+  function handleCommand(name?: string, arg?: string): void {
     switch (name) {
       case "abort":
         // ctx.abort() is safe from event handlers
@@ -188,9 +271,15 @@ export default function weechatBridge(pi: ExtensionAPI) {
       case "compact":
       case "status":
       case "model":
-        // route through a registered extension command so session-control
-        // methods (newSession, …) run in the safe command context
-        pi.sendUserMessage(`/weechat-ctl ${name}`, { deliverAs: "followUp" });
+        // Route through the registered extension command.
+        // expandPromptTemplates: true is REQUIRED: sendUserMessage defaults
+        // it to false, which skips extension-command dispatch and would send
+        // the literal text "/weechat-ctl …" to the LLM. With it on, the
+        // command executes immediately — even while a turn is streaming.
+        pi.sendUserMessage(
+          `/weechat-ctl ${name}${arg ? " " + arg : ""}`,
+          { expandPromptTemplates: true },
+        );
         return;
       default:
         send({ type: "error", code: "unknown_command", message: `!${name ?? "?"}` });
@@ -222,8 +311,10 @@ export default function weechatBridge(pi: ExtensionAPI) {
   // --------------------------------------------------------------- events
 
   pi.on("session_start", async (_event, ctx) => {
+    reinitDebugLog(); // picks up a marker file created after process start
     shutdown = false;
     attempt = 0;
+    busy = false;
     ctxRef = ctx;
     blockBufs.clear();
     sendSessionInfo(ctx);
@@ -237,11 +328,13 @@ export default function weechatBridge(pi: ExtensionAPI) {
 
   pi.on("agent_start", async (_event, ctx) => {
     ctxRef = ctx;
+    busy = true;
     setState("thinking");
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
     ctxRef = ctx;
+    busy = false;
     setState("idle");
   });
 
@@ -266,10 +359,41 @@ export default function weechatBridge(pi: ExtensionAPI) {
   });
 
   // Streaming: assemble text blocks from delta events, emit whole lines.
+  // Append a delta to one streaming block; emit whole lines as they form.
+  function streamLine(
+    bufs: Map<number, string>,
+    key: number,
+    delta: string,
+    type: "assistant_line" | "thinking_line",
+  ): void {
+    const cur = (bufs.get(key) ?? "") + delta;
+    bufs.set(key, cur);
+    // flush complete lines as they form
+    const nl = cur.indexOf("\n");
+    if (nl !== -1) {
+      send({ type, msgId: currentMsgId, text: cur.slice(0, nl) });
+      bufs.set(key, cur.slice(nl + 1));
+    }
+  }
+
+  function flushTail(
+    bufs: Map<number, string>,
+    key: number,
+    type: "assistant_line" | "thinking_line",
+  ): void {
+    // remaining partial line of this block is complete now
+    const tail = bufs.get(key);
+    if (tail && tail.trim()) {
+      send({ type, msgId: currentMsgId, text: tail });
+    }
+    bufs.set(key, "");
+  }
+
   pi.on("message_start", async (event) => {
     const msg = event.message as any;
     if (msg?.role === "assistant") {
       blockBufs.clear();
+      thinkBufs.clear();
       currentMsgId = ++msgSeq;
     }
   });
@@ -277,28 +401,31 @@ export default function weechatBridge(pi: ExtensionAPI) {
   pi.on("message_update", async (event) => {
     const ev = (event as any).assistantMessageEvent;
     if (!ev || typeof ev !== "object") return;
-    if (ev.type === "text_start") {
-      blockBufs.set(ev.contentIndex ?? 0, "");
-    } else if (ev.type === "text_delta") {
-      const key = ev.contentIndex ?? 0;
-      const cur = (blockBufs.get(key) ?? "") + String(ev.delta ?? "");
-      blockBufs.set(key, cur);
-      // flush complete lines as they form
-      const nl = cur.indexOf("\n");
-      if (nl !== -1) {
-        send({ type: "assistant_line", msgId: currentMsgId, text: cur.slice(0, nl) });
-        blockBufs.set(key, cur.slice(nl + 1));
-      }
-    } else if (ev.type === "text_end") {
-      // remaining partial line of this block is complete now
-      const key = ev.contentIndex ?? 0;
-      const tail = blockBufs.get(key);
-      if (tail && tail.trim()) {
-        send({ type: "assistant_line", msgId: currentMsgId, text: tail });
-      }
-      blockBufs.set(key, "");
-    } else if (ev.type === "toolcall_start") {
-      setState("thinking");
+    const key = ev.contentIndex ?? 0;
+    switch (ev.type) {
+      case "text_start":
+        blockBufs.set(key, "");
+        break;
+      case "text_delta":
+        streamLine(blockBufs, key, String(ev.delta ?? ""), "assistant_line");
+        break;
+      case "text_end":
+        flushTail(blockBufs, key, "assistant_line");
+        break;
+      // thinking blocks (reasoning models): mirrored as their own line type;
+      // the buffer decides whether to render them (!think on|off)
+      case "thinking_start":
+        thinkBufs.set(key, "");
+        break;
+      case "thinking_delta":
+        streamLine(thinkBufs, key, String(ev.delta ?? ""), "thinking_line");
+        break;
+      case "thinking_end":
+        flushTail(thinkBufs, key, "thinking_line");
+        break;
+      case "toolcall_start":
+        setState("thinking");
+        break;
     }
   });
 
@@ -306,13 +433,13 @@ export default function weechatBridge(pi: ExtensionAPI) {
     const msg = event.message as any;
     if (msg?.role !== "assistant") return;
     // authoritative final text: re-emit any tail the deltas didn't flush
-    const blocks = [...blockBufs.values()].filter((t) => t.trim()).join("\n");
-    if (blocks) {
-      for (const line of blocks.split("\n")) {
-        send({ type: "assistant_line", msgId: currentMsgId, text: line });
-      }
+    for (const [bufs, type] of [
+      [blockBufs, "assistant_line"],
+      [thinkBufs, "thinking_line"],
+    ] as const) {
+      for (const key of [...bufs.keys()]) flushTail(bufs, key, type);
+      bufs.clear();
     }
-    blockBufs.clear();
     send({ type: "assistant_flush", msgId: currentMsgId });
   });
 
@@ -343,8 +470,14 @@ export default function weechatBridge(pi: ExtensionAPI) {
 
   pi.registerCommand("weechat-ctl", {
     description: "Control commands forwarded from the WeeChat bridge buffer (internal)",
-    handler: async (args, ctx) => {
-      const name = String(args ?? "").trim();
+    handler: async (rawArgs, ctx) => {
+      // args is everything after "/weechat-ctl": first token = subcommand,
+      // remainder (if any) = argument (e.g. model id)
+      const trimmed = String(rawArgs ?? "").trim();
+      const spaceIdx = trimmed.indexOf(" ");
+      const name = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
+      const arg =
+        spaceIdx === -1 ? undefined : trimmed.slice(spaceIdx + 1).trim() || undefined;
       try {
         switch (name) {
           case "new_session": {
@@ -373,7 +506,49 @@ export default function weechatBridge(pi: ExtensionAPI) {
             send({ type: "status", state: ctx.isIdle() ? "idle" : "thinking" });
             return;
           case "model": {
-            const models = (ctx as any).scopedModels ?? [];
+            const models = ctx.scopedModels ?? [];
+            if (arg) {
+              // !model provider/id → select via pi.setModel()
+              const want = arg;
+              const candidates: any[] = [
+                ...(ctx.model ? [ctx.model] : []),
+                ...models.map((m: any) => m.model).filter(Boolean),
+              ];
+              const found = candidates.find(
+                (m) => `${m.provider}/${m.id}` === want || m.id === want,
+              );
+              if (!found) {
+                send({
+                  type: "error",
+                  code: "model_not_found",
+                  message:
+                    `no model matching "${want}" — use !model to list available models`,
+                });
+                return;
+              }
+              let ok = false;
+              try {
+                ok = await pi.setModel(found);
+              } catch (err) {
+                ok = false;
+                send({
+                  type: "error",
+                  code: "model_set_failed",
+                  message: String((err as Error)?.message ?? err),
+                });
+                return;
+              }
+              if (!ok) {
+                send({
+                  type: "error",
+                  code: "model_set_failed",
+                  message: `setModel rejected ${found.provider}/${found.id} (auth?)`,
+                });
+                return;
+              }
+              // model_select event will resend session_info
+              return;
+            }
             if (models.length === 0) {
               send({ type: "assistant_line", msgId: 0, text: "(no scoped models)" });
             } else {

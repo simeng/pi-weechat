@@ -167,6 +167,44 @@ test("integration: real extension ↔ real weechat script", async (t) => {
     (m) => m.type === "print" && strip(m.text).includes("> hello from weechat"),
     "buffer: echo"
   );
+
+  // thinking streams: hidden by default, toggleable with !think on
+  await mock.fire("message_start", { message: { role: "assistant" } });
+  await mock.fire("message_update", {
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "hidden pondering\n" },
+  });
+  // liveliness marker on a later block: once it renders, the (absent)
+  // thinking line above could not still be in flight
+  await mock.fire("message_update", {
+    assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "liveliness check\n" },
+  });
+  await mock.fire("message_end", { message: { role: "assistant" } });
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("liveliness check"),
+    "buffer: text after hidden thinking"
+  );
+  assert.ok(
+    !wc.lines.some((m) => m.type === "print" && m.text.includes("hidden pondering")),
+    "thinking must be hidden by default"
+  );
+
+  wc.send({ op: "input", text: "!think on" });
+  await wc.waitFor(
+    (m) => m.type === "print" && strip(m.text).includes("thinking: on"),
+    "buffer: thinking enabled"
+  );
+
+  await mock.fire("message_start", { message: { role: "assistant" } });
+  await mock.fire("message_update", {
+    assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "visible pondering\n" },
+  });
+  await mock.fire("message_update", {
+    assistantMessageEvent: { type: "thinking_end", contentIndex: 0 },
+  });
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("visible pondering"),
+    "buffer: thinking line rendered"
+  );
 });
 
 function waitForMock(pred, what, ms = 5000) {
