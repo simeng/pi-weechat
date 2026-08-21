@@ -179,9 +179,16 @@ class Bridge(object):
         self._print(C_DIM + "type a line to send it to pi; !help lists commands%s" % R)
 
     def _print(self, text):
-        """Print one plain line (no time, no prefix)."""
+        """Print one line, stamped with the current time.
+
+        Lines are printed WITHOUT a leading "\t\t" prefix: that trick
+        suppresses the timestamp in the terminal UI, but it also zeroes the
+        line's stored date — relay clients (e.g. Glowing Bear over the relay
+        websocket) would then show 01.01.1970 or no useful time. With a real
+        date, both the TUI and relay clients show proper HH:MM timestamps.
+        """
         if self.alive and self.buffer:
-            weechat.prnt(self.buffer, "\t\t%s" % text)
+            weechat.prnt(self.buffer, text)
 
     def set_state(self, state, detail=None):
         self.state = state
@@ -639,7 +646,7 @@ def pi_shutdown_cb():
 
 def main():
     dbg("main(): loading (sock=%s, debug=%s)" % (default_socket_path(), bool(_DBG_PATH)))
-    weechat.register("pi_bridge", "simeng", "0.3.0", "MIT",
+    weechat.register("pi_bridge", "simeng", "0.3.1", "MIT",
                      "mirror a pi coding agent session through a WeeChat buffer",
                      "pi_shutdown_cb", "")
     # plugin options (auto-created on first run; /set pi_bridge.<name> …)

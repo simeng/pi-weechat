@@ -130,8 +130,11 @@ Design:
   tool lines `chat_prefix_network`, info/status `chat_value`, errors
   `chat_prefix_error`, success `chat_status_enabled`, dim output/thinking
   `separator` (see `_theme()` in pi_bridge.py).
-- **Rendering** (one `weechat.prnt(buf, "\t\t" + text)` per line; the
-  `\t\t` prefix suppresses timestamp/numbering): 
+- **Rendering** (one `weechat.prnt(buf, text)` per line). Lines are printed
+  WITHOUT a leading `\t\t`: that trick would suppress the timestamp in the
+  terminal UI but zero out the stored line date, which relay clients
+  (Glowing Bear over the relay websocket) would render as 01.01.1970.
+  Real dates give proper HH:MM timestamps everywhere: 
   - `assistant_line`: print as-is (default color), one buffer line each.
   - `tool_start`: `⚙ tool_name <summary>` where `<summary>` is the main
     content of the args struct, per tool (`format_tool_args()`): bash→

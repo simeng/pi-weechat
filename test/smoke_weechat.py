@@ -332,6 +332,12 @@ def main():
     msg = json.loads(recv_lines.pop(0))
     assert msg == {"type": "command", "name": "model", "arg": "prov/model-b"}, msg
 
+    # lines must keep their stored date for relay clients (Glowing Bear):
+    # a leading "\t\t" prefix suppresses the TUI timestamp but zeroes the
+    # line's date field (relay would render 01.01.1970)
+    assert not any(t.startswith("\t") for k, t in stub.prints), \
+        "lines must be printed without leading tabs so they keep real dates"
+
     # client disconnect → title back to waiting
     client.close()
     stub.pump(0.3)
