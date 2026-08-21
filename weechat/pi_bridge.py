@@ -424,7 +424,7 @@ class Bridge(object):
         if t == "thinking_line":
             if not self.thinking_enabled():
                 return  # hidden; the line is dropped entirely
-            self._print(C_DIM + "  💭 " + msg.get("text", "") + R)
+            self._print(C_DIM + "💭 " + msg.get("text", "") + R)
             return
         if t == "assistant_flush":
             return  # lines already complete; nothing to render

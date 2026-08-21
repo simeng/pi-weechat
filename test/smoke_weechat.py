@@ -320,8 +320,8 @@ def main():
 
     # tool output body and thinking lines must use different colors
     raw = [t for k, t in stub.prints if k == "PRINT"]
-    assert any(t.startswith("C  \U0001F4AD ") for t in raw), \
-        "thinking lines keep the dim (cyan) color"
+    assert any(t.startswith("C\U0001F4AD ") for t in raw), \
+        "thinking lines are flush-left (no indent), dim cyan"
     assert any(t.startswith("B  ") for t in raw), \
         "tool output body uses its own color (blue), distinct from thinking"
 
