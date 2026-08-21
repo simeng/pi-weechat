@@ -128,8 +128,10 @@ Design:
   at render time; each has a palette fallback mirroring the 4.x theme default.
   Role → theme name: user input `chat_nick_self`, assistant text `chat`,
   tool lines `chat_prefix_network`, info/status `chat_value`, errors
-  `chat_prefix_error`, success `chat_status_enabled`, dim output/thinking
-  `separator` (see `_theme()` in pi_bridge.py).
+  `chat_prefix_error`, success `chat_status_enabled`, hints/thinking 💭
+  `chat_host`; the tool *output body* is a fixed palette color (`blue`,
+  deliberately not theme-following so it stays distinct from the dim
+  thinking lines — see `C_TOOL_OUT` in pi_bridge.py).
 - **Rendering** (one `weechat.prnt(buf, text)` per line). Lines are printed
   WITHOUT a leading `\t\t`: that trick would suppress the timestamp in the
   terminal UI but zero out the stored line date, which relay clients
@@ -142,7 +144,8 @@ Design:
     memory_write→target + content, memory_search→query, … unknown tools get
     compact `k=v` pairs. Values are flattened to one line and clipped at
     300 chars with an `…(+N)` marker.
-  - `tool_end`: green ✔ / red ✘ prefix + dim indented output lines, filtered by the
+  - `tool_end`: green ✔ / red ✘ prefix + blue indented output lines (distinct
+    from the dim cyan 💭 thinking lines), filtered by the
     `pi_bridge.tool_output` option (`full` | `summary` | `off`; default
     `summary` = first 3 + last 3 lines with `… (N more lines)` in between).
 - **Hook lifecycle:** every `hook_fd` handle (listen, client read, write) is

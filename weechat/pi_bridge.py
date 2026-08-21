@@ -95,7 +95,11 @@ C_TOOL = _theme("chat_prefix_network", "magenta")   # tool activity lines
 C_STATUS = _theme("chat_value", "cyan")             # info lines (session, modes)
 C_ERR = _theme("chat_prefix_error", "yellow")       # errors
 C_OK = _theme("chat_status_enabled", "green")       # successes
-C_DIM = _theme("separator", "236")                  # dim output / thinking
+C_DIM = _theme("chat_host", "cyan")                  # hints / 💭 thinking lines
+# Tool *output* body: own color, deliberately a fixed palette color (no
+# canonical WeeChat [color] slot for this role; theme-following risks
+# collapsing back onto chat_host/cyan and looking identical to thinking).
+C_TOOL_OUT = _color("blue")
 R = _color("reset")
 
 # Per-tool summary of tool_start args: the "main content" of each tool's
@@ -436,7 +440,7 @@ class Bridge(object):
             self._print(color + ("✔ " if ok else "✘ ") +
                         (msg.get("toolName", "tool") or "tool") + R)
             for line in self._tool_output_lines(msg.get("output")):
-                self._print(C_DIM + "  " + line + R)
+                self._print(C_TOOL_OUT + "  " + line + R)
             return
         if t == "error":
             self._print(C_ERR + "pi bridge: %s: %s%s" % (

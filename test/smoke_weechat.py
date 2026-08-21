@@ -42,7 +42,7 @@ class WeechatStub:
         # Emulate weechat.color(): palette names → marker codes; theme names
         # ([color] section of weechat.conf) are undefined in the test env,
         # so the bridge's palette fallbacks are exercised end-to-end.
-        return {"white": "W", "magenta": "M", "cyan": "C",
+        return {"white": "W", "magenta": "M", "cyan": "C", "blue": "B",
                 "yellow": "E", "green": "G", "236": "D"}.get(name, "")
 
     def config_is_set_plugin(self, name):
@@ -317,6 +317,13 @@ def main():
     pump_and_drain(0.3)
     text = plain()
     assert "visible thought" in text, "!think on must render thinking lines"
+
+    # tool output body and thinking lines must use different colors
+    raw = [t for k, t in stub.prints if k == "PRINT"]
+    assert any(t.startswith("C  \U0001F4AD ") for t in raw), \
+        "thinking lines keep the dim (cyan) color"
+    assert any(t.startswith("B  ") for t in raw), \
+        "tool output body uses its own color (blue), distinct from thinking"
 
     # !help is answered locally (nothing hits the wire)
     ns["pi_input_cb"]("", "buffer", "!help")
