@@ -364,6 +364,73 @@ test("integration: real extension ↔ real weechat script over TCP with token", 
   await mock.fire("session_shutdown");
 });
 
+// The config FILE drives endpoint + token (no PI_WEECHAT_URL / _TOKEN env),
+// then the same file with a WRONG token loses to the correct env value —
+// proving env vars take precedence over pi-weechat.json.
+test("integration: config file pi-weechat.json + env precedence", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wc-itg-cfg-"));
+  const sockPath = path.join(dir, "bridge.sock");
+  const port = await getFreePort();
+  const token = "cfg-secret-" + Math.random().toString(16).slice(2);
+  const cfgPath = path.join(dir, "pi-weechat.json");
+
+  const wc = startWeechatSide(sockPath);
+  t.after(async () => {
+    try { wc.child.kill("SIGKILL"); } catch {}
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  t.after(() => {
+    delete process.env.PI_WEECHAT_URL;
+    delete process.env.PI_WEECHAT_TOKEN;
+    delete process.env.PI_CODING_AGENT_DIR;
+  });
+
+  await wc.waitFor((m) => m.type === "ready", "python driver ready", 10_000);
+
+  // token + TCP listener on the weechat side (as in the plain TCP test)
+  wc.send({ op: "set", name: "token", value: token });
+  wc.send({ op: "set", name: "tcp_listen", value: `127.0.0.1:${port}` });
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes(`listening on tcp 127.0.0.1:${port}`),
+    "tcp listening line"
+  );
+
+  // --- phase 1: endpoint + token come from the CONFIG FILE only ---------
+  delete process.env.PI_WEECHAT_URL;
+  delete process.env.PI_WEECHAT_TOKEN;
+  process.env.PI_CODING_AGENT_DIR = dir; // config path = <dir>/pi-weechat.json
+  fs.writeFileSync(cfgPath, JSON.stringify({ url: `tcp://127.0.0.1:${port}`, token }));
+
+  await loadExt();
+  await mock.fire("session_start");
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("pi connected from 127.0.0.1"),
+    "buffer: pi connected using config-file url+token"
+  );
+
+  // --- phase 2: env token WINS over a wrong file token -------------------
+  await mock.fire("session_shutdown");
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("pi disconnected"),
+    "buffer: disconnected before env-precedence phase"
+  );
+
+  fs.writeFileSync(cfgPath, JSON.stringify({ url: `tcp://127.0.0.1:${port}`, token: "wrong-file-token" }));
+  process.env.PI_WEECHAT_TOKEN = token; // correct secret in the environment
+  wc.lines.length = 0; // drop phase-1 lines so waits only match fresh output
+  await mock.fire("session_start"); // refreshConfig re-reads file + env
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("pi connected from 127.0.0.1"),
+    "buffer: pi connected with env token beating wrong file token"
+  );
+  assert.ok(
+    !wc.lines.some((m) => m.type === "print" && m.text.includes("auth failed")),
+    "no auth failure: the env token must win over the config file's"
+  );
+
+  await mock.fire("session_shutdown");
+});
+
 function waitForMock(pred, what, ms = 5000) {
   return new Promise((resolve, reject) => {
     const iv = setInterval(() => {

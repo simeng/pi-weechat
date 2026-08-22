@@ -85,6 +85,28 @@ Open the `pi` buffer:
 - Prompts you type directly in pi's own terminal are echoed into the buffer too,
   so both surfaces stay in sync.
 
+### pi-side config (`~/.pi/agent/pi-weechat.json`)
+
+Everything the env vars configure can also live in a small JSON file next to
+pi's own settings (the agent dir follows `$PI_CODING_AGENT_DIR`, default
+`~/.pi/agent`):
+
+```json
+{
+  "url": "tcp://box:52311",    // endpoint — same syntax as PI_WEECHAT_URL
+  "token": "…",                // shared secret — same as PI_WEECHAT_TOKEN
+  "debugLog": "/path/to/log"   // optional — same as PI_BRIDGE_DEBUG
+}
+```
+
+**Environment variables always win over the file** when both are set, so a
+per-session export still overrides your standing config. Unknown keys are
+ignored (forward-compat); an absent or empty value means "unset"; a missing
+file is fine. A *broken* file (invalid JSON, wrong types) never breaks the
+bridge — it degrades to env/default behavior, notes the problem in the debug
+log, and prints a red `config_error` line in the buffer. The file is re-read
+on every `/reload`, so edits apply without restarting pi.
+
 ### Endpoint (where pi dials)
 
 The pi side resolves its endpoint in this order (first match wins):
@@ -96,14 +118,16 @@ The pi side resolves its endpoint in this order (first match wins):
      (so existing path-style values keep working; `C:\…` is a path, not a scheme)
    - unknown schemes (e.g. `tls://host:1`) are rejected with a clear error —
      that's the intentional extension point for future transports
-2. `$PI_WEECHAT_SOCK` — **deprecated**, still honored as a fallback (URL wins
+2. `"url"` in `~/.pi/agent/pi-weechat.json` — same syntax
+3. `$PI_WEECHAT_SOCK` — **deprecated**, still honored as a fallback (URL wins
    when both are set; the extension notes the deprecation in the debug log)
-3. `$XDG_RUNTIME_DIR/pi-weechat.sock`
-4. `~/.local/state/pi-weechat/pi-weechat.sock`
+4. `$XDG_RUNTIME_DIR/pi-weechat.sock`
+5. `~/.local/state/pi-weechat/pi-weechat.sock`
 
-`$PI_WEECHAT_TOKEN` carries the shared secret for remote auth (see below) —
-never put credentials in the URL itself. The Unix socket file is created
-`0700`; only local users who can read/write it can connect.
+`$PI_WEECHAT_TOKEN` — or `"token"` in the config file — carries the shared
+secret for remote auth (see below); never put credentials in the URL itself.
+The Unix socket file is created `0700`; only local users who can
+read/write it can connect.
 
 ## Remote setup (TCP)
 
@@ -152,12 +176,18 @@ without a token).
 
 ### pi side (machine B)
 
+Either export the env vars in the pi session's environment:
+
 ```sh
 export PI_WEECHAT_URL=tcp://<host-A-or-tailscale-name>:52311
 export PI_WEECHAT_TOKEN=<token>
 ```
 
-then (re)start or `/reload` the pi session. The buffer on A shows
+…or, more conveniently, put them in `~/.pi/agent/pi-weechat.json` (see
+[pi-side config](#pi-side-config-pi-weechatjson)) — no shell exports to
+remember, and edits apply on `/reload`.
+
+Then (re)start or `/reload` the pi session. The buffer on A shows
 `— pi connected from <B-ip> —`.
 
 ### Caveats
@@ -205,11 +235,12 @@ touch $XDG_RUNTIME_DIR/pi-weechat.debug   # default: /run/user/UID/pi-weechat.de
 Then reload both sides (`/python reload pi_bridge` in WeeChat, `/reload` in pi).
 Every connection event and every message in both directions is appended to that
 file (auto-rotates at ~1 MiB). Remove the file and reload to disable, or point
-`PI_BRIDGE_DEBUG=/path/to/log` at an explicit file instead. The debug log never
-contains the token — only one-way handshake proofs.
+`PI_BRIDGE_DEBUG=/path/to/log` (or `"debugLog"` in the pi config file) at an
+explicit file instead. The debug log never contains the token — only one-way
+handshake proofs.
 
 For **remote** setups the marker file only enables the side it sits on; use
-`PI_BRIDGE_DEBUG` on each machine instead.
+`PI_BRIDGE_DEBUG` (or `"debugLog"`) on each machine instead.
 
 ## Development
 
@@ -242,4 +273,5 @@ HMAC compare · server `hello` withheld until the client is validated.
 
 Token guidance: ≥ 128 bits of entropy (`openssl rand -hex 16`), never a
 password or a reused secret, stored only in `sec.conf` via
-`${sec.data.…}` on the WeeChat side and in `PI_WEECHAT_TOKEN` on the pi side.
+`${sec.data.…}` on the WeeChat side and in `PI_WEECHAT_TOKEN` (or
+`pi-weechat.json`) on the pi side.

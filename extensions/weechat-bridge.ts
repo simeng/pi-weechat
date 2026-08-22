@@ -2,11 +2,13 @@
  * weechat-bridge.ts — pi extension: mirror this session into a WeeChat buffer.
  *
  * Dials (as client) the WeeChat script (weechat/pi_bridge.py) over a Unix
- * socket or TCP (PI_WEECHAT_URL: tcp://host:port, unix://<path>, …), mirrors
- * assistant text (batched into whole lines), tool calls/results, and status;
- * forwards lines typed in the WeeChat buffer back to pi as user input.
- * Wire format: NDJSON, protocol 2 (challenge-response auth when a token is
- * configured — the token is never sent). See PLAN.md §2.
+ * socket or TCP, mirrors assistant text (batched into whole lines), tool
+ * calls/results, and status; forwards lines typed in the WeeChat buffer back
+ * to pi as user input. Endpoint/token/debug are read from environment
+ * variables (PI_WEECHAT_URL / PI_WEECHAT_TOKEN / PI_BRIDGE_DEBUG) or from the
+ * config file <agent dir>/pi-weechat.json (default ~/.pi/agent/) — env vars
+ * win when both set. Wire format: NDJSON, protocol 2 (challenge-response auth
+ * when a token is configured — the token is never sent). See PLAN.md §2.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as crypto from "node:crypto";
@@ -16,16 +18,24 @@ import * as os from "node:os";
 import * as path from "node:path";
 // @ts-ignore - plain ESM module, no types needed
 import { LineDecoder, PROTOCOL_VERSION, parseEndpoint } from "../lib/codec.mjs";
+// @ts-ignore - plain ESM module, no types needed
+import { loadConfig } from "../lib/pi-config.mjs";
 
 const MAX_TOOL_OUTPUT = 8192;
 const DEBUG_LOG_MAX_BYTES = 1_000_000; // rotate above this
 
-// Opt-in wire debug log. Enabled by PI_BRIDGE_DEBUG=<path>, or by the
-// existence of a marker file $XDG_RUNTIME_DIR/pi-weechat.debug (the WeeChat
-// script honors the same marker, so one file enables both sides).
-function resolveDebugLogPath(): string | null {
+// Values from the pi-side config file (lib/pi-config.mjs). Env vars always
+// win over these; see resolve*() below.
+type BridgeConfig = { url?: string; token?: string; debugLog?: string };
+
+// Opt-in wire debug log. Enabled by PI_BRIDGE_DEBUG=<path>, then the
+// config-file "debugLog" key, then the marker file
+// $XDG_RUNTIME_DIR/pi-weechat.debug (the WeeChat script honors the same
+// marker, so one file enables both sides).
+function resolveDebugLogPath(cfg: BridgeConfig = {}): string | null {
   const env = process.env.PI_BRIDGE_DEBUG;
   if (env) return env;
+  if (cfg.debugLog) return cfg.debugLog;
   const xdg = process.env.XDG_RUNTIME_DIR;
   if (!xdg) return null;
   const marker = path.join(xdg, "pi-weechat.debug");
@@ -59,8 +69,8 @@ function dbg(msg: string): void {
   }
 }
 
-function reinitDebugLog(): void {
-  const p = resolveDebugLogPath();
+function reinitDebugLog(cfg: BridgeConfig = {}): void {
+  const p = resolveDebugLogPath(cfg);
   if (p !== debugLogPath) {
     dbg(`debug log ${p ? "ENABLED" : "disabled"}: ${p ?? "(no marker)"}`);
     debugLogPath = p;
@@ -87,17 +97,27 @@ function describeEndpoint(ep: Endpoint): string {
 let sockDeprecationNoted = false;
 
 /**
- * Resolve where to dial: PI_WEECHAT_URL (tcp://host:port, unix://<path>,
- * schemeless host:port → tcp, anything else → socket path), else the
- * deprecated PI_WEECHAT_SOCK, else the default unix path.
+ * Resolve where to dial, first match wins: $PI_WEECHAT_URL, then the config
+ * file's `url`, then the deprecated $PI_WEECHAT_SOCK, then the default unix
+ * path. (tcp://host:port, unix://<path>, schemeless host:port → tcp,
+ * anything else → socket path.)
  */
-function resolveEndpoint(): Endpoint {
+function resolveEndpoint(cfg: BridgeConfig = {}, onProblem?: (msg: string) => void): Endpoint {
   const url = process.env.PI_WEECHAT_URL;
   if (url) {
     try {
       return parseEndpoint(url) as Endpoint;
     } catch (err) {
       dbg(`PI_WEECHAT_URL is invalid (${String(err)}); falling back to the unix socket path`);
+    }
+  }
+  if (cfg.url) {
+    try {
+      return parseEndpoint(cfg.url) as Endpoint;
+    } catch (err) {
+      const msg = `pi-weechat.json "url" is invalid (${String(err)}); falling back to the unix socket path`;
+      dbg(msg);
+      onProblem?.(msg);
     }
   }
   if (process.env.PI_WEECHAT_SOCK) {
@@ -118,8 +138,7 @@ function makeProof(token: string, nonce: string): string {
 }
 
 export default function weechatBridge(pi: ExtensionAPI) {
-  reinitDebugLog();
-  let endpoint: Endpoint = resolveEndpoint();
+  let endpoint: Endpoint;
   let token = "";
   let sock: net.Socket | null = null;
   let decoder: LineDecoder | null = null;
@@ -139,6 +158,28 @@ export default function weechatBridge(pi: ExtensionAPI) {
   let thinkBufs = new Map<number, string>();
   let msgSeq = 0;
   let currentMsgId = 0;
+
+  // -------------------------------------------------------------- config
+
+  /**
+   * (Re)read the config file + env vars. Called at extension load and at
+   * every session_start, so edits to pi-weechat.json or the environment are
+   * picked up by /reload without restarting pi. A broken file never breaks
+   * the bridge: it degrades to env/default values, is noted in the debug
+   * log, and surfaces as a red `config_error` line in the buffer.
+   */
+  function refreshConfig(): void {
+    const cfg = loadConfig({
+      onError: (m: string) => {
+        dbg(m);
+        send({ type: "error", code: "config_error", message: m });
+      },
+    }) as BridgeConfig;
+    reinitDebugLog(cfg); // picks up a marker file / debugLog seen after load
+    endpoint = resolveEndpoint(cfg, (m) => send({ type: "error", code: "config_error", message: m }));
+    token = process.env.PI_WEECHAT_TOKEN ?? (cfg.token ?? "");
+  }
+  refreshConfig(); // at load time (session_start refreshes again)
 
   // ------------------------------------------------------------------ send
 
@@ -326,7 +367,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
           // The server dropped us for a bad proof — usually a token
           // mismatch. Keep retrying with the normal backoff; the buffer
           // side already printed the red error line.
-          dbg("AUTH FAILED: token mismatch? check PI_WEECHAT_TOKEN / pi_bridge.token — retrying");
+          dbg("AUTH FAILED: token mismatch? check PI_WEECHAT_TOKEN / pi-weechat.json \"token\" / pi_bridge.token — retrying");
         } else {
           dbg("error from weechat: " + JSON.stringify(msg).slice(0, 200));
         }
@@ -427,10 +468,8 @@ export default function weechatBridge(pi: ExtensionAPI) {
   // --------------------------------------------------------------- events
 
   pi.on("session_start", async (_event, ctx) => {
-    reinitDebugLog(); // picks up a marker file created after process start
-    // (re-)read the endpoint + token: env can change across /reload
-    endpoint = resolveEndpoint();
-    token = process.env.PI_WEECHAT_TOKEN ?? "";
+    // (re-)read config file + env: both can change across /reload
+    refreshConfig();
     shutdown = false;
     attempt = 0;
     busy = false;

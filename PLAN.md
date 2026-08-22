@@ -35,7 +35,7 @@ pi as user input.
   clients are rejected with a short error message; in-flight handshakes are
   capped and time out — §6).
 - **Pi extension = socket client.** Dials the endpoint from
-  `PI_WEECHAT_URL` (or the deprecated `PI_WEECHAT_SOCK`) on `session_start`,
+  env / config file (§2 order) on `session_start`,
   retries with exponential backoff (1s → 30s cap) while WeeChat/pi order is
   different, and transparently reconnects if the peer dies. On
   `session_shutdown` it closes the socket cleanly.
@@ -48,12 +48,20 @@ confidentiality is the VPN's job (§6).
 
 ## 2. Socket & protocol
 
-- **Endpoints (pi dials):** `$PI_WEECHAT_URL` — `tcp://host:port`,
+- **Endpoints (pi dials):** first match wins — `$PI_WEECHAT_URL`, then
+  `"url"` in the pi-side config file, then the deprecated `$PI_WEECHAT_SOCK`,
+  then `$XDG_RUNTIME_DIR/pi-weechat.sock`, then
+  `~/.local/state/pi-weechat/pi-weechat.sock`. URL syntax: `tcp://host:port`,
   `unix://<path>` (or `unix:<path>`), schemeless `host:port` (numeric port) ⇒
   TCP, anything else ⇒ socket path; unknown scheme ⇒ error (extension point).
-  Falls back to the deprecated `$PI_WEECHAT_SOCK`, then
-  `$XDG_RUNTIME_DIR/pi-weechat.sock`, then
-  `~/.local/state/pi-weechat/pi-weechat.sock`. On the WeeChat side the Unix
+  **pi-side config file** (`lib/pi-config.mjs`):
+  `<agent dir>/pi-weechat.json` — agent dir follows `$PI_CODING_AGENT_DIR`
+  (default `~/.pi/agent`, next to pi's own settings.json); keys `url`,
+  `token`, `debugLog` mirror `PI_WEECHAT_URL` / `PI_WEECHAT_TOKEN` /
+  `PI_BRIDGE_DEBUG`; env vars win over the file; re-read at every
+  `session_start` (so `/reload` picks up edits); a broken file degrades to
+  env/default behavior + red `config_error` line in the buffer. On the
+  WeeChat side the Unix
   path uses the same env/XDG logic; the TCP bind address is the
   `pi_bridge.tcp_listen` plugin option. Unix socket created with `0700`.
 - **Framing:** newline-delimited JSON (NDJSON), UTF-8. Max message size guard
@@ -304,8 +312,9 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 | `pi_bridge.token` | WeeChat option; recommended value `${sec.data.pi_weechat_token}` (`/secure set pi_weechat_token …`) | empty (no enforcement) |
 | `pi_bridge.allowed_ips` | WeeChat option; regex of peer IPs accepted on the TCP listener (empty = allow all) | empty |
 | `pi_bridge.tool_output` | WeeChat option (`/set pi_bridge.tool_output full\|summary\|off`, or `!tools <mode>` in the buffer) | `summary` |
-| `PI_WEECHAT_URL`     | pi extension env: `tcp://host:port` / `unix://<path>` / `host:port` / path | unset ⇒ `PI_WEECHAT_SOCK` (deprecated) ⇒ default unix path |
-| `PI_WEECHAT_TOKEN`   | pi extension env: shared secret for the challenge (never in the URL) | unset (anonymous) |
+| `PI_WEECHAT_URL`     | pi extension env: `tcp://host:port` / `unix://<path>` / `host:port` / path | unset ⇒ config-file `url` ⇒ `PI_WEECHAT_SOCK` (deprecated) ⇒ default unix path |
+| `PI_WEECHAT_TOKEN`   | pi extension env: shared secret for the challenge (never in the URL) | unset (anonymous) ⇒ config-file `token` |
+| `pi-weechat.json`    | pi-side config file `<agent dir>/pi-weechat.json` (agent dir = `$PI_CODING_AGENT_DIR`, default `~/.pi/agent`); keys `url` / `token` / `debugLog` mirror the env vars above — **env always wins over the file**; re-read at each `session_start`; broken file ⇒ env/default behavior + red `config_error` line | missing (fine) |
 | socket path (unix)   | weechat side: same env / XDG dirs | `$XDG_RUNTIME_DIR/pi-weechat.sock` |
 
 ## 8. Milestones
