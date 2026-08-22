@@ -1,18 +1,21 @@
 /**
  * weechat-bridge.ts — pi extension: mirror this session into a WeeChat buffer.
  *
- * Connects (as client) to the Unix socket served by the WeeChat script
- * (weechat/pi_bridge.py), mirrors assistant text (batched into whole lines),
- * tool calls/results, and status; forwards lines typed in the WeeChat buffer
- * back to pi as user input. Wire format: NDJSON, see PLAN.md §2.
+ * Dials (as client) the WeeChat script (weechat/pi_bridge.py) over a Unix
+ * socket or TCP (PI_WEECHAT_URL: tcp://host:port, unix://<path>, …), mirrors
+ * assistant text (batched into whole lines), tool calls/results, and status;
+ * forwards lines typed in the WeeChat buffer back to pi as user input.
+ * Wire format: NDJSON, protocol 2 (challenge-response auth when a token is
+ * configured — the token is never sent). See PLAN.md §2.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 // @ts-ignore - plain ESM module, no types needed
-import { LineDecoder, PROTOCOL_VERSION } from "../lib/codec.mjs";
+import { LineDecoder, PROTOCOL_VERSION, parseEndpoint } from "../lib/codec.mjs";
 
 const MAX_TOOL_OUTPUT = 8192;
 const DEBUG_LOG_MAX_BYTES = 1_000_000; // rotate above this
@@ -68,17 +71,56 @@ const PING_INTERVAL_MS = 30_000;
 const PONG_TIMEOUT_MS = 90_000;
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
+const DIAL_TIMEOUT_MS = 10_000; // TCP: filtered/blackholed ports never ECONNREFUSE
+const CHALLENGE_WAIT_MS = 3_000; // wait for the server's challenge when a token is set
 
-function resolveSocketPath(): string {
-  if (process.env.PI_WEECHAT_SOCK) return process.env.PI_WEECHAT_SOCK;
+type Endpoint =
+  | { kind: "tcp"; host: string; port: number }
+  | { kind: "unix"; path: string };
+
+function describeEndpoint(ep: Endpoint): string {
+  return ep.kind === "tcp"
+    ? `tcp://${ep.host}:${ep.port}`
+    : `unix:${ep.path}`;
+}
+
+let sockDeprecationNoted = false;
+
+/**
+ * Resolve where to dial: PI_WEECHAT_URL (tcp://host:port, unix://<path>,
+ * schemeless host:port → tcp, anything else → socket path), else the
+ * deprecated PI_WEECHAT_SOCK, else the default unix path.
+ */
+function resolveEndpoint(): Endpoint {
+  const url = process.env.PI_WEECHAT_URL;
+  if (url) {
+    try {
+      return parseEndpoint(url) as Endpoint;
+    } catch (err) {
+      dbg(`PI_WEECHAT_URL is invalid (${String(err)}); falling back to the unix socket path`);
+    }
+  }
+  if (process.env.PI_WEECHAT_SOCK) {
+    if (!sockDeprecationNoted) {
+      sockDeprecationNoted = true;
+      dbg("note: PI_WEECHAT_SOCK is deprecated — use PI_WEECHAT_URL (e.g. unix://<path>)");
+    }
+    return { kind: "unix", path: process.env.PI_WEECHAT_SOCK };
+  }
   const xdg = process.env.XDG_RUNTIME_DIR;
-  if (xdg) return path.join(xdg, "pi-weechat.sock");
-  return path.join(os.homedir(), ".local", "state", "pi-weechat", "pi-weechat.sock");
+  if (xdg) return { kind: "unix", path: path.join(xdg, "pi-weechat.sock") };
+  return { kind: "unix", path: path.join(os.homedir(), ".local", "state", "pi-weechat", "pi-weechat.sock") };
+}
+
+/** Shared-secret proof for the protocol-2 challenge (the token itself is never sent). */
+function makeProof(token: string, nonce: string): string {
+  return crypto.createHmac("sha256", token).update(nonce).digest("hex");
 }
 
 export default function weechatBridge(pi: ExtensionAPI) {
   reinitDebugLog();
-  let socketPath = resolveSocketPath();
+  let endpoint: Endpoint = resolveEndpoint();
+  let token = "";
   let sock: net.Socket | null = null;
   let decoder: LineDecoder | null = null;
   let shutdown = false; // session_shutdown was emitted; stop reconnecting
@@ -89,6 +131,8 @@ export default function weechatBridge(pi: ExtensionAPI) {
   let ctxRef: any = null; // latest ExtensionContext (for ctx.abort())
   let busy = false;           // agent_start seen without agent_settled
   let pendingOut: string[] = []; // messages emitted before the socket is up
+  let helloSent = false;         // our hello went out for the current connection
+  let challengeTimer: NodeJS.Timeout | null = null;
 
   // Streaming assembly: assistant text + thinking blocks, keyed by contentIndex.
   let blockBufs = new Map<number, string>();
@@ -112,6 +156,31 @@ export default function weechatBridge(pi: ExtensionAPI) {
   function flushPending(): void {
     for (const line of pendingOut) sock?.write(line);
     pendingOut = [];
+  }
+
+  /**
+   * Send the handshake hello, then the pending queue.
+   *
+   * Protocol 2: the hello MUST go out first (the server ignores everything
+   * before a valid hello). With a configured token the server answers its
+   * challenge with proof = HMAC-SHA256(token, nonce) — the token itself is
+   * never transmitted. `proof` is only included when non-empty.
+   */
+  function sendHello(proof?: string): void {
+    if (helloSent) return;
+    helloSent = true;
+    if (challengeTimer) {
+      clearTimeout(challengeTimer);
+      challengeTimer = null;
+    }
+    const hello: Record<string, unknown> = {
+      type: "hello",
+      protocol: PROTOCOL_VERSION,
+      name: "pi-weechat-bridge",
+    };
+    if (proof) hello.proof = proof;
+    send(hello);
+    flushPending();
   }
 
   // -------------------------------------------------------------- connect
@@ -142,6 +211,11 @@ export default function weechatBridge(pi: ExtensionAPI) {
 
   function disconnect(): void {
     stopPing();
+    if (challengeTimer) {
+      clearTimeout(challengeTimer);
+      challengeTimer = null;
+    }
+    helloSent = false;
     if (sock) {
       sock.destroy();
       sock = null;
@@ -155,20 +229,41 @@ export default function weechatBridge(pi: ExtensionAPI) {
     if (shutdown) return;
     if (sock && !sock.destroyed) return;
 
-    dbg(`dialing ${socketPath}`);
-    const s = net.connect(socketPath);
+    const ep = endpoint;
+    dbg(`dialing ${describeEndpoint(ep)}`);
+    const s =
+      ep.kind === "tcp"
+        ? net.connect({ host: ep.host, port: ep.port })
+        : net.connect(ep.path);
     sock = s;
     decoder = new LineDecoder(onMessage, {
       onError: (e: Error) =>
         send({ type: "error", code: "client_error", message: e.message }),
     });
 
+    if (ep.kind === "tcp") {
+      // filtered/blackholed ports never deliver ECONNREFUSED; time the dial
+      s.setTimeout(DIAL_TIMEOUT_MS);
+      s.once("timeout", () => {
+        dbg(`dial timeout after ${DIAL_TIMEOUT_MS}ms`);
+        s.destroy(); // → "close" → scheduleReconnect
+      });
+    }
+
     s.once("connect", () => {
-      dbg(`connected (flushing ${pendingOut.length} pending)`);
+      s.setTimeout(0); // dial timeout done; the ping/pong loop covers liveness
+      dbg(`connected (flushing ${pendingOut.length} pending after hello)`);
       attempt = 0;
       lastPongAt = Date.now();
-      flushPending(); // session_info/status emitted before connect
-      send({ type: "hello", protocol: PROTOCOL_VERSION, name: "pi-weechat-bridge" });
+      if (token) {
+        // The server sends a challenge only when IT has a token configured.
+        // Wait briefly for it; if none arrives (server has no token) a bare
+        // hello is accepted anyway, so the fallback is safe.
+        challengeTimer = setTimeout(() => sendHello(undefined), CHALLENGE_WAIT_MS);
+        void challengeTimer.unref?.();
+      } else {
+        sendHello(undefined);
+      }
       stopPing();
       pingTimer = setInterval(() => {
         if (Date.now() - lastPongAt > PONG_TIMEOUT_MS) {
@@ -208,11 +303,32 @@ export default function weechatBridge(pi: ExtensionAPI) {
         (typeof msg.text === "string" && msg.text.length > 200 ? ` …(+${msg.text.length - 200} chars)` : ""),
     );
     switch (msg.type) {
+      case "challenge": {
+        // Server-side shared-secret challenge (token configured on the
+        // WeeChat side). Answer with the HMAC proof; the token itself is
+        // never sent, and a captured proof is useless (fresh nonce per
+        // connection).
+        if (!helloSent) {
+          const nonce = typeof msg.nonce === "string" ? msg.nonce : "";
+          sendHello(nonce ? makeProof(token, nonce) : undefined);
+        }
+        return;
+      }
       case "hello":
         if (intOf(msg.protocol) !== PROTOCOL_VERSION) {
           send({ type: "error", code: "protocol_mismatch" });
           disconnect();
           scheduleReconnect();
+        }
+        return;
+      case "error":
+        if (msg.code === "auth_failed") {
+          // The server dropped us for a bad proof — usually a token
+          // mismatch. Keep retrying with the normal backoff; the buffer
+          // side already printed the red error line.
+          dbg("AUTH FAILED: token mismatch? check PI_WEECHAT_TOKEN / pi_bridge.token — retrying");
+        } else {
+          dbg("error from weechat: " + JSON.stringify(msg).slice(0, 200));
         }
         return;
       case "pong":
@@ -312,6 +428,9 @@ export default function weechatBridge(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     reinitDebugLog(); // picks up a marker file created after process start
+    // (re-)read the endpoint + token: env can change across /reload
+    endpoint = resolveEndpoint();
+    token = process.env.PI_WEECHAT_TOKEN ?? "";
     shutdown = false;
     attempt = 0;
     busy = false;

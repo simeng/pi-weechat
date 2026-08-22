@@ -1,23 +1,25 @@
 # pi-weechat — Mirror pi agent I/O through a WeeChat buffer
 
 Goal: chat with a [pi](https://pi.dev) coding agent from inside WeeChat. A pi
-**package** (extension) and a **WeeChat Python script** run on the same machine
-and communicate over a local Unix domain socket. Everything pi says — assistant
-streaming text, tool calls, results, status changes — is mirrored into a
-dedicated WeeChat buffer, and anything typed in that buffer is sent to pi as
-user input.
+**package** (extension) and a **WeeChat Python script** communicate over a
+local Unix domain socket — or, since protocol 2, over TCP when pi runs on a
+different machine (opt-in, shared-secret auth, see §6). Everything pi says —
+assistant streaming text, tool calls, results, status changes — is mirrored
+into a dedicated WeeChat buffer, and anything typed in that buffer is sent to
+pi as user input.
 
 ## 1. Architecture
 
 ```
 ┌───────────────────────────┐          ┌──────────────────────────────┐
-│  WeeChat                   │          │  pi (TUI or headless)         │
+│  WeeChat (machine A)      │          │  pi (machine B, or same box) │
 │  ┌───────────────────────┐ │  Unix   │  ┌──────────────────────────┐ │
 │  │ buffer "pi"           │ │  domain │  │ extension                 │ │
 │  │  pi_bridge.py         │◄┼─socket──┼►│  weechat-bridge.ts        │ │
-│  │  · socket SERVER      │ │  (NDJSON│  │  · socket CLIENT          │ │
-│  │  · hook_fd read/write │ │   JSON) │  │  · node:net client +      │ │
-│  │  · buffer input_cb    │ │         │  │    reconnect backoff      │ │
+│  │  · SERVER: unix always│ │  (NDJSON│  │  · CLIENT: dials unix or  │ │
+│  │    + TCP when opt-in  │ │   JSON) │  │    tcp (PI_WEECHAT_URL)   │ │
+│  │  · hook_fd read/write │ │         │  │  · node:net + backoff     │ │
+│  │  · buffer input_cb    │ │         │  │    + challenge→proof auth │ │
 │  └──────────┬────────────┘ │         │  └──────────┬───────────────┘ │
 │             │              │         │             │ pi.on(...)       │
 │   user types line          │         │   message_start /              │
@@ -26,29 +28,56 @@ user input.
 ```
 
 - **WeeChat script = socket server.** WeeChat is the long-lived process; pi
-  sessions start/stop/reload all the time. The script `bind()`s the socket at
-  load and accepts exactly one client (extra clients are rejected with a short
-  error message).
-- **Pi extension = socket client.** Connects on `session_start`, retries with
-  exponential backoff (1s → 30s cap) while WeeChat/pi order is different, and
-  transparently reconnects if the peer dies. On `session_shutdown` it closes
-  the socket cleanly.
+  sessions start/stop/reload all the time. The script `bind()`s the Unix
+  socket at load, and — since protocol 2 — also a TCP listener when
+  `pi_bridge.tcp_listen` is set (live rebind, no reload). Across BOTH
+  transports it admits exactly one authenticated client at a time (extra
+  clients are rejected with a short error message; in-flight handshakes are
+  capped and time out — §6).
+- **Pi extension = socket client.** Dials the endpoint from
+  `PI_WEECHAT_URL` (or the deprecated `PI_WEECHAT_SOCK`) on `session_start`,
+  retries with exponential backoff (1s → 30s cap) while WeeChat/pi order is
+  different, and transparently reconnects if the peer dies. On
+  `session_shutdown` it closes the socket cleanly.
 
-Why a Unix socket (not TCP loopback or pipes): same machine only, no port
-collisions, no network exposure, and both sides already have first-class
-non-blocking fd APIs (`hook_fd` on WeeChat, `node:net` on pi).
+Why a Unix socket locally: same machine, no port collisions, no network
+exposure. Why TCP is fine remotely: both sides already have first-class
+fd APIs (`hook_fd` on WeeChat, `node:net` on pi), and the shared-secret
+challenge (below) keeps a captured wire useless for impersonation —
+confidentiality is the VPN's job (§6).
 
 ## 2. Socket & protocol
 
-- **Path:** `$XDG_RUNTIME_DIR/pi-weechat.sock`, falling back to
-  `~/.local/state/pi-weechat/pi-weechat.sock`. Overridable by config on both
-  sides (`pi_bridge.py` reads a WeeChat option; the extension reads an env var
-  / pi setting). Socket created with `0700` permissions.
+- **Endpoints (pi dials):** `$PI_WEECHAT_URL` — `tcp://host:port`,
+  `unix://<path>` (or `unix:<path>`), schemeless `host:port` (numeric port) ⇒
+  TCP, anything else ⇒ socket path; unknown scheme ⇒ error (extension point).
+  Falls back to the deprecated `$PI_WEECHAT_SOCK`, then
+  `$XDG_RUNTIME_DIR/pi-weechat.sock`, then
+  `~/.local/state/pi-weechat/pi-weechat.sock`. On the WeeChat side the Unix
+  path uses the same env/XDG logic; the TCP bind address is the
+  `pi_bridge.tcp_listen` plugin option. Unix socket created with `0700`.
 - **Framing:** newline-delimited JSON (NDJSON), UTF-8. Max message size guard
   of 1 MiB (larger tool outputs are chunked by the sender, see §5).
-- **Handshake:** first message in each direction is
-  `{"type":"hello","protocol":1,"name":"weechat-pi-bridge"}`. Version mismatch
-  → close with `{"type":"error","code":"protocol_mismatch",...}`.
+- **Protocol version: 2** (both sides upgrade together; mismatch still yields
+  `protocol_mismatch`).
+- **Handshake (gated, both transports):** the server ignores everything from
+  a client until a valid `hello` arrives (no prompt-injection before auth).
+  - *No token configured:* client sends
+    `{"type":"hello","protocol":2,"name":"pi-weechat-bridge"}` first, then its
+    pending queue; the server answers with its own hello only after
+    validating the protocol.
+  - *Token configured (shared secret — the token is never sent):* the server
+    first sends `{"type":"challenge","nonce":<256-bit random hex>}`; the
+    client answers with the hello carrying `"proof": hex(HMAC-SHA256(key=token,
+    msg=nonce))`. Constant-time compare; wrong/missing proof →
+    `{"type":"error","code":"auth_failed"}` + drop. Fresh nonce per connection
+    ⇒ captured proofs can't be replayed. The server's hello is withheld until
+    the client is validated, so unauthenticated peers see no protocol data.
+
+| type (new in v2) | payload | direction | meaning |
+|---|---|---|---|
+| `challenge` | `{nonce}` | server → client | shared-secret challenge (only when a token is set) |
+| `hello.proof` | `{...}` | client | `hex(HMAC-SHA256(token, nonce))`; only when a token is set |
 
 ### Message types (pi extension → WeeChat)
 
@@ -113,10 +142,16 @@ weechat.hook_fd(fd, 1, 0, 4, "pi_fd_cb", "")   # READ | HUP flags; cb(data, fd) 
 
 Design:
 
-- **Server socket:** bound in `weechat.register()` path (module load). Accept
-  via a listening-fd hook (`hook_fd` with the listen flag); on connect, `bind()`
-  the client fd to the same read/hup callback. Only one client at a time; if a
-  second connects, reply one `error{code: "client_already_connected"}` and close.
+- **Server sockets:** the Unix socket is bound at module load; the optional
+  TCP listener (`pi_bridge.tcp_listen`) starts/stops on option change via
+  `hook_config` (live rebind — the `urlserver.py` pattern: blocking listen
+  fd, one plain `accept()` per `hook_fd` event, `SO_REUSEADDR`, `listen(5)`,
+  status line from `getsockname()`). Both funnels share one accept path:
+  peer-IP gates first (lockout, `allowed_ips`), then one client at a time —
+  an extra connected client gets one `error{code: "client_already_connected"}`;
+  up to 3 in-flight handshakes are held, then closed silently. Client fds are
+  non-blocking in both transports, with the shared `rxbuff` + write-hook
+  backpressure model.
 - **Reader:** accumulate in a buffer, split on `\n`, JSON-parse each line,
   dispatch on `type`. Partial reads wait for more data (return `RC_OK`).
 - **Writer:** `sendall()` is safe enough at these volumes; if the socket ever
@@ -237,8 +272,26 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 
 ## 6. Security
 
-- Local socket only: file mode `0700`, created in the user's private
-  state dir. No network listener, no auth needed beyond Unix ownership.
+- **Local (Unix):** file mode `0700` in the user's private state dir. When a
+  token is configured it is enforced on the Unix transport too — no weaker
+  path on localhost. Handshake gating applies to both transports.
+- **Remote (TCP) — shared-secret model:** the pre-shared token authenticates
+  but does NOT encrypt (cleartext NDJSON). The challenge-response design
+  means the token never crosses the wire and captured handshakes can't be
+  replayed (fresh nonce), but an **active MITM can still relay** the session
+  ⇒ run remote setups inside Tailscale/a VPN. Token guidance: ≥ 128 bits of
+  entropy (`openssl rand -hex 16`), never a password/reused secret; stored
+  encrypted in `sec.conf` (`${sec.data.…}` reference) on the WeeChat side and
+  in `PI_WEECHAT_TOKEN` on the pi side — never literally in `weechat.conf`,
+  never in the URL.
+- **Server-side hardening** (module constants in `pi_bridge.py`): constant-time
+  HMAC compare · 10 s auth deadline (silent drop) · ≤ 3 unauthenticated
+  connections · per-IP failure lockout (> 5 failures / 60 s ⇒ 600 s silent
+  ignore — no knocking oracle; behind shared NAT the NAT's IP is what gets
+  locked) · `pi_bridge.allowed_ips` peer-IP regex gate at accept (silent) ·
+  per-event read cap 256 KiB (bursts can't stall WeeChat's UI) · `user_input`
+  rate limit 5/s (bounds LLM spend if a token leaks) · server hello withheld
+  until validation (no service fingerprint for scanners).
 - WeeChat side never executes anything from the socket; pi side treats
   incoming JSON as data. The pi extension is untrusted-code-by-design (all pi
   extensions are) — review before installing.
@@ -247,8 +300,13 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 
 | setting              | where                          | default                             |
 |----------------------|--------------------------------|-------------------------------------|
+| `pi_bridge.tcp_listen` | WeeChat option (`/set pi_bridge.tcp_listen host:port`; `0.0.0.0:port` for LAN/Tailscale) — live rebind, no reload | empty (off) |
+| `pi_bridge.token` | WeeChat option; recommended value `${sec.data.pi_weechat_token}` (`/secure set pi_weechat_token …`) | empty (no enforcement) |
+| `pi_bridge.allowed_ips` | WeeChat option; regex of peer IPs accepted on the TCP listener (empty = allow all) | empty |
 | `pi_bridge.tool_output` | WeeChat option (`/set pi_bridge.tool_output full\|summary\|off`, or `!tools <mode>` in the buffer) | `summary` |
-| socket path          | pi extension: `PI_WEECHAT_SOCK` env or `.pi/settings.json` extension setting; weechat side: same env / XDG dirs | `$XDG_RUNTIME_DIR/pi-weechat.sock` |
+| `PI_WEECHAT_URL`     | pi extension env: `tcp://host:port` / `unix://<path>` / `host:port` / path | unset ⇒ `PI_WEECHAT_SOCK` (deprecated) ⇒ default unix path |
+| `PI_WEECHAT_TOKEN`   | pi extension env: shared secret for the challenge (never in the URL) | unset (anonymous) |
+| socket path (unix)   | weechat side: same env / XDG dirs | `$XDG_RUNTIME_DIR/pi-weechat.sock` |
 
 ## 8. Milestones
 
@@ -264,6 +322,11 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 5. **M4 — packaging:** `pi install /path/to/pi-weechat` works; weechat script
    install instructions in README. ✅ (npm publish for the pi.dev gallery:
    optional follow-up.)
+6. **M5 — remote (TCP):** opt-in TCP listener with shared-secret auth
+   (challenge → HMAC proof, token never on the wire), handshake gating,
+   `PI_WEECHAT_URL` endpoint (deprecating `PI_WEECHAT_SOCK`), server hardening
+   (auth deadline, pending cap, IP lockout, `allowed_ips`, read cap, input
+   rate limit), live rebind via `hook_config`. ✅
 
 ## 9. Repo layout
 
@@ -288,8 +351,9 @@ pi-weechat/
 
 ## 10. Open questions
 
-- Multi-session: one pi process = one connection. If two pi instances run,
-  v1 keeps "first client wins"; v2 could multiplex by session id in the hello.
-  (Decide before M3.)
+- Multi-session: one pi process = one connection, still — now spanning both
+  transports (a TCP client and a Unix client are mutually exclusive). If two
+  pi instances run, the current build keeps "first authenticated client
+  wins"; a future version could multiplex by session id in the hello.
 - WeeChat colors: hardcode a small palette vs. read `weechat.color` settings —
   start hardcoded.

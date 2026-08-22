@@ -3,21 +3,38 @@
 # pi_bridge.py — mirror a pi coding agent session through a WeeChat buffer.
 #
 # Creates a "pi" buffer that acts as both display and input for a pi session.
-# This script is the Unix-socket SERVER; the pi extension (see
+# This script is the SERVER; the pi extension (see
 # extensions/weechat-bridge.ts) connects to it. Wire format: NDJSON, see
 # PLAN.md §2.
+#
+# Transports (one client at a time, across both):
+#   * Unix socket — always on. Path: $PI_WEECHAT_SOCK, else
+#     $XDG_RUNTIME_DIR/pi-weechat.sock, else ~/.local/state/pi-weechat/.
+#   * TCP — opt-in via `/set pi_bridge.tcp_listen host:port` (live rebind,
+#     no reload). For remote pi; the TCP listener mirrors the design of
+#     WeeChat's own urlserver.py (blocking listen fd, one accept() per
+#     event, SO_REUSEADDR, listen(5)).
+#
+# Auth (protocol 2, shared secret — the token never crosses the wire):
+#   when `pi_bridge.token` is set, EVERY client (TCP and Unix) is first
+#   sent {"type":"challenge","nonce":<random hex>} and must answer its
+#   hello with proof = hex(HMAC-SHA256(key=token, msg=nonce)). Wrong or
+#   missing proof → error{auth_failed} + drop. Empty token ⇒ anonymous
+#   (current behavior). Recommended: store the secret in sec.conf
+#   (/secure set pi_weechat_token …) and set the option to
+#   ${sec.data.pi_weechat_token}.
 #
 # Install: copy into ~/.local/share/weechat/python/ and start WeeChat, or
 #   /python load pi_bridge
 # Reload after changes: /python reload pi_bridge
-#
-# Socket path: $PI_WEECHAT_SOCK, else $XDG_RUNTIME_DIR/pi-weechat.sock,
-# else ~/.local/state/pi-weechat/pi-weechat.sock (same logic as the pi side).
 ###
 
-import errno
+import hashlib
+import hmac
 import json
 import os
+import re
+import secrets
 import socket
 import time
 
@@ -54,8 +71,19 @@ def dbg(msg):
     except Exception:
         pass  # debug must never break the bridge
 
-PROTOCOL = 1
+PROTOCOL = 2
 MAX_LINE = 1024 * 1024  # must match MAX_LINE_BYTES in lib/codec.mjs
+
+# ------------------------------------------------- abuse-resistance thresholds
+# Module constants so tests can override them; a production install keeps the
+# defaults. Rationale in README ("Threat model") and PLAN §6.
+AUTH_TIMEOUT_S = 10            # no valid hello within 10 s of accept → drop
+MAX_PENDING_UNAUTH = 3         # max accepted-but-not-authed connections
+FAIL_MAX = 5                   # auth failures per source IP within the window…
+FAIL_WINDOW_S = 60             # …that trigger a lockout
+LOCKOUT_S = 600                # …for this long (silent drop, no oracle)
+MAX_BYTES_PER_EVENT = 256 * 1024  # read budget per client fd event
+USER_INPUT_MAX_PER_S = 5       # buffer lines forwarded to pi per sliding 1 s
 
 
 def _color(name):
@@ -96,6 +124,7 @@ C_STATUS = _theme("chat_value", "cyan")             # info lines (session, modes
 C_ERR = _theme("chat_prefix_error", "yellow")       # errors
 C_OK = _theme("chat_status_enabled", "green")       # successes
 C_DIM = _theme("chat_host", "cyan")                  # hints / 💭 thinking lines
+C_REJECT = _color("red")                             # auth failures / security
 # Tool *output* body: own color, deliberately a fixed palette color (no
 # canonical WeeChat [color] slot for this role; theme-following risks
 # collapsing back onto chat_host/cyan and looking identical to thinking).
@@ -158,19 +187,97 @@ def default_socket_path():
     return os.path.join(state, "pi-weechat", "pi-weechat.sock")
 
 
+def _proof(token, nonce):
+    """Shared-secret proof: hex(HMAC-SHA256(key=token, msg=nonce)).
+
+    The token is never transmitted — only this one-way derivation, bound to
+    a fresh per-connection nonce (a captured proof is useless on the next
+    connection). The pi extension computes the same value with node:crypto.
+    """
+    return hmac.new(token.encode("utf-8"),
+                    str(nonce).encode("ascii"),
+                    hashlib.sha256).hexdigest()
+
+
+def _parse_tcp_listen(raw):
+    """Parse the pi_bridge.tcp_listen option ("host:port").
+
+    Empty host ⇒ 0.0.0.0. Returns (host, port) or (None, 0) when invalid.
+    """
+    idx = raw.rfind(":")
+    if idx < 0:
+        return None, 0
+    host = raw[:idx] or "0.0.0.0"
+    port_str = raw[idx + 1:]
+    if not port_str.isdigit():
+        return None, 0
+    port = int(port_str)
+    if not (1 <= port <= 65535):
+        return None, 0
+    return host, port
+
+
+def _local_ip():
+    """Best-effort primary local IPv4 address (no packet is actually sent)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("1.1.1.1", 53))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return "?"
+
+
 class Bridge(object):
     def __init__(self):
         self.buffer = None
         self.alive = False            # buffer still open?
         self.sock_path = default_socket_path()
+        # unix listener (always on)
         self.listen_sock = None
-        self.client = None            # accepted client socket (or None)
-        self.listen_hook = None       # hook_fd handle for the listen socket
-        self.client_hook = None       # hook_fd handle for the client read side
-        self.write_hook = None        # hook_fd handle for the write side
-        self.rxbuff = b""
-        self.outq = b""
+        self.listen_hook = None
+        # tcp listener (opt-in, live rebind via pi_config_cb)
+        self.tcp_listen_sock = None
+        self.tcp_listen_hook = None
+        self.tcp_listen_value = ""
+        self.config_hook = None
+        # connections: one AUTHED client + a few in-handshake pendings
+        self.client = None            # the authenticated conn (dict, or None)
+        self.pending = []             # accepted, not authed yet (list of dicts)
+        # per-IP abuse state (TCP peers only)
+        self.ip_failures = {}         # ip -> [timestamps of auth failures]
+        self.ip_lockouts = {}         # ip -> lockout-until (epoch)
+        # user_input (buffer → pi) rate-limit window
+        self.ui_times = []
         self.state = "waiting"        # waiting | idle | thinking | tool:<name>
+
+    # ------------------------------------------------------- connection state
+
+    def _new_conn(self, conn_sock, ip, peer):
+        return {
+            "sock": conn_sock,
+            "fd": conn_sock.fileno(),
+            "ip": ip,                 # None for unix
+            "peer": peer,             # human label for logs/prints
+            "rxbuff": b"",
+            "outq": b"",
+            "read_hook": None,
+            "write_hook": None,
+            "timer": None,            # auth-deadline hook_timer handle
+            "authed": False,
+            "token": None,            # token we challenged with (None = anon)
+            "nonce": None,
+        }
+
+    def _conn_by_fd(self, fd):
+        if self.client is not None and self.client["fd"] == fd:
+            return self.client
+        for conn in self.pending:
+            if conn["fd"] == fd:
+                return conn
+        return None
 
     # ---------------------------------------------------------------- buffer
 
@@ -212,161 +319,47 @@ class Bridge(object):
         if self.alive and self.buffer and title:
             weechat.buffer_set(self.buffer, "title", title)
 
-    # ---------------------------------------------------------------- socket
+    # ---------------------------------------------------------------- options
 
-    def make_server(self):
-        path = self.sock_path
-        directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
+    def _opt(self, name):
+        """Read a pi_bridge.* plugin option (WeeChat expands ${sec.data.…})."""
+        if weechat is None:
+            return ""
         try:
-            os.unlink(path)  # stale socket from a previous run
-        except OSError:
-            pass
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(path)
-        os.chmod(path, 0o700)
-        sock.listen(1)
-        sock.setblocking(False)
-        self.listen_sock = sock
-        self.listen_hook = weechat.hook_fd(sock.fileno(), 1, 0, 0, "pi_listen_cb", "")
-        return True
+            return (weechat.config_get_plugin(name) or "").strip()
+        except Exception:
+            return ""
 
-    def accept_pending(self):
-        """Called on read event of the listen socket."""
-        while True:
-            try:
-                client, _addr = self.listen_sock.accept()
-            except BlockingIOError:
-                return
-            except OSError:
-                self._print(C_ERR + "pi bridge: accept error" + R)
-                return
-            if self.client is not None:
-                # one client at a time (v1)
-                try:
-                    client.sendall((json.dumps({"type": "error", "code":
-                        "client_already_connected"}) + "\n").encode())
-                except OSError:
-                    pass
-                dbg("accept: rejected second client")
-                client.close()
-                continue
-            client.setblocking(False)
-            dbg("accept: new client fd=%s" % client.fileno())
-            self.client = client
-            self.rxbuff = b""
-            self.outq = b""
-            self.client_hook = weechat.hook_fd(client.fileno(), 1, 0, 0, "pi_client_cb", "")
-            self._send({"type": "hello", "protocol": PROTOCOL,
-                        "name": "weechat-pi-bridge"})
-            self.set_state("idle")
-            self._print(C_OK + "— pi connected —" + R)
+    def _token(self):
+        return self._opt("token")
 
-    def client_event(self, fd):
-        """Read events (and HUP) for the accepted client."""
-        if self.client is None:
-            return
-        if fd is not None and int(fd) < 0:
-            # hooked fd gone (e.g. we closed it)
-            self.drop_client()
-            return
+    def _allowed_ips_re(self):
+        """Compiled allowed_ips regex, or None (empty = allow all)."""
+        raw = self._opt("allowed_ips")
+        if not raw:
+            return None
         try:
-            data = self.client.recv(65536)
-        except BlockingIOError:
-            return
-        except OSError as e:
-            dbg("recv error: %s" % e)
-            data = b""
-        if not data:  # peer closed (recv == 0) or error → disconnect
-            dbg("recv 0 bytes — peer closed, dropping client")
-            self.drop_client()
-            return
-        dbg("recv %d bytes" % len(data))
-        self.rxbuff += data
-        while b"\n" in self.rxbuff:
-            line, self.rxbuff = self.rxbuff.split(b"\n", 1)
-            if len(line) > MAX_LINE:
-                self._print(C_ERR + "pi bridge: dropped oversized message" + R)
-                continue
-            try:
-                msg = json.loads(line.decode("utf-8", "replace"))
-            except ValueError:
-                self._print(C_ERR + "pi bridge: bad JSON line ignored" + R)
-                continue
-            if isinstance(msg, dict):
-                try:
-                    self.dispatch(msg)
-                except Exception as e:  # never let one bad message kill the loop
-                    self._print(C_ERR + "pi bridge: dispatch error: %s%s" % (e, R))
-        if len(self.rxbuff) > MAX_LINE:
-            self.rxbuff = b""
+            return re.compile(raw)
+        except re.error as err:
+            dbg("allowed_ips: invalid regex %r: %s (treating as allow-all)"
+                % (raw, err))
+            return None
 
-    def drop_client(self):
-        dbg("drop_client")
-        if self.client is not None:
-            try:
-                self.client.close()
-            except OSError:
-                pass
-            self.client = None
-        # unhook BOTH fd hooks for the old client; leaving them behind makes
-        # WeeChat poll a closed fd ("Bad file descriptor used in hook_fd")
-        # and re-fire stale callbacks if a new client reuses the fd number.
-        if self.client_hook:
-            weechat.unhook(self.client_hook)
-            self.client_hook = None
-        if self.write_hook:
-            weechat.unhook(self.write_hook)
-            self.write_hook = None
-        self.rxbuff = b""
-        self.outq = b""
-        self.set_state("waiting")
-        self._print(C_DIM + "— pi disconnected —" + R)
-
-    # ------------------------------------------------------------- sending
-
-    def _send(self, obj):
-        if self.client is None:
-            dbg("_send %s DROPPED (no client)" % obj.get("type"))
-            return
-        line = (json.dumps(obj, separators=(",", ":")) + "\n").encode()
-        self.outq += line
-        dbg(">> send %s (%d bytes, outq=%d)" % (obj.get("type"), len(line), len(self.outq)))
-        # Flush synchronously: do not rely on the write-readiness hook to
-        # fire — if it ever doesn't, outbound messages (user input, pongs)
-        # would sit in outq forever. The hook is kept only as a backpressure
-        # fallback for the rare case the socket buffer is full.
-        self._try_flush()
-
-    def _try_flush(self):
-        while self.outq:
-            if self.client is None:
-                return
-            try:
-                n = self.client.send(self.outq)
-            except BlockingIOError:
-                dbg("flush: backpressure (outq=%d), waiting for write hook" % len(self.outq))
-                if self.write_hook is None:
-                    self.write_hook = weechat.hook_fd(
-                        self.client.fileno(), 0, 1, 0, "pi_write_cb", "")
-                return
-            except OSError as e:
-                dbg("flush: send error %s — dropping client" % e)
-                self.drop_client()
-                return
-            self.outq = self.outq[n:]
-        dbg("flush: outq empty")
-        if self.write_hook:
-            weechat.unhook(self.write_hook)
-            self.write_hook = None
-
-    def flush_outq(self, fd):
-        # write-readiness event: only matters after a backpressure pause
-        dbg("write_cb fired (outq=%d)" % len(self.outq))
-        self._try_flush()
-
-    # ---------------------------------------------------------- dispatching
+    def config_warnings(self):
+        """Loud buffer warnings for common misconfigurations."""
+        token = self._token()
+        if "${" in token:
+            self._print(C_REJECT +
+                        "pi_bridge.token still contains a ${…} reference — it "
+                        "was not expanded. Store the secret with "
+                        "/secure set pi_weechat_token <token> and use "
+                        "/set pi_bridge.token \"${sec.data.pi_weechat_token}\""
+                        + R)
+        if self._opt("tcp_listen") and not token:
+            self._print(C_ERR +
+                        "pi_bridge.tcp_listen is set but pi_bridge.token is "
+                        "empty — TCP clients are accepted WITHOUT "
+                        "authentication" + R)
 
     def tool_output_mode(self):
         """pi_bridge.tool_output option: full | summary | off."""
@@ -385,14 +378,401 @@ class Bridge(object):
             v = ""
         return v if v in modes else default
 
+    # ------------------------------------------------------------ listeners
+
+    def make_unix_server(self):
+        path = self.sock_path
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        try:
+            os.unlink(path)  # stale socket from a previous run
+        except OSError:
+            pass
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(path)
+        os.chmod(path, 0o700)
+        sock.listen(1)
+        sock.setblocking(False)
+        self.listen_sock = sock
+        self.listen_hook = weechat.hook_fd(sock.fileno(), 1, 0, 0, "pi_listen_cb", "")
+        return True
+
+    def make_tcp_server(self):
+        """Start (or restart) the TCP listener (urlserver.py pattern).
+
+        The listen socket stays BLOCKING: hook_fd only fires when a
+        connection is queued, and WeeChat callbacks are single-threaded, so
+        one plain accept() per event in pi_tcp_listen_cb is safe.
+        """
+        raw = self._opt("tcp_listen")
+        host, port = _parse_tcp_listen(raw) if raw else (None, 0)
+        if raw and host is None:
+            self._print(C_ERR + "pi bridge: bad tcp_listen value %r (want "
+                        "host:port, e.g. 0.0.0.0:52311)%s" % (raw, R))
+            return False
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.listen(5)
+        self.stop_tcp_server(keep_conns=True)
+        self.tcp_listen_sock = sock
+        self.tcp_listen_hook = weechat.hook_fd(sock.fileno(), 1, 0, 0,
+                                               "pi_tcp_listen_cb", "")
+        bound_host, bound_port = sock.getsockname()[:2]
+        line = "listening on tcp %s:%d" % (bound_host, bound_port)
+        if bound_host == "0.0.0.0":
+            line += " (this host: %s)" % _local_ip()
+        if self._token():
+            line += " (token required)"
+        self._print(C_STATUS + line + R)
+        dbg("tcp listener started on %s:%d" % (bound_host, bound_port))
+        return True
+
+    def stop_tcp_server(self, keep_conns=False):
+        """Close + unhook the TCP listener.
+
+        With keep_conns=False (live rebind / cleanup) also drops any
+        TCP-originated connections: the current client if it came over TCP,
+        and all in-handshake TCP pendings.
+        """
+        if self.tcp_listen_sock is not None:
+            try:
+                self.tcp_listen_sock.close()
+            except OSError:
+                pass
+            self.tcp_listen_sock = None
+        if self.tcp_listen_hook:
+            weechat.unhook(self.tcp_listen_hook)
+            self.tcp_listen_hook = None
+        if not keep_conns:
+            for conn in list(self.pending):
+                if conn.get("ip") is not None:
+                    self.drop_conn(conn)
+            if self.client is not None and self.client.get("ip") is not None:
+                self.drop_conn(self.client)
+
+    # --------------------------------------------------------------- accept
+
+    def accept_pending(self):
+        """Read event on the (non-blocking) unix listen socket."""
+        while True:
+            try:
+                conn_sock, _addr = self.listen_sock.accept()
+            except BlockingIOError:
+                return
+            except OSError:
+                self._print(C_ERR + "pi bridge: accept error" + R)
+                return
+            self.on_accept(conn_sock, None, "unix")
+
+    def accept_tcp(self):
+        """Read event on the (blocking) tcp listen socket: ONE accept."""
+        try:
+            conn_sock, addr = self.tcp_listen_sock.accept()
+        except OSError as err:
+            dbg("tcp accept error: %s" % err)
+            return
+        ip, port = addr[0], addr[1]
+        try:
+            conn_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        self.on_accept(conn_sock, ip, "tcp %s:%d" % (ip, port))
+
+    def on_accept(self, conn_sock, ip, peer):
+        now = time.time()
+        # ---- peer-IP gates (TCP only), BEFORE any handshake byte goes out
+        if ip is not None:
+            self._prune_ip_state(now)
+            until = self.ip_lockouts.get(ip)
+            if until and now < until:
+                dbg("accept: %s locked out (%.0fs remaining) — closing"
+                    % (ip, until - now))
+                self._close_sock(conn_sock)
+                return
+            allowed = self._allowed_ips_re()
+            if allowed is not None and not allowed.search(ip):
+                dbg("accept: %s not in allowed_ips — closing" % ip)
+                self._close_sock(conn_sock)
+                return
+        # ---- one client at a time (across both transports)
+        if self.client is not None:
+            self._send_raw(conn_sock, {"type": "error",
+                                       "code": "client_already_connected"})
+            self._close_sock(conn_sock)
+            dbg("accept: rejected second client (%s)" % peer)
+            return
+        # ---- unauthenticated-connection cap
+        if len(self.pending) >= MAX_PENDING_UNAUTH:
+            dbg("accept: %d pending unauthed connections — closing %s"
+                % (len(self.pending), peer))
+            self._close_sock(conn_sock)
+            return
+        # ---- admit: pending until a valid hello arrives
+        conn_sock.setblocking(False)
+        conn = self._new_conn(conn_sock, ip, peer)
+        self.pending.append(conn)
+        conn["read_hook"] = weechat.hook_fd(conn["fd"], 1, 0, 0,
+                                            "pi_client_cb", str(conn["fd"]))
+        token = self._token()
+        if token:
+            conn["token"] = token
+            conn["nonce"] = secrets.token_hex(32)
+            self._send_to(conn, {"type": "challenge", "nonce": conn["nonce"]})
+        conn["timer"] = weechat.hook_timer(int(AUTH_TIMEOUT_S * 1000), 0, 1,
+                                           "pi_auth_timeout_cb", str(conn["fd"]))
+        dbg("accept: %s pending (fd=%d, challenge=%s)"
+            % (peer, conn["fd"], bool(token)))
+
+    @staticmethod
+    def _close_sock(conn_sock):
+        try:
+            conn_sock.close()
+        except OSError:
+            pass
+
+    # -------------------------------------------------------------- per-IP
+
+    def _prune_ip_state(self, now):
+        for ip in list(self.ip_lockouts):
+            if now >= self.ip_lockouts[ip]:
+                del self.ip_lockouts[ip]
+        for ip in list(self.ip_failures):
+            recent = [t for t in self.ip_failures[ip] if now - t < FAIL_WINDOW_S]
+            if recent:
+                self.ip_failures[ip] = recent
+            else:
+                del self.ip_failures[ip]
+
+    def _record_failure(self, conn):
+        """Count an auth failure per source IP; lock out after FAIL_MAX."""
+        ip = conn.get("ip")
+        if not ip:
+            return
+        now = time.time()
+        fails = [t for t in self.ip_failures.get(ip, []) if now - t < FAIL_WINDOW_S]
+        fails.append(now)
+        self.ip_failures[ip] = fails
+        if len(fails) > FAIL_MAX:
+            self.ip_lockouts[ip] = now + LOCKOUT_S
+            self.ip_failures.pop(ip, None)
+            dbg("lockout: %s ignored silently for %ds" % (ip, LOCKOUT_S))
+
+    # ------------------------------------------------------------ client I/O
+
+    def client_event(self, data, fd):
+        """Read events (and HUP) for accepted clients (unix or tcp)."""
+        if fd is not None and fd < 0:
+            # hooked fd gone (e.g. we closed it): `data` carries the fd
+            conn = self._conn_by_fd(int(data) if data else -1)
+            if conn is not None:
+                self.drop_conn(conn)
+            return
+        conn = self._conn_by_fd(fd)
+        if conn is None:
+            return
+        # per-event read cap: a burst can never stall WeeChat's UI; the
+        # remainder stays in rxbuff (or the kernel) for the next event
+        budget = MAX_BYTES_PER_EVENT
+        total = 0
+        while budget > 0:
+            try:
+                chunk = conn["sock"].recv(min(65536, budget))
+            except BlockingIOError:
+                break
+            except OSError as err:
+                dbg("recv error: %s" % err)
+                self.drop_conn(conn)
+                return
+            if not chunk:  # peer closed (recv == 0) → disconnect
+                dbg("recv 0 bytes — %s closed, dropping" % conn["peer"])
+                self.drop_conn(conn)
+                return
+            budget -= len(chunk)
+            total += len(chunk)
+            conn["rxbuff"] += chunk
+        if total:
+            dbg("recv %d bytes (fd=%d, rxbuff=%d)"
+                % (total, fd, len(conn["rxbuff"])))
+        self._process_lines(conn)
+
+    def _process_lines(self, conn):
+        while b"\n" in conn["rxbuff"]:
+            line, conn["rxbuff"] = conn["rxbuff"].split(b"\n", 1)
+            if len(line) > MAX_LINE:
+                if conn["authed"]:
+                    self._print(C_ERR + "pi bridge: dropped oversized message" + R)
+                continue
+            try:
+                msg = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                if conn["authed"]:
+                    self._print(C_ERR + "pi bridge: bad JSON line ignored" + R)
+                continue
+            if isinstance(msg, dict):
+                try:
+                    self._handle(conn, msg)
+                except Exception as err:  # never let one bad message kill the loop
+                    if conn["authed"]:
+                        self._print(C_ERR + "pi bridge: dispatch error: %s%s" % (err, R))
+        if len(conn["rxbuff"]) > MAX_LINE:
+            conn["rxbuff"] = b""
+
+    # ------------------------------------------------------------ handshaking
+
+    def _handle(self, conn, msg):
+        t = msg.get("type")
+        if t == "hello":
+            self._handle_hello(conn, msg)
+            return
+        if not conn["authed"]:
+            # handshake gating: everything before a valid hello is ignored
+            dbg("pre-auth %r from %s — ignored" % (t, conn["peer"]))
+            return
+        self.dispatch(msg)
+
+    def _handle_hello(self, conn, msg):
+        if conn["authed"]:
+            return  # duplicate hello: ignore
+        try:
+            proto = int(msg.get("protocol", 0))
+        except (TypeError, ValueError):
+            proto = 0
+        if proto != PROTOCOL:
+            self._send_to(conn, {"type": "error", "code": "protocol_mismatch"})
+            self._print(C_ERR + "pi bridge: protocol mismatch" + R)
+            self.drop_conn(conn)
+            return
+        token = conn["token"]
+        if token is not None:
+            proof = str(msg.get("proof") or "")
+            expected = _proof(token, conn["nonce"])
+            try:
+                ok = hmac.compare_digest(proof.lower(), expected)
+            except TypeError:  # non-ascii proof
+                ok = False
+            if not ok:
+                self._record_failure(conn)
+                self._print(C_REJECT + "pi bridge: auth failed from %s%s"
+                            % (conn["peer"], R))
+                self._send_to(conn, {"type": "error", "code": "auth_failed"})
+                self.drop_conn(conn)
+                return
+        # authenticated: promote to the single client slot
+        self._unhook_timer(conn)
+        conn["authed"] = True
+        if self.client is not None:
+            # someone else won the slot in the meantime
+            self._send_to(conn, {"type": "error",
+                                 "code": "client_already_connected"})
+            self.drop_conn(conn)
+            return
+        for other in list(self.pending):
+            if other is not conn:
+                self.drop_conn(other)  # silently: they lost the race
+        self.pending.remove(conn)
+        self.client = conn
+        self._send_to(conn, {"type": "hello", "protocol": PROTOCOL,
+                             "name": "weechat-pi-bridge"})
+        self.set_state("idle")
+        if conn["ip"] is not None:
+            self._print(C_OK + "— pi connected from %s —%s" % (conn["ip"], R))
+        else:
+            self._print(C_OK + "— pi connected —%s" % R)
+        dbg("client authed: %s" % conn["peer"])
+
+    def auth_timeout(self, fd):
+        """hook_timer: no valid hello within AUTH_TIMEOUT_S → drop silently."""
+        conn = self._conn_by_fd(fd)
+        if conn is None or conn["authed"] or not conn.get("timer"):
+            return
+        dbg("auth timeout: dropping %s" % conn["peer"])
+        self.drop_conn(conn)
+
+    def drop_conn(self, conn):
+        dbg("drop_conn %s (authed=%s)" % (conn.get("peer"), conn.get("authed")))
+        self._unhook_timer(conn)
+        self._close_sock(conn["sock"])
+        for key in ("read_hook", "write_hook"):
+            if conn.get(key):
+                weechat.unhook(conn[key])
+                conn[key] = None
+        if conn in self.pending:
+            self.pending.remove(conn)
+        if self.client is conn:
+            self.client = None
+            self.set_state("waiting")
+            self._print(C_DIM + "— pi disconnected —%s" % R)
+
+    def _unhook_timer(self, conn):
+        if conn.get("timer"):
+            try:
+                weechat.unhook(conn["timer"])
+            except Exception:
+                pass
+            conn["timer"] = None
+
+    # ------------------------------------------------------------- sending
+
+    def _send_raw(self, conn_sock, obj):
+        """Send one message on a not-yet-tracked socket (e.g. rejections)."""
+        try:
+            conn_sock.sendall((json.dumps(obj, separators=(",", ":")) + "\n").encode())
+        except OSError:
+            pass
+
+    def _send(self, obj):
+        """Send to the authenticated client (or drop, with a dbg note)."""
+        if self.client is None:
+            dbg("_send %s DROPPED (no client)" % obj.get("type"))
+            return
+        self._send_to(self.client, obj)
+
+    def _send_to(self, conn, obj):
+        line = (json.dumps(obj, separators=(",", ":")) + "\n").encode()
+        conn["outq"] += line
+        dbg(">> send %s to %s (%d bytes, outq=%d)"
+            % (obj.get("type"), conn.get("peer"), len(line), len(conn["outq"])))
+        # Flush synchronously: do not rely on the write-readiness hook to
+        # fire — if it ever doesn't, outbound messages (input, pongs) would
+        # sit in outq forever. The hook is kept only as a backpressure
+        # fallback for the rare case the socket buffer is full.
+        self._try_flush(conn)
+
+    def _try_flush(self, conn):
+        while conn["outq"]:
+            try:
+                n = conn["sock"].send(conn["outq"])
+            except BlockingIOError:
+                dbg("flush: backpressure (outq=%d), waiting for write hook"
+                    % len(conn["outq"]))
+                if conn["write_hook"] is None:
+                    conn["write_hook"] = weechat.hook_fd(
+                        conn["fd"], 0, 1, 0, "pi_write_cb", str(conn["fd"]))
+                return
+            except OSError as err:
+                dbg("flush: send error %s — dropping client" % err)
+                self.drop_conn(conn)
+                return
+            conn["outq"] = conn["outq"][n:]
+        if conn["write_hook"]:
+            weechat.unhook(conn["write_hook"])
+            conn["write_hook"] = None
+
+    def flush_outq(self, data, fd):
+        # write-readiness event: only matters after a backpressure pause
+        conn = self._conn_by_fd(int(data) if data else fd)
+        if conn is not None:
+            dbg("write_cb fired (outq=%d)" % len(conn["outq"]))
+            self._try_flush(conn)
+
+    # ---------------------------------------------------------- dispatching
+
     def dispatch(self, msg):
         t = msg.get("type")
         if t == "hello":
-            if int(msg.get("protocol", 0)) != PROTOCOL:
-                self._send({"type": "error", "code": "protocol_mismatch"})
-                self._print(C_ERR + "pi bridge: protocol mismatch" + R)
-                self.drop_client()
-            return
+            return  # already handled (and gated) in _handle
         if t == "ping":
             self._send({"type": "pong", "ts": msg.get("ts")})
             return
@@ -465,8 +845,30 @@ class Bridge(object):
 
     # ---------------------------------------------------------- user input
 
+    def _send_user_input(self, text, echo, msg):
+        """Forward one buffer line to pi as user_input (rate-limited).
+
+        `text` is what goes on the wire (prefixes like "!s " stripped),
+        `echo` is what gets echoed into the buffer (the line as typed).
+
+        This is the only path that spends the remote pi's LLM budget, so it
+        is the only message type rate-limited (a flooded buffer — relay
+        input, a bot, a compromised local host — must not translate 1:1
+        into prompts). The line is still echoed into the buffer either way.
+        """
+        now = time.time()
+        self.ui_times = [t for t in self.ui_times if now - t < 1.0]
+        if len(self.ui_times) >= USER_INPUT_MAX_PER_S:
+            self._print(C_REJECT + "input rate limited (max %d/s)%s"
+                        % (USER_INPUT_MAX_PER_S, R))
+            self._send({"type": "error", "code": "rate_limited"})
+        else:
+            self.ui_times.append(now)
+            self._send(dict(msg, type="user_input", text=text))
+        self._print(C_USER + "> " + R + echo)
+
     def on_input(self, line):
-        if self.client is None:
+        if self.client is None or not self.client.get("authed"):
             self._print(C_ERR + "not connected to pi (see buffer title)" + R)
             return
         line = line.strip()
@@ -500,7 +902,8 @@ class Bridge(object):
                 self._set_plugin_option("thinking", arg)
                 self._print(C_STATUS + "thinking: %s%s" % (arg, R))
             else:
-                self._print(C_ERR + "unknown thinking mode: %s (on | off)%s" % (arg, R))
+                self._print(C_ERR + "unknown thinking mode: %s (on | off)%s"
+                            % (arg, R))
             return
         # buffer-local control commands → protocol 'command' messages
         command_map = {
@@ -511,19 +914,21 @@ class Bridge(object):
         }
         if line in command_map:
             self._send({"type": "command", "name": command_map[line]})
+            self._print(C_USER + "> " + R + line)
         elif line == "!model":
             self._send({"type": "command", "name": "model"})
+            self._print(C_USER + "> " + R + line)
         elif line.startswith("!model "):
             # pi's setModel via the weechat-ctl extension command
             self._send({"type": "command", "name": "model",
                         "arg": line[7:].strip()})
+            self._print(C_USER + "> " + R + line)
         elif line.startswith("!s "):
-            self._send({"type": "user_input", "text": line[3:], "deliverAs": "steer"})
+            self._send_user_input(line[3:], line, {"deliverAs": "steer"})
         elif line.startswith("!q "):
-            self._send({"type": "user_input", "text": line[3:], "deliverAs": "followUp"})
+            self._send_user_input(line[3:], line, {"deliverAs": "followUp"})
         else:
-            self._send({"type": "user_input", "text": line})
-        self._print(C_USER + "> " + R + line)
+            self._send_user_input(line, line, {})
 
     @staticmethod
     def _set_plugin_option(name, value):
@@ -537,16 +942,11 @@ class Bridge(object):
     # -------------------------------------------------------------- cleanup
 
     def cleanup(self):
+        self.stop_tcp_server()
+        for conn in list(self.pending):
+            self.drop_conn(conn)
         if self.client is not None:
-            try:
-                self.client.close()
-            except OSError:
-                pass
-            self.client = None
-        for attr in ("client_hook", "write_hook"):
-            if getattr(self, attr):
-                weechat.unhook(getattr(self, attr))
-                setattr(self, attr, None)
+            self.drop_conn(self.client)
         if self.listen_sock is not None:
             try:
                 self.listen_sock.close()
@@ -556,6 +956,9 @@ class Bridge(object):
         if self.listen_hook:
             weechat.unhook(self.listen_hook)
             self.listen_hook = None
+        if self.config_hook:
+            weechat.unhook(self.config_hook)
+            self.config_hook = None
         try:
             os.unlink(self.sock_path)
         except OSError:
@@ -568,7 +971,7 @@ def format_tool_args(name, args):
     Known tools show their main content (bash: command, edit: path + number
     of edits, memory_write: target + content, …); unknown tools get compact
     key=value pairs. Values longer than ARG_VALUE_LIMIT characters are
-    clipped with an "…(+N)" marker. Returns "" when there is nothing to show.
+    clipped with a "…(+N)" marker. Returns "" when there is nothing to show.
     """
     if not isinstance(args, dict) or not args:
         return ""
@@ -629,13 +1032,53 @@ def pi_listen_cb(data, fd):
     return weechat.WEECHAT_RC_OK
 
 
+def pi_tcp_listen_cb(data, fd):
+    BRIDGE.accept_tcp()
+    return weechat.WEECHAT_RC_OK
+
+
 def pi_client_cb(data, fd):
-    BRIDGE.client_event(int(fd))
+    BRIDGE.client_event(data, int(fd))
     return weechat.WEECHAT_RC_OK
 
 
 def pi_write_cb(data, fd):
-    BRIDGE.flush_outq(int(fd))
+    BRIDGE.flush_outq(data, int(fd))
+    return weechat.WEECHAT_RC_OK
+
+
+def pi_auth_timeout_cb(data, *args):
+    BRIDGE.auth_timeout(int(data))
+    return weechat.WEECHAT_RC_OK
+
+
+def pi_config_cb(data, option, *args):
+    """Fired on any plugins.var.python.pi_bridge.* option change.
+
+    tcp_listen changes rebind the listener live (urlserver.py pattern);
+    token/allowed_ips need no restart — they apply per connection/accept.
+    """
+    name = option.rsplit(".", 1)[-1] if option else ""
+    if name == "tcp_listen":
+        new = BRIDGE._opt("tcp_listen")
+        if new != BRIDGE.tcp_listen_value:
+            BRIDGE.tcp_listen_value = new
+            BRIDGE.stop_tcp_server()
+            if new:
+                try:
+                    BRIDGE.make_tcp_server()
+                except OSError as err:
+                    BRIDGE._print(C_ERR + "pi bridge: cannot listen on tcp "
+                                    "%s (%s)%s" % (new, err, R))
+            else:
+                BRIDGE._print(C_STATUS + "tcp listener stopped%s" % R)
+    if name in ("tcp_listen", "token"):
+        BRIDGE.config_warnings()
+    return weechat.WEECHAT_RC_OK
+
+
+def pi_signal_cb(data, signal, *args):
+    BRIDGE.cleanup()
     return weechat.WEECHAT_RC_OK
 
 
@@ -650,21 +1093,35 @@ def pi_shutdown_cb():
 
 def main():
     dbg("main(): loading (sock=%s, debug=%s)" % (default_socket_path(), bool(_DBG_PATH)))
-    weechat.register("pi_bridge", "simeng", "0.3.1", "MIT",
+    weechat.register("pi_bridge", "simeng", "0.4.0", "MIT",
                      "mirror a pi coding agent session through a WeeChat buffer",
                      "pi_shutdown_cb", "")
-    # plugin options (auto-created on first run; /set pi_bridge.<name> …)
+    # plugin options (auto-created on first run; /set pi_bridge.<name> …).
+    # WeeChat options only — no env-var fallback on this side; ${sec.data.x}
+    # references are expanded by WeeChat at read time.
+    for name in ("tcp_listen", "token", "allowed_ips"):
+        if not weechat.config_is_set_plugin(name):
+            weechat.config_set_plugin(name, "")
     if not weechat.config_is_set_plugin("tool_output"):
         weechat.config_set_plugin("tool_output", DEFAULT_TOOL_OUTPUT)
     if not weechat.config_is_set_plugin("thinking"):
         weechat.config_set_plugin("thinking", DEFAULT_THINKING)
     BRIDGE.make_buffer()
     try:
-        BRIDGE.make_server()
+        BRIDGE.make_unix_server()
     except OSError as err:
         weechat.prnt("", C_ERR + "pi_bridge: cannot listen on %s (%s)%s"
                      % (BRIDGE.sock_path, err, R))
-        return
+    BRIDGE.config_hook = weechat.hook_config(
+        "plugins.var.python.pi_bridge.*", "pi_config_cb", "")
+    BRIDGE.tcp_listen_value = BRIDGE._opt("tcp_listen")
+    if BRIDGE.tcp_listen_value:
+        try:
+            BRIDGE.make_tcp_server()
+        except OSError as err:
+            weechat.prnt("", C_ERR + "pi_bridge: cannot listen on tcp %s (%s)%s"
+                         % (BRIDGE.tcp_listen_value, err, R))
+    BRIDGE.config_warnings()
     weechat.hook_signal("quit;upgrade", "pi_signal_cb", "")
 
 

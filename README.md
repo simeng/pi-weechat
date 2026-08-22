@@ -1,9 +1,9 @@
 # pi-weechat
 
-Mirror a [pi](https://pi.dev) coding agent session into a WeeChat buffer — and type back at pi — over a local Unix socket.
+Mirror a [pi](https://pi.dev) coding agent session into a WeeChat buffer — and type back at pi — over a local Unix socket or TCP (remote pi).
 
-- **WeeChat side**: Python script that creates a `pi` buffer and serves an NDJSON protocol on a Unix socket (the _server_).
-- **pi side**: TypeScript extension installed as a pi package; connects as _client_, mirrors assistant output / tool calls / status into the buffer, and forwards lines you type back to pi as user input.
+- **WeeChat side**: Python script that creates a `pi` buffer and serves an NDJSON protocol (the _server_): always on a Unix socket, optionally also on TCP with shared-secret auth.
+- **pi side**: TypeScript extension installed as a pi package; dials as _client_, mirrors assistant output / tool calls / status into the buffer, and forwards lines you type back to pi as user input.
 
 Architecture and wire protocol: [PLAN.md](./PLAN.md).
 
@@ -26,7 +26,7 @@ test/                          node:test suite + python smoke + cross-language i
 
 - Node.js ≥ 22.18 (`--experimental-strip-types`) or a pi version that bundles one; pi itself for the extension side.
 - Python 3.9+ (stdlib only) and WeeChat ≥ 3.x with the Python plugin, for the buffer side.
-- Both components on the **same machine** (Unix domain socket, no network exposure).
+- Same machine: nothing to configure (Unix domain socket, no network exposure). Remote: a reachable TCP path between the two machines — for confidentiality, run it inside Tailscale/a VPN (see [Remote setup](#remote-setup-tcp)).
 
 ## Install
 
@@ -85,22 +85,102 @@ Open the `pi` buffer:
 - Prompts you type directly in pi's own terminal are echoed into the buffer too,
   so both surfaces stay in sync.
 
-### Socket path
+### Endpoint (where pi dials)
 
-Both sides resolve it identically (first match wins):
+The pi side resolves its endpoint in this order (first match wins):
 
-1. `$PI_WEECHAT_SOCK`
-2. `$XDG_RUNTIME_DIR/pi-weechat.sock`
-3. `~/.local/state/pi-weechat/pi-weechat.sock`
+1. `$PI_WEECHAT_URL` — one variable for all transports:
+   - `tcp://host:port` — TCP (host may be a Tailscale name; port required)
+   - `unix://<path>` (or `unix:<path>`) — Unix socket at `<path>`
+   - schemeless `host:port` with a numeric port ⇒ TCP; anything else ⇒ Unix socket path
+     (so existing path-style values keep working; `C:\…` is a path, not a scheme)
+   - unknown schemes (e.g. `tls://host:1`) are rejected with a clear error —
+     that's the intentional extension point for future transports
+2. `$PI_WEECHAT_SOCK` — **deprecated**, still honored as a fallback (URL wins
+   when both are set; the extension notes the deprecation in the debug log)
+3. `$XDG_RUNTIME_DIR/pi-weechat.sock`
+4. `~/.local/state/pi-weechat/pi-weechat.sock`
 
-Set `PI_WEECHAT_SOCK` in both environments to override (e.g. for multiple
-machines' worth of sandboxes, or when `$XDG_RUNTIME_DIR` is absent). The socket
-file is created `0700`; only local users who can read/write it can connect.
+`$PI_WEECHAT_TOKEN` carries the shared secret for remote auth (see below) —
+never put credentials in the URL itself. The Unix socket file is created
+`0700`; only local users who can read/write it can connect.
+
+## Remote setup (TCP)
+
+Run pi on one machine, WeeChat on another. Roles are unchanged: the WeeChat
+script listens, pi dials. The TCP listener mirrors the design of WeeChat's
+own `urlserver.py` (blocking listen fd, one `accept()` per event,
+`SO_REUSEADDR`), and auth uses a **shared secret**: when a token is
+configured, the server sends a random nonce and the client answers its
+handshake with `HMAC-SHA256(token, nonce)` — the token itself is **never
+transmitted** (a passive capture can't replay it: the nonce is fresh per
+connection).
+
+### WeeChat side (machine A)
+
+```sh
+# one-time: pick a secret (≥ 128 bits of entropy — not a password)
+token=$(openssl rand -hex 16)
+```
+
+Inside WeeChat:
+
+```
+/secure passphrase <passphrase>            # if not set yet
+/secure set pi_weechat_token <token>       # encrypted into sec.conf
+/set pi_bridge.token "${sec.data.pi_weechat_token}"   # reference, not the secret
+/set pi_bridge.tcp_listen 0.0.0.0:52311    # or a Tailscale IP: e.g. 100.x.y.z:52311
+```
+
+The buffer prints `listening on tcp 0.0.0.0:52311 (this host: …) (token required)`
+(address from the real bound socket). `/set pi_bridge.tcp_listen …` **re-binds
+live** — no `/python reload`; setting it back to empty stops the listener.
+`pi_bridge.token` and `pi_bridge.allowed_ips` apply per connection — no
+restart needed. Optionally restrict who may connect (regex on the peer IP,
+scans are dropped silently):
+
+```
+/set pi_bridge.allowed_ips "^(192\\.168\\.1\\.20|100\\.64\\..*)$"
+```
+
+**Do not** set the token literally in the option (`/set pi_bridge.token sekret`)
+— it would sit in plaintext in `weechat.conf`. The `sec.data` reference keeps
+it in `sec.conf` (encrypted with the sec passphrase); if the reference doesn't
+expand, the buffer prints a loud red warning. An empty `pi_bridge.token` means
+**no enforcement** (the buffer warns in yellow when `tcp_listen` is set
+without a token).
+
+### pi side (machine B)
+
+```sh
+export PI_WEECHAT_URL=tcp://<host-A-or-tailscale-name>:52311
+export PI_WEECHAT_TOKEN=<token>
+```
+
+then (re)start or `/reload` the pi session. The buffer on A shows
+`— pi connected from <B-ip> —`.
+
+### Caveats
+
+- **The token authenticates, it does not encrypt.** Traffic is cleartext
+  NDJSON; an active MITM on the path can still relay the session (a captured
+  nonce-proof can't be replayed, but forwarding live works). For
+  confidentiality run the connection inside **Tailscale or a VPN** — then the
+  token mainly protects against other hosts on the shared network.
+- **One client at a time, across both transports.** A second dial (TCP or
+  Unix) is rejected with `client_already_connected` while a client is
+  connected; in-flight handshakes are capped (3) and time out (10 s).
+- Debug logging is per machine: `PI_BRIDGE_DEBUG=<path>` on each side (the
+  shared `$XDG_RUNTIME_DIR/pi-weechat.debug` marker only makes sense when
+  both sides run locally).
 
 ## Notes & limitations (v1)
 
-- **One pi session per WeeChat buffer.** A second connecting client is rejected
-  (`client_already_connected`). Multi-session multiplexing is on the roadmap (PLAN §10).
+- **One pi session per WeeChat buffer.** A second connecting client (TCP or
+  Unix) is rejected (`client_already_connected`). Multi-session multiplexing
+  is on the roadmap (PLAN §10).
+- Remote traffic is **not encrypted** (token ≠ encryption) — use Tailscale/
+  VPN for confidentiality (see [Remote setup](#remote-setup-tcp)).
 - Assistant text is rendered in whole lines (WeeChat has no partial-line redraw);
   the extension batches token deltas and flushes completed lines.
 - Tool output is truncated to ~8 KiB per result (whole-line boundary, pi side)
@@ -125,7 +205,11 @@ touch $XDG_RUNTIME_DIR/pi-weechat.debug   # default: /run/user/UID/pi-weechat.de
 Then reload both sides (`/python reload pi_bridge` in WeeChat, `/reload` in pi).
 Every connection event and every message in both directions is appended to that
 file (auto-rotates at ~1 MiB). Remove the file and reload to disable, or point
-`PI_BRIDGE_DEBUG=/path/to/log` at an explicit file instead (per side).
+`PI_BRIDGE_DEBUG=/path/to/log` at an explicit file instead. The debug log never
+contains the token — only one-way handshake proofs.
+
+For **remote** setups the marker file only enables the side it sits on; use
+`PI_BRIDGE_DEBUG` on each machine instead.
 
 ## Development
 
@@ -136,4 +220,26 @@ npm run test:py   # weechat script smoke test only (python3, stdlib only)
 ```
 
 The integration test spawns the real Python bridge and drives it with the real
-TypeScript extension over a live socket — no mocks on the wire.
+TypeScript extension over a live socket — both transports (Unix and TCP with
+token auth), no mocks on the wire.
+
+## Threat model (remote/TCP)
+
+What the server-side hardening defends against, and what it doesn't:
+
+| threat | covered? |
+|---|---|
+| Port scanners / opportunistic LAN attackers | ✅ no service fingerprint (server's first message is a random nonce, never protocol data), IP allowlist gate, silent drops |
+| Weak-token brute force | ✅ constant-time proof compare, per-IP failure lockout (5 failures/60 s ⇒ 10 min silence), unauthenticated-connection cap (3), 10 s auth deadline |
+| A leaked token | ⚠️ the holder can connect and impersonate pi — rotate the token (`/secure set` again). Rate limiting bounds the damage: buffer→pi input is capped at 5 lines/s (`rate_limited` beyond) |
+| Active MITM on the path | ❌ **not covered** — traffic is cleartext; use Tailscale/VPN. A MITM can relay the session (but cannot replay captured handshakes or read the token) |
+
+Hardening measures and defaults (module constants in `weechat/pi_bridge.py`):
+auth deadline `10 s` · pending-unauthed cap `3` · failure lockout `5` in
+`60 s` ⇒ `600 s` · `allowed_ips` regex gate at accept · per-event read cap
+`256 KiB` · `user_input` rate limit `5/s` sliding window · constant-time
+HMAC compare · server `hello` withheld until the client is validated.
+
+Token guidance: ≥ 128 bits of entropy (`openssl rand -hex 16`), never a
+password or a reused secret, stored only in `sec.conf` via
+`${sec.data.…}` on the WeeChat side and in `PI_WEECHAT_TOKEN` on the pi side.

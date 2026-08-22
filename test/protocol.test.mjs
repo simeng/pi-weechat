@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 
-import { encodeMessage, LineDecoder, PROTOCOL_VERSION, MAX_LINE_BYTES } from "../lib/codec.mjs";
+import { encodeMessage, LineDecoder, PROTOCOL_VERSION, MAX_LINE_BYTES, parseEndpoint, makeHello } from "../lib/codec.mjs";
 
 // ---------------------------------------------------------------- codec unit
 
@@ -52,7 +52,47 @@ test("LineDecoder rejects messages without a string type", () => {
 
 test("MAX_LINE_BYTES is the shared 1 MiB limit", () => {
   assert.equal(MAX_LINE_BYTES, 1024 * 1024);
-  assert.equal(PROTOCOL_VERSION, 1);
+  assert.equal(PROTOCOL_VERSION, 2);
+});
+
+// ------------------------------------------------------- parseEndpoint unit
+
+test("parseEndpoint: tcp:// forms", () => {
+  assert.deepEqual(parseEndpoint("tcp://10.0.0.2:52311"), { kind: "tcp", host: "10.0.0.2", port: 52311 });
+  assert.deepEqual(parseEndpoint("tcp://tail-4a2b.ts.net:52311"), { kind: "tcp", host: "tail-4a2b.ts.net", port: 52311 });
+  assert.deepEqual(parseEndpoint("tcp://[::1]:52311"), { kind: "tcp", host: "[::1]", port: 52311 });
+  // missing port / bad port / missing host → clear errors
+  assert.throws(() => parseEndpoint("tcp://host"), /host:port/);
+  assert.throws(() => parseEndpoint("tcp://host:abc"), /numeric port/);
+  assert.throws(() => parseEndpoint("tcp://host:99999"), /out of range/);
+  assert.throws(() => parseEndpoint("tcp://:52311"), /host:port|host/);
+  assert.throws(() => parseEndpoint("tcp://"), /host:port/);
+});
+
+test("parseEndpoint: unix:// and unix: forms", () => {
+  assert.deepEqual(parseEndpoint("unix:///tmp/bridge.sock"), { kind: "unix", path: "/tmp/bridge.sock" });
+  assert.deepEqual(parseEndpoint("unix:/tmp/bridge.sock"), { kind: "unix", path: "/tmp/bridge.sock" });
+  assert.deepEqual(parseEndpoint("unix:relative/bridge.sock"), { kind: "unix", path: "relative/bridge.sock" });
+  assert.throws(() => parseEndpoint("unix://"), /socket path/);
+});
+
+test("parseEndpoint: schemeless host:port → tcp, else unix path", () => {
+  assert.deepEqual(parseEndpoint("192.168.1.20:52311"), { kind: "tcp", host: "192.168.1.20", port: 52311 });
+  assert.deepEqual(parseEndpoint("weechat-box:52311"), { kind: "tcp", host: "weechat-box", port: 52311 });
+  assert.deepEqual(parseEndpoint("/run/user/1000/pi-weechat.sock"), { kind: "unix", path: "/run/user/1000/pi-weechat.sock" });
+  assert.deepEqual(parseEndpoint("C:\\Users\\simeng\\pi-weechat.sock"), { kind: "unix", path: "C:\\Users\\simeng\\pi-weechat.sock" }, "Windows-style path is a unix socket path, not a scheme");
+});
+
+test("parseEndpoint: unknown scheme throws (extension point)", () => {
+  assert.throws(() => parseEndpoint("tls://host:1"), /unsupported endpoint scheme "tls"/);
+  assert.throws(() => parseEndpoint("ws://host:1"), /unsupported endpoint scheme "ws"/);
+  assert.throws(() => parseEndpoint(""), /empty endpoint/);
+});
+
+test("makeHello: proof only included when non-empty", () => {
+  assert.deepEqual(makeHello("pi"), { type: "hello", protocol: 2, name: "pi" });
+  assert.deepEqual(makeHello("pi", "ab12"), { type: "hello", protocol: 2, name: "pi", proof: "ab12" });
+  assert.deepEqual(makeHello("pi", ""), { type: "hello", protocol: 2, name: "pi" });
 });
 
 // ------------------------------------------------------------ fake weechat
@@ -162,11 +202,12 @@ test("end-to-end: handshake, output mirroring, input injection", async (t) => {
 
   const hello = await waitFor(() => weechat.received.find((m) => m.type === "hello"), "pi hello");
   assert.equal(hello.protocol, PROTOCOL_VERSION);
-  // session_info (emitted at session_start) is flushed before the handshake
+  // protocol 2 handshake gating: the hello goes out FIRST, and the pending
+  // queue (session_info emitted at session_start) is flushed only after it
   assert.ok(
-    weechat.received.findIndex((m) => m.type === "session_info") <
-      weechat.received.findIndex((m) => m.type === "hello"),
-    "session_info precedes hello on the wire"
+    weechat.received.findIndex((m) => m.type === "hello") <
+      weechat.received.findIndex((m) => m.type === "session_info"),
+    "hello precedes session_info on the wire (server-side handshake gating)"
   );
   await waitFor(
     () => weechat.received.find((m) => m.type === "session_info"),
