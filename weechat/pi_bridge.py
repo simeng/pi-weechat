@@ -6,6 +6,12 @@
 # This script is the SERVER; the pi extension (see
 # extensions/weechat-bridge.ts) connects to it. Wire format: NDJSON, see
 # PLAN.md §2.
+
+# Rendering is role-based: pi-originated lines (assistant text, thinking,
+# tools) render under the nick `pi`; user lines (buffer input, pi-terminal
+# echoes) under the user's IRC nick — first entry of
+# irc.server_default.nicks, re-applied live via hook_config; system lines
+# stay prefix-less (channel-notice style).
 #
 # Transports (one client at a time, across both):
 #   * Unix socket — always on. Path: $PI_WEECHAT_SOCK, else
@@ -118,6 +124,7 @@ def _theme(theme_name, fallback):
 # Colors: (theme name from weechat.conf [color], palette fallback).
 # Fallbacks mirror the 4.x default theme values for each role.
 C_USER = _theme("chat_nick_self", "white")          # user's own input lines
+C_NICK = _theme("chat_nick", "white")                 # the `pi` nick in the prefix column
 C_PI = _theme("chat", "")                           # assistant text (default fg)
 C_TOOL = _theme("chat_prefix_network", "magenta")   # tool activity lines
 C_STATUS = _theme("chat_value", "cyan")             # info lines (session, modes)
@@ -439,6 +446,31 @@ def _local_ip():
         return "?"
 
 
+def _user_nick():
+    """The user's IRC nick: the first non-empty entry of
+    irc.server_default.nicks (comma-separated).
+
+    Re-evaluated on every call (no caching) so config changes take effect
+    on the next printed line. The option only exists while the IRC plugin
+    is loaded — config_get returning "" (plugin not loaded) or an empty
+    value is the expected fallback path, not an error.
+    """
+    if weechat is None:
+        return ""
+    try:
+        opt = weechat.config_get("irc.server_default.nicks")
+        if not opt:
+            return ""
+        raw = weechat.config_string(opt) or ""
+    except Exception:
+        return ""
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if entry:
+            return entry
+    return ""
+
+
 class Bridge(object):
     def __init__(self):
         self.buffer = None
@@ -452,6 +484,7 @@ class Bridge(object):
         self.tcp_listen_hook = None
         self.tcp_listen_value = ""
         self.config_hook = None
+        self.nick_config_hook = None  # irc.server_default.nicks live re-apply
         # connections: one AUTHED client + a few in-handshake pendings
         self.client = None            # the authenticated conn (dict, or None)
         self.pending = []             # accepted, not authed yet (list of dicts)
@@ -497,6 +530,7 @@ class Bridge(object):
         self.buffer = weechat.buffer_new("pi", "pi_input_cb", "", "pi_close_cb", "")
         weechat.buffer_set(self.buffer, "title", "pi: (waiting for pi)")
         weechat.buffer_set(self.buffer, "localvar_set_no_log", "1")
+        self.apply_user_nick()
         self.alive = True
         self._print(C_STATUS + "pi bridge ready — socket %s%s" % (self.sock_path, R))
         self._print(C_DIM + "type a line to send it to pi; !help lists commands%s" % R)
@@ -512,6 +546,61 @@ class Bridge(object):
         """
         if self.alive and self.buffer:
             weechat.prnt(self.buffer, text)
+
+
+    def apply_user_nick(self):
+        """(Re)apply the user-nick buffer localvar from
+        irc.server_default.nicks (first entry), so user lines render in the
+        prefix column under the user's real nick (chat_nick_self color).
+        localvar when the nick is empty — user lines then fall back to the
+        '> ' marker.
+        """
+        if self.buffer is None:
+            return
+        nick = _user_nick()
+        if nick:
+            weechat.buffer_set(self.buffer, "localvar_set_nick", nick)
+        else:
+            weechat.buffer_set(self.buffer, "localvar_unset_nick", "")
+
+
+    def _print_msg(self, text, role):
+        """Render one line for a role (message body colors unchanged).
+
+        'pi'   → prnt_date_tags, tag prefix_nick_chat_nick, and `pi` as the
+                 line prefix (the text before the first TAB, the way the
+                 IRC plugin emits nicks): the prefix column shows the nick
+                 `pi` (theme chat_nick color), with WeeChat's nick brackets
+                 and same-nick prefix hiding applied.
+        'user' → prnt_date_tags, tag prefix_nick_chat_nick_self (+ self_msg
+                 like the IRC plugin's own echoes), the user's IRC nick as
+                 prefix (chat_nick_self color). Empty nick ⇒ legacy
+                 fallback: the '> ' marker via plain prnt (today's
+                 rendering).
+        'sys'  → plain prnt, no prefix (channel-notice style): session
+                 info, connect/disconnect notices, errors, command status
+                 answers, rate-limit warnings, ready/listening lines.
+        """
+        # prnt_date_tags stamps the current time, so lines keep real dates
+        # for relay clients (the no-leading-tab rule of _print is untouched).
+        if role == "pi":
+            if self.alive and self.buffer:
+                weechat.prnt_date_tags(
+                    self.buffer, int(time.time()), "prefix_nick_chat_nick",
+                    C_NICK + "pi" + R + "\t" + text)
+        elif role == "user":
+            nick = _user_nick()
+            if nick:
+                if self.alive and self.buffer:
+                    weechat.prnt_date_tags(
+                        self.buffer, int(time.time()),
+                        "self_msg,notify_none,no_highlight,"
+                        "prefix_nick_chat_nick_self",
+                        C_USER + nick + R + "\t" + text)
+            else:
+                self._print(C_USER + "> " + R + text)
+        else:
+            self._print(text)
 
     def set_state(self, state, detail=None):
         self.state = state
@@ -603,20 +692,20 @@ class Bridge(object):
             fence = _fence_open(text)
             if fence is not None:
                 self._md_fence = fence
-                self._print(C_DIM + text + R)
+                self._print_msg(C_DIM + text + R, "pi")
             else:
-                self._print(C_PI + text + R)
+                self._print_msg(C_PI + text + R, "pi")
             return
         if _fence_closed(self._md_fence, text):
             self._md_fence = None
-            self._print(C_DIM + text + R)
+            self._print_msg(C_DIM + text + R, "pi")
             return
         lang = self._md_fence["lang"]
         if self.highlight_enabled() and HL_ALIAS.get(lang.lower()):
             body = highlight_code(text, lang, self._md_fence["ctx"])
         else:
             body = text
-        self._print("  " + body)
+        self._print_msg("  " + body, "pi")
 
     def _plugin_option(self, name, modes, default):
         if weechat is None:
@@ -1031,9 +1120,16 @@ class Bridge(object):
             return
         if t == "status":
             state = msg.get("state", "idle")
+            # busy = a turn is in flight (agent_start ⇒ "thinking",
+            # tool events ⇒ "tool:<name>"). session_start and manual
+            # status queries also send "idle" — those are not settles.
+            was_busy = self.state == "thinking" or self.state.startswith("tool:")
             self.set_state(state)
-            if state == "idle" and self.state != "waiting":
-                pass  # title already updated; no line needed on settle
+            if state == "idle" and was_busy and self.alive and self.buffer:
+                # turn settled: one extra highlight line below the last
+                # message line (left untouched); date 0 ⇒ now
+                weechat.prnt_date_tags(self.buffer, 0, "notify_highlight",
+                                       C_OK + "[x] ready!" + R)
             return
         if t == "session_info":
             bits = []
@@ -1048,7 +1144,7 @@ class Bridge(object):
         if t == "user_echo":
             text = msg.get("text", "")
             for line in str(text).splitlines() or [""]:
-                self._print(C_USER + "> " + R + line)
+                self._print_msg(line, "user")
             return
         if t == "assistant_line":
             self._print_assistant(msg.get("text", ""), msg.get("msgId"))
@@ -1056,23 +1152,23 @@ class Bridge(object):
         if t == "thinking_line":
             if not self.thinking_enabled():
                 return  # hidden; the line is dropped entirely
-            self._print(C_DIM + "💭 " + msg.get("text", "") + R)
+            self._print_msg(C_DIM + "\U0001F4AD " + msg.get("text", "") + R, "pi")
             return
         if t == "assistant_flush":
             return  # lines already complete; nothing to render
         if t == "tool_start":
             name = msg.get("toolName", "?")
             summary = format_tool_args(name, msg.get("args") or {})
-            self._print(C_TOOL + "⚙ " + name + C_DIM +
-                        (" " + summary if summary else "") + R)
+            self._print_msg(C_TOOL + "⚙ " + name + C_DIM +
+                            (" " + summary if summary else "") + R, "pi")
             return
         if t == "tool_end":
             ok = not msg.get("isError")
             color = C_OK if ok else C_ERR
-            self._print(color + ("✔ " if ok else "✘ ") +
-                        (msg.get("toolName", "tool") or "tool") + R)
+            self._print_msg(color + ("✔ " if ok else "✘ ") +
+                            (msg.get("toolName", "tool") or "tool") + R, "pi")
             for line in self._tool_output_lines(msg.get("output")):
-                self._print(C_TOOL_OUT + "  " + line + R)
+                self._print_msg(C_TOOL_OUT + "  " + line + R, "pi")
             return
         if t == "error":
             self._print(C_ERR + "pi bridge: %s: %s%s" % (
@@ -1117,7 +1213,7 @@ class Bridge(object):
         else:
             self.ui_times.append(now)
             self._send(dict(msg, type="user_input", text=text))
-        self._print(C_USER + "> " + R + echo)
+        self._print_msg(echo, "user")
 
     def on_input(self, line):
         if self.client is None or not self.client.get("authed"):
@@ -1179,15 +1275,15 @@ class Bridge(object):
         }
         if line in command_map:
             self._send({"type": "command", "name": command_map[line]})
-            self._print(C_USER + "> " + R + line)
+            self._print_msg(line, "user")
         elif line == "!model":
             self._send({"type": "command", "name": "model"})
-            self._print(C_USER + "> " + R + line)
+            self._print_msg(line, "user")
         elif line.startswith("!model "):
             # pi's setModel via the weechat-ctl extension command
             self._send({"type": "command", "name": "model",
                         "arg": line[7:].strip()})
-            self._print(C_USER + "> " + R + line)
+            self._print_msg(line, "user")
         elif line.startswith("!s "):
             self._send_user_input(line[3:], line, {"deliverAs": "steer"})
         elif line.startswith("!q "):
@@ -1224,6 +1320,9 @@ class Bridge(object):
         if self.config_hook:
             weechat.unhook(self.config_hook)
             self.config_hook = None
+        if self.nick_config_hook:
+            weechat.unhook(self.nick_config_hook)
+            self.nick_config_hook = None
         try:
             os.unlink(self.sock_path)
         except OSError:
@@ -1342,6 +1441,15 @@ def pi_config_cb(data, option, *args):
     return weechat.WEECHAT_RC_OK
 
 
+def pi_nick_cb(data, option, *args):
+    """Fired when irc.server_default.nicks changes (IRC plugin loaded).
+
+    Re-applies (or clears) the buffer nick localvar live — no reload.
+    """
+    BRIDGE.apply_user_nick()
+    return weechat.WEECHAT_RC_OK
+
+
 def pi_signal_cb(data, signal, *args):
     BRIDGE.cleanup()
     return weechat.WEECHAT_RC_OK
@@ -1381,6 +1489,8 @@ def main():
                      % (BRIDGE.sock_path, err, R))
     BRIDGE.config_hook = weechat.hook_config(
         "plugins.var.python.pi_bridge.*", "pi_config_cb", "")
+    BRIDGE.nick_config_hook = weechat.hook_config(
+        "irc.server_default.nicks", "pi_nick_cb", "")
     BRIDGE.tcp_listen_value = BRIDGE._opt("tcp_listen")
     if BRIDGE.tcp_listen_value:
         try:

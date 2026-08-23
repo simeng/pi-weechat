@@ -163,7 +163,7 @@ test("integration: real extension ↔ real weechat script", async (t) => {
   });
   await mock.fire("message_update", { assistantMessageEvent: { type: "text_end", contentIndex: 0 } });
   await mock.fire("message_end", { message: { role: "assistant" } });
-  await wc.waitFor((m) => m.type === "print" && m.text.includes("line one from pi"), "buffer: line one");
+  await wc.waitFor((m) => m.type === "print" && m.tags === "prefix_nick_chat_nick" && m.prefix.includes("pi") && m.text.includes("line one from pi"), "buffer: line one (pi nick prefix)");
   await wc.waitFor((m) => m.type === "print" && m.text.includes("line two"), "buffer: line two (tail flush)");
 
   // tool execution renders
@@ -199,12 +199,18 @@ test("integration: real extension ↔ real weechat script", async (t) => {
     "followUp delivered"
   );
 
-  // typed lines echo back into the buffer (strip weechat color tags first);
-  // the stub's reset marker ("0") sits between prompt and echoed text
-  const strip = (s) => s.replace(/color:(?:white|default|blue|cyan|red|green|gray|reset)/g, "");
+  // typed lines echo back into the buffer under the user's IRC nick
+  // (prnt_date_tags tag prefix_nick_chat_nick_self, user nick before the TAB —
+  // no legacy '> ' marker in the text)
   await wc.waitFor(
-    (m) => m.type === "print" && strip(m.text).includes("> 0hello from weechat"),
-    "buffer: echo"
+    (m) => m.type === "print"
+      && m.tags === "self_msg,notify_none,no_highlight,prefix_nick_chat_nick_self"
+      && m.prefix.includes("alice") && m.text === "hello from weechat",
+    "buffer: echo (user nick)"
+  );
+  assert.ok(
+    !wc.lines.some((m) => m.type === "print" && m.text.startsWith("> ")),
+    "no legacy '> ' marker anywhere in the buffer"
   );
 
   // thinking streams: hidden by default, toggleable with !think on
@@ -229,7 +235,7 @@ test("integration: real extension ↔ real weechat script", async (t) => {
 
   wc.send({ op: "input", text: "!think on" });
   await wc.waitFor(
-    (m) => m.type === "print" && strip(m.text).includes("thinking: on"),
+    (m) => m.type === "print" && m.text.includes("thinking: on"),
     "buffer: thinking enabled"
   );
 
@@ -303,7 +309,7 @@ test("integration: real extension ↔ real weechat script over TCP with token", 
   });
   await mock.fire("message_update", { assistantMessageEvent: { type: "text_end", contentIndex: 0 } });
   await mock.fire("message_end", { message: { role: "assistant" } });
-  await wc.waitFor((m) => m.type === "print" && m.text.includes("tcp line one"), "buffer: tcp line one");
+  await wc.waitFor((m) => m.type === "print" && m.tags === "prefix_nick_chat_nick" && m.prefix.includes("pi") && m.text.includes("tcp line one"), "buffer: tcp line one (pi nick prefix)");
   await wc.waitFor((m) => m.type === "print" && m.text.includes("tcp line two"), "buffer: tcp line two");
 
   // tool execution renders
@@ -331,10 +337,11 @@ test("integration: real extension ↔ real weechat script over TCP with token", 
     () => mock.sentUserMessages.find((m) => m.text === "queue over tcp" && m.deliverAs === "followUp"),
     "followUp delivered over tcp"
   );
-  const strip = (s) => s.replace(/color:(?:white|default|blue|cyan|red|green|gray|reset)/g, "");
   await wc.waitFor(
-    (m) => m.type === "print" && strip(m.text).includes("> 0hello over tcp"),
-    "buffer: echo over tcp"
+    (m) => m.type === "print"
+      && m.tags === "self_msg,notify_none,no_highlight,prefix_nick_chat_nick_self"
+      && m.prefix.includes("alice") && m.text === "hello over tcp",
+    "buffer: echo over tcp (user nick)"
   );
 
   // ---------------- negative: wrong token ⇒ auth_failed + retries -------
