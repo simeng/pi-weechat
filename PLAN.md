@@ -66,12 +66,13 @@ confidentiality is the VPN's job (§6).
   `pi_bridge.tcp_listen` plugin option. Unix socket created with `0700`.
 - **Framing:** newline-delimited JSON (NDJSON), UTF-8. Max message size guard
   of 1 MiB (larger tool outputs are chunked by the sender, see §5).
-- **Protocol version: 2** (both sides upgrade together; mismatch still yields
-  `protocol_mismatch`).
+- **Protocol version: 3** (v3 adds the interactive UI channel, `ui_request`
+  / `ui_response` + `!pick`, and the built-in `cd` command; both sides
+  upgrade together — a mismatch still yields `protocol_mismatch`).
 - **Handshake (gated, both transports):** the server ignores everything from
   a client until a valid `hello` arrives (no prompt-injection before auth).
   - *No token configured:* client sends
-    `{"type":"hello","protocol":2,"name":"pi-weechat-bridge"}` first, then its
+    `{"type":"hello","protocol":3,"name":"pi-weechat-bridge"}` first, then its
     pending queue; the server answers with its own hello only after
     validating the protocol.
   - *Token configured (shared secret — the token is never sent):* the server
@@ -86,6 +87,15 @@ confidentiality is the VPN's job (§6).
 |---|---|---|---|
 | `challenge` | `{nonce}` | server → client | shared-secret challenge (only when a token is set) |
 | `hello.proof` | `{...}` | client | `hex(HMAC-SHA256(token, nonce))`; only when a token is set |
+
+| type (new in v3) | payload | direction | meaning |
+|---|---|---|---|
+| `ui_request` | select: `{id, method:"select", title, options[], multiple?}` · input: `{id, method:"input", title, placeholder?}` | pi → WeeChat | interactive prompt rendered in the buffer ("?" + numbered options or a free-text hint); answered with `!pick`. `options` entries are strings or `{label, description?}`; `multiple` allows comma-list answers. `id` is a per-connection monotonic counter |
+| `ui_response` | answer: `{id, value}` (string; array when multiple) · cancel: `{id, cancelled:true}` | WeeChat → pi | answer to `ui_request`; `value` is the picked option text(s) or the entered free text. Stale/unknown ids are ignored on the pi side |
+
+Only one prompt is tracked per connection: a new `ui_request` supersedes the
+pending one (the WeeChat side immediately sends a cancelled `ui_response` for
+the old id). On disconnect, all pending prompts resolve as cancelled.
 
 ### Message types (pi extension → WeeChat)
 
@@ -109,7 +119,7 @@ confidentiality is the VPN's job (§6).
 |-------------|----------------------------------|------------------------------------------------|
 | `hello`     | as above                         | handshake                                      |
 | `user_input`| `{text, deliverAs?}`             | typed line; `deliverAs` ∈ undefined (normal), `"steer"` (`!s ...` prefix → mid-stream steering), `"followUp"` (`!q ...`). The pi side fills in `"followUp"` for plain input that arrives while a turn is running, so nothing is dropped |
-| `command`   | `{name, arg?}`                   | name ∈ `new_session`, `compact`, `abort`, `status`, `model`; `arg` carries the optional argument (e.g. model id for `model`). `abort` runs `ctx.abort()` directly (safe from event handlers); the rest are routed through a registered extension command (`/weechat-ctl <name> [arg]`) sent with `expandPromptTemplates: true` so it executes immediately — even mid-stream |
+| `command`   | `{name, arg?}`                   | name ∈ `new_session`, `compact`, `abort`, `status`, `model`, `cd`; `arg` carries the optional argument (e.g. model id for `model`, path for `cd`). `abort` runs `ctx.abort()` directly (safe from event handlers); the rest are routed through a registered extension command (`/weechat-ctl <name> [arg]`) sent with `expandPromptTemplates: true` so it executes immediately — even mid-stream. `cd` is handled built-in by the bridge (no LLM round trip): exact existing dir ⇒ immediate session switch; otherwise fuzzy-similar dirs + a “➕ create … as new project” option are offered as a `ui_request`, answered with `!pick` |
 | `pong`      | `{ts}`                           | keepalive response                             |
 
 Buffer-local commands typed in the WeeChat buffer (all start with `!` so they
@@ -121,6 +131,8 @@ never reach the LLM):
 - `!compact`   — compaction (`ctx.compact()`)
 - `!abort`     — abort current turn (`ctx.abort()`)
 - `!model`     — list available models (scoped via `ctx.scopedModels` when scoping is configured, else the full catalogue via `ctx.modelRegistry.getAvailable()` — mirrors pi's `/model`); `!model <provider/id>` selects via `pi.setModel()`
+- `!cd <path>` — switch pi to a different project directory (new session in that cwd). Exact existing dir ⇒ switches immediately; otherwise fuzzy-similar dirs are listed as a `ui_request` select (always including “➕ create <path> as new project”) — answer with `!pick`. Ported from the standalone `/cd` extension so it works over the bridge
+- `!pick …`    — answer the pending `ui_request` prompt (“?” in the buffer): `!pick <n>` (or `!pick 1,3` when multiple), exact option text, free text for input prompts, or `!pick cancel`. With no pending prompt it is rejected locally
 - `!status`    — force a status refresh (session file, model)
 - `!tools [full|summary|off]` — tool output verbosity in the buffer (`pi_bridge.tool_output`)
 - `!think [on|off]`           — show/hide thinking lines (`pi_bridge.thinking`, default off)
@@ -362,6 +374,14 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
    `PI_WEECHAT_URL` endpoint (deprecating `PI_WEECHAT_SOCK`), server hardening
    (auth deadline, pending cap, IP lockout, `allowed_ips`, read cap, input
    rate limit), live rebind via `hook_config`. ✅
+7. **M6 — interactive UI channel (protocol v3):** `ui_request`/`ui_response`
+   + `!pick` in the buffer; built-in `!cd <path>` project switching (fuzzy
+   search + create option, ported from the standalone `/cd` extension);
+   `globalThis.__pi_weechat_bridge__` handle so other extensions (e.g.
+   ask_user-style tools) can offer their prompts in the buffer via
+   `isConnected()/select()/input()`. ✅ (ask-user relay itself: roadmap —
+   no public hook in pi-ask-user today, so the bridge only exposes the
+   channel.)
 
 ## 9. Repo layout
 

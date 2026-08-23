@@ -335,10 +335,10 @@ def main():
     # protocol 2 handshake gating: the CLIENT sends its hello first (no
     # challenge when no token is configured); the server answers after
     # validating it
-    send({"type": "hello", "protocol": 2, "name": "pi"})
+    send({"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi"})
     pump_and_drain(client)
     hello = json.loads(recv_lines.pop(0))
-    assert hello["type"] == "hello" and hello["protocol"] == 2, hello
+    assert hello["type"] == "hello" and hello["protocol"] == ns["PROTOCOL"], hello
     assert "pi connected" in buffer_text(stub)
 
     # pi → weechat: mirror output into the buffer
@@ -450,6 +450,120 @@ def main():
     assert "!s do this instead" in me_lines, "!s echo under user nick"
     assert not any(t.startswith("> ") for t in me_lines), \
         "user-nick lines must not carry the legacy '> ' marker"
+
+    # ------------------------------------------------------------------
+    # !cd + ui_request / !pick (protocol-3 interactive prompts)
+    # ------------------------------------------------------------------
+
+    # bare !cd → local usage hint, nothing on the wire
+    ns["pi_input_cb"]("", "buffer", "!cd")
+    pump_and_drain(client, 0.4)
+    assert recv_lines == [], "bare !cd must not reach pi"
+    assert "usage: !cd <path>" in buffer_text(stub), "!cd usage hint missing"
+
+    # !cd <path> → command message to pi
+    ns["pi_input_cb"]("", "buffer", "!cd ~/projects/foo")
+    pump_and_drain(client, 0.4)
+    msg = json.loads(recv_lines.pop(0))
+    assert msg == {"type": "command", "name": "cd",
+                   "arg": "~/projects/foo"}, msg
+
+    # !pick with nothing pending → local error, nothing on the wire
+    ns["pi_input_cb"]("", "buffer", "!pick 1")
+    pump_and_drain(client, 0.4)
+    assert recv_lines == [], "!pick without a prompt must not reach pi"
+    assert "nothing to pick" in buffer_text(stub)
+
+    # select prompt: numbered options (+descriptions) and a hint line
+    send({"type": "status", "state": "idle"})
+    send({"type": "ui_request", "id": 7, "method": "select",
+          "title": "No exact match for /x. Which directory?",
+          "options": ["/opt/alpha",
+                      {"label": "/opt/beta", "description": "the beta one"}]})
+    pump_and_drain(client, 0.4)
+    text = buffer_text(stub)
+    assert "? No exact match for /x. Which directory?" in text
+    assert "1. /opt/alpha" in text and "2. /opt/beta" in text
+    assert "the beta one" in text, "option description must render"
+    assert "!pick cancel" in text, "hint line must mention !pick"
+    assert BRIDGE.pending_ui is not None and BRIDGE.pending_ui["id"] == 7
+    assert stub.title == "pi: (idle) — awaiting !pick", stub.title
+
+    # !pick by number → ui_response with the option text; title hint clears
+    ns["pi_input_cb"]("", "buffer", "!pick 2")
+    pump_and_drain(client, 0.4)
+    msg = json.loads(recv_lines.pop(0))
+    assert msg == {"type": "ui_response", "id": 7,
+                   "value": "/opt/beta"}, msg
+    assert BRIDGE.pending_ui is None
+    assert stub.title == "pi: (idle)", stub.title
+
+    # multi-select: comma list → array value; out-of-range number rejected
+    send({"type": "ui_request", "id": 8, "method": "select",
+          "title": "Pick some", "multiple": True,
+          "options": ["a", "b", "c"]})
+    pump_and_drain(client, 0.2)
+    ns["pi_input_cb"]("", "buffer", "!pick 9")
+    pump_and_drain(client, 0.3)
+    assert recv_lines == [], "out-of-range number must not be sent"
+    assert "no such option" in buffer_text(stub)
+    ns["pi_input_cb"]("", "buffer", "!pick 1,3")
+    pump_and_drain(client, 0.4)
+    msg = json.loads(recv_lines.pop(0))
+    assert msg == {"type": "ui_response", "id": 8, "value": ["a", "c"]}, msg
+
+    # exact option text is accepted (single select → string value)
+    send({"type": "ui_request", "id": 9, "method": "select",
+          "title": "Keep or drop?", "options": ["keep", "drop"]})
+    pump_and_drain(client, 0.2)
+    ns["pi_input_cb"]("", "buffer", "!pick drop")
+    pump_and_drain(client, 0.4)
+    msg = json.loads(recv_lines.pop(0))
+    assert msg == {"type": "ui_response", "id": 9, "value": "drop"}, msg
+
+    # a new prompt supersedes the pending one: old id released as cancelled
+    send({"type": "ui_request", "id": 10, "method": "select",
+          "title": "old prompt", "options": ["x"]})
+    pump_and_drain(client, 0.2)
+    send({"type": "ui_request", "id": 11, "method": "select",
+          "title": "new prompt", "options": ["y"]})
+    pump_and_drain(client, 0.3)
+    msg = json.loads(recv_lines.pop(0))
+    assert msg == {"type": "ui_response", "id": 10, "cancelled": True}, msg
+    assert BRIDGE.pending_ui["id"] == 11
+    ns["pi_input_cb"]("", "buffer", "!pick cancel")
+    pump_and_drain(client, 0.4)
+    msg = json.loads(recv_lines.pop(0))
+    assert msg == {"type": "ui_response", "id": 11, "cancelled": True}, msg
+    assert BRIDGE.pending_ui is None
+
+    # input prompt: free-form answer via !pick <text> (incl. spaces)
+    send({"type": "ui_request", "id": 12, "method": "input",
+          "title": "Enter a value", "placeholder": "type something…"})
+    pump_and_drain(client, 0.2)
+    assert "!pick <your answer>" in buffer_text(stub)
+    assert "type something…" in buffer_text(stub), "placeholder must render"
+    ns["pi_input_cb"]("", "buffer", "!pick hello world")
+    pump_and_drain(client, 0.4)
+    msg = json.loads(recv_lines.pop(0))
+    assert msg == {"type": "ui_response", "id": 12,
+                   "value": "hello world"}, msg
+
+    # a malformed ui_request is ignored (no pending state, nothing sent)
+    send({"type": "ui_request", "method": "select"})
+    pump_and_drain(client, 0.3)
+    assert recv_lines == [] and BRIDGE.pending_ui is None
+    assert "bad ui_request" in buffer_text(stub)
+
+    # the !cd / !pick lines typed above were echoed under the user's IRC nick
+    # as well — same path as plain input (no legacy '> ' marker)
+    me_rows = [(p, b) for tags, p, b in stub.printf_tags if tags == me_tags]
+    me_lines = [b for _, b in me_rows]
+    for expected in ("!cd ~/projects/foo", "!pick 2", "!pick 1,3",
+                     "!pick drop", "!pick cancel", "!pick hello world"):
+        assert expected in me_lines, "user-nick echo missing: %r" % expected
+    assert all("alice" in p for p, _ in me_rows), \
+        "user lines carry the user's nick as the line prefix"
 
     # ping → pong
     send({"type": "ping", "ts": 123})
@@ -756,12 +870,12 @@ def main():
 
     # --- anonymous TCP handshake (no token configured)
     tc = tcp_connect(port1)
-    send_line(tc, {"type": "hello", "protocol": 2, "name": "pi"})
+    send_line(tc, {"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi"})
     stub.pump(0.3)
     lines = []
     drain(tc, lines)
     hello = json.loads(lines[0])
-    assert hello["type"] == "hello" and hello["protocol"] == 2, \
+    assert hello["type"] == "hello" and hello["protocol"] == ns["PROTOCOL"], \
         "anonymous hello accepted without a challenge"
     tc.close()
     stub.pump(0.3)
@@ -780,13 +894,13 @@ def main():
     challenge = json.loads(lines[0])
     assert challenge["type"] == "challenge" and len(challenge["nonce"]) == 64, \
         "first server message is a challenge with a 256-bit nonce"
-    send_line(tc, {"type": "hello", "protocol": 2, "name": "pi",
+    send_line(tc, {"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi",
                    "proof": proof_for(TOKEN, challenge["nonce"])})
     stub.pump(0.3)
     lines = []
     drain(tc, lines)
     hello = json.loads(lines[0])
-    assert hello["type"] == "hello" and hello["protocol"] == 2, \
+    assert hello["type"] == "hello" and hello["protocol"] == ns["PROTOCOL"], \
         "server hello only after a valid proof"
     assert "pi connected from 127.0.0.1" in buffer_text(stub), \
         "connect line names the TCP peer IP"
@@ -829,7 +943,7 @@ def main():
     lines = []
     drain(tc, lines)
     assert lines and json.loads(lines[0])["type"] == "challenge"
-    send_line(tc, {"type": "hello", "protocol": 2, "name": "pi",
+    send_line(tc, {"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi",
                    "proof": proof_for(TOKEN, json.loads(lines[0])["nonce"])})
     stub.pump(0.3)
     lines = []
@@ -846,7 +960,7 @@ def main():
     lines = []
     drain(tc, lines)
     challenge = json.loads(lines[0])
-    send_line(tc, {"type": "hello", "protocol": 2, "name": "pi",
+    send_line(tc, {"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi",
                    "proof": proof_for("wrong-token", challenge["nonce"])})
     pump_and_drain(tc, 0.4)
     assert json.loads(recv_lines[-1]) == {"type": "error", "code": "auth_failed"}
@@ -859,7 +973,7 @@ def main():
     stub.pump(0.3)
     lines = []
     drain(tc, lines)
-    send_line(tc, {"type": "hello", "protocol": 2, "name": "pi"})
+    send_line(tc, {"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi"})
     pump_and_drain(tc, 0.4)
     assert json.loads(recv_lines[-1]) == {"type": "error", "code": "auth_failed"}
     tc.close()
@@ -874,7 +988,7 @@ def main():
     drain(tc, lines)
     assert lines and json.loads(lines[0])["type"] == "challenge", \
         "challenge still first, pre-auth bytes ignored"
-    send_line(tc, {"type": "hello", "protocol": 2, "name": "pi",
+    send_line(tc, {"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi",
                    "proof": proof_for(TOKEN, json.loads(lines[0])["nonce"])})
     stub.pump(0.3)
     lines = []
@@ -890,7 +1004,7 @@ def main():
     stub.config_set_plugin("token", "")
     stub.pump(0.1)
     tc = tcp_connect(port1)
-    send_line(tc, {"type": "hello", "protocol": 2, "name": "pi"})
+    send_line(tc, {"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi"})
     stub.pump(0.3)
     lines = []
     drain(tc, lines)
@@ -924,7 +1038,7 @@ def main():
     assert lines and json.loads(lines[0])["type"] == "challenge", \
         "matching peer IP passes the gate"
     # the broken-reference value is enforced as a literal token
-    send_line(tc, {"type": "hello", "protocol": 2, "name": "pi",
+    send_line(tc, {"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi",
                    "proof": proof_for("${sec.data.pi_weechat_token}",
                                       json.loads(lines[0])["nonce"])})
     stub.pump(0.3)
@@ -970,7 +1084,7 @@ def main():
         lines = []
         drain(tc, lines)
         challenge = json.loads(lines[0])
-        send_line(tc, {"type": "hello", "protocol": 2, "name": "pi",
+        send_line(tc, {"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi",
                        "proof": proof_for("bad", challenge["nonce"])})
         pump_and_drain(tc, 0.3)
         assert json.loads(recv_lines[-1]) == {"type": "error",

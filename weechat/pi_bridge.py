@@ -21,7 +21,7 @@
 #     WeeChat's own urlserver.py (blocking listen fd, one accept() per
 #     event, SO_REUSEADDR, listen(5)).
 #
-# Auth (protocol 2, shared secret — the token never crosses the wire):
+# Auth (protocol 3, shared secret — the token never crosses the wire):
 #   when `pi_bridge.token` is set, EVERY client (TCP and Unix) is first
 #   sent {"type":"challenge","nonce":<random hex>} and must answer its
 #   hello with proof = hex(HMAC-SHA256(key=token, msg=nonce)). Wrong or
@@ -29,6 +29,12 @@
 #   (current behavior). Recommended: store the secret in sec.conf
 #   (/secure set pi_weechat_token …) and set the option to
 #   ${sec.data.pi_weechat_token}.
+#
+# Interactive prompts (protocol 3): pi can ask the buffer for input with
+#   ui_request {id, method: "select"|"input", title, options?/placeholder?};
+# the user answers with `!pick <n>` (comma list / exact text) or
+# `!pick <text>` (input) or `!pick cancel`; this script sends back
+#   ui_response {id, value | cancelled}.
 #
 # Install: copy into ~/.local/share/weechat/python/ and start WeeChat, or
 #   /python load pi_bridge
@@ -77,7 +83,7 @@ def dbg(msg):
     except Exception:
         pass  # debug must never break the bridge
 
-PROTOCOL = 2
+PROTOCOL = 3
 MAX_LINE = 1024 * 1024  # must match MAX_LINE_BYTES in lib/codec.mjs
 
 # ------------------------------------------------- abuse-resistance thresholds
@@ -384,6 +390,8 @@ DEFAULT_HIGHLIGHT = "on"
 HELP_TEXT = (
     "!s <text> steer current turn · !q <text> queue follow-up\n"
     "!new new session · !compact compact context · !abort abort current turn\n"
+    "!cd <path> switch pi to a project dir (fuzzy match → pick list)\n"
+    "!pick <n|text> answer pi’s “?” prompt (!pick cancel aborts)\n"
     "!status refresh session/model info · !model [provider/id] list or set model\n"
     "!tools [full|summary|off] tool output verbosity (default: summary)\n"
     "!think [on|off] show/hide thinking lines (default: off)\n"
@@ -497,6 +505,8 @@ class Bridge(object):
         # markdown fence tracking for streamed assistant lines (per message)
         self._md_msg = None           # msgId of the last assistant_line seen
         self._md_fence = None         # open fence dict (see _fence_open), or None
+        # pending interactive prompt from pi (ui_request); answered via !pick
+        self.pending_ui = None        # {id, method, options, multiple}, or None
 
     # ------------------------------------------------------- connection state
 
@@ -1044,6 +1054,8 @@ class Bridge(object):
             # state from the old connection must not leak into new messages
             self._md_msg = None
             self._md_fence = None
+            # no live peer left to answer a pending prompt
+            self.pending_ui = None
             self.set_state("waiting")
             self._print(C_DIM + "— pi disconnected —%s" % R)
 
@@ -1124,7 +1136,7 @@ class Bridge(object):
             # tool events ⇒ "tool:<name>"). session_start and manual
             # status queries also send "idle" — those are not settles.
             was_busy = self.state == "thinking" or self.state.startswith("tool:")
-            self.set_state(state)
+            self.set_state(state, msg.get("detail"))
             if state == "idle" and was_busy and self.alive and self.buffer:
                 # turn settled: one extra highlight line below the last
                 # message line (left untouched); date 0 ⇒ now
@@ -1170,6 +1182,9 @@ class Bridge(object):
             for line in self._tool_output_lines(msg.get("output")):
                 self._print_msg(C_TOOL_OUT + "  " + line + R, "pi")
             return
+        if t == "ui_request":
+            self._handle_ui_request(msg)
+            return
         if t == "error":
             self._print(C_ERR + "pi bridge: %s: %s%s" % (
                 msg.get("code", "?"), msg.get("message", ""), R))
@@ -1190,6 +1205,116 @@ class Bridge(object):
                     + ["… (%d more lines)" % (len(lines) - 6)]
                     + lines[-3:])
         return lines
+
+    # ------------------------------------------------- interactive prompts
+
+    def _handle_ui_request(self, msg):
+        """Render a select/input prompt from pi; the user answers with !pick.
+
+        `select` shows numbered options (comma list when multiple);
+        `input` asks for free-form text. Only one prompt is tracked at a
+        time — a new request supersedes the old one, which is released on
+        the pi side with a cancelled ui_response so it doesn't wait forever.
+        """
+        req_id = msg.get("id")
+        method = msg.get("method")
+        title = str(msg.get("title") or "").strip() or "(untitled)"
+        if not isinstance(req_id, int) or method not in ("select", "input"):
+            self._print(C_ERR + "pi bridge: bad ui_request ignored" + R)
+            return
+        if self.pending_ui is not None and self.pending_ui["id"] != req_id:
+            self._send({"type": "ui_response", "id": self.pending_ui["id"],
+                        "cancelled": True})
+        if method == "select":
+            options = []
+            for opt in (msg.get("options") or [])[:24]:  # sanity cap
+                if isinstance(opt, dict) and isinstance(opt.get("label"), str):
+                    options.append((opt["label"],
+                                    str(opt.get("description") or "").strip()))
+                elif isinstance(opt, str) and opt:
+                    options.append((opt, ""))
+            if not options:
+                self._print(C_ERR + "pi bridge: select with no options ignored" + R)
+                return
+            multiple = bool(msg.get("multiple"))
+            self.pending_ui = {"id": req_id, "method": "select",
+                               "options": options, "multiple": multiple}
+            self._print(C_STATUS + "? " + title + R)
+            for i, (label, desc) in enumerate(options, 1):
+                self._print("%2d. %s" % (i, label))
+                if desc:
+                    self._print("    " + C_DIM + desc.replace("\n", " ") + R)
+            hint = "reply !pick <n>" + (", e.g. !pick 1,3 (multiple)" if multiple else "") \
+                   + " · !pick cancel"
+            self._print(C_DIM + hint + R)
+        else:  # input
+            self.pending_ui = {"id": req_id, "method": "input"}
+            self._print(C_STATUS + "? " + title + R)
+            placeholder = msg.get("placeholder")
+            ph = (" (%s)" % str(placeholder).replace("\n", " ")) if placeholder else ""
+            self._print(C_DIM + "reply !pick <your answer>%s · !pick cancel" % ph + R)
+        self.set_state(self.state, "awaiting !pick")
+
+    def handle_pick(self, arg, raw_line):
+        """Answer the pending ui_request with one buffer line.
+
+        select:  !pick <n> (comma list when multiple), or exact option text
+        input:   !pick <free-form text>
+        any:     !pick cancel
+        """
+        pending = self.pending_ui
+        if pending is None:
+            self._print(C_ERR +
+                        "nothing to pick — !pick answers a “?” prompt from pi" + R)
+            return
+        if arg == "" or arg in ("cancel", "c"):
+            self._respond_ui(pending, cancelled=True)
+            self._print_msg(raw_line, "user")
+            return
+        if pending["method"] == "input":
+            self._respond_ui(pending, value=arg)
+            self._print_msg(raw_line, "user")
+            return
+        # select: try numbers first ("3", or "1,3"), then exact option text
+        parts = [p.strip() for p in arg.split(",")]
+        if (all(p.isdigit() for p in parts)
+                and all(1 <= int(p) <= len(pending["options"]) for p in parts)):
+            chosen = [pending["options"][int(p) - 1][0] for p in parts]
+            if not pending["multiple"] and len(chosen) > 1:
+                self._print(C_ERR + "single choice only — pick one number" + R)
+                return
+            value = chosen if pending["multiple"] else chosen[0]
+        else:
+            value = None
+            for label, _desc in pending["options"]:
+                if label == arg:
+                    value = [label] if pending["multiple"] else label
+                    break
+            if value is None:
+                self._print(C_ERR + "no such option: %s (numbers 1-%d, or “cancel”)"
+                            % (arg, len(pending["options"])) + R)
+                return
+        self._respond_ui(pending, value=value)
+        self._print_msg(raw_line, "user")
+
+    def _respond_ui(self, pending, value=None, cancelled=False):
+        """Send the ui_response for `pending` (rate-limited like input: it
+        unblocks a pi command, so a flooded buffer must not unblock many)."""
+        now = time.time()
+        self.ui_times = [t for t in self.ui_times if now - t < 1.0]
+        if len(self.ui_times) >= USER_INPUT_MAX_PER_S:
+            self._print(C_REJECT + "input rate limited (max %d/s)%s"
+                        % (USER_INPUT_MAX_PER_S, R))
+            return
+        self.ui_times.append(now)
+        msg = {"type": "ui_response", "id": pending["id"]}
+        if cancelled:
+            msg["cancelled"] = True
+        else:
+            msg["value"] = value
+        self._send(msg)
+        self.pending_ui = None
+        self.set_state(self.state)  # drop the “awaiting !pick” title hint
 
     # ---------------------------------------------------------- user input
 
@@ -1284,6 +1409,17 @@ class Bridge(object):
             self._send({"type": "command", "name": "model",
                         "arg": line[7:].strip()})
             self._print_msg(line, "user")
+        elif line == "!cd" or (line.startswith("!cd ") and not line[4:].strip()):
+            self._print(C_ERR + "usage: !cd <path> — e.g. !cd ~/my-project" + R)
+            return
+        elif line.startswith("!cd "):
+            # switch pi to a project dir; fuzzy matches (and the "create as
+            # new project" option) come back as a ? prompt answered with !pick
+            self._send({"type": "command", "name": "cd", "arg": line[4:].strip()})
+            self._print_msg(line, "user")
+        elif line == "!pick" or line.startswith("!pick "):
+            self.handle_pick(line[5:].strip(), line)
+            return
         elif line.startswith("!s "):
             self._send_user_input(line[3:], line, {"deliverAs": "steer"})
         elif line.startswith("!q "):
@@ -1466,7 +1602,7 @@ def pi_shutdown_cb():
 
 def main():
     dbg("main(): loading (sock=%s, debug=%s)" % (default_socket_path(), bool(_DBG_PATH)))
-    weechat.register("pi_bridge", "simeng", "0.4.0", "MIT",
+    weechat.register("pi_bridge", "simeng", "0.5.0", "MIT",
                      "mirror a pi coding agent session through a WeeChat buffer",
                      "pi_shutdown_cb", "")
     # plugin options (auto-created on first run; /set pi_bridge.<name> …).

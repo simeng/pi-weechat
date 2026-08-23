@@ -63,16 +63,48 @@ function startWeechatSide(sockPath) {
 
 function makePiMock() {
   const handlers = {};
+  const commands = {};
   const sentUserMessages = [];
+  const switchCalls = [];
+  // Command context emulating pi's ExtensionCommandContext: /weechat-ctl
+  // commands need waitForIdle/switchSession/newSession/compact.
+  const commandCtx = {
+    ...MOCK_CTX,
+    waitForIdle: async () => {},
+    newSession: async (o) => {
+      o?.withSession?.(commandCtx);
+      return { cancelled: false };
+    },
+    compact: (o) => o?.onComplete?.(),
+    switchSession: async (file, o) => {
+      switchCalls.push(file);
+      o?.withSession?.(commandCtx);
+      return { cancelled: false };
+    },
+  };
   return {
     sentUserMessages,
+    switchCalls,
     api: {
       on: (name, fn) => {
         (handlers[name] ??= []).push(fn);
       },
-      registerCommand: () => {},
+      registerCommand: (name, opts) => {
+        commands[name] = opts;
+      },
       sendUserMessage: (text, opts) => {
         sentUserMessages.push({ text, ...(opts ?? {}) });
+        // Emulate pi's extension-command dispatch: with
+        // expandPromptTemplates, "/weechat-ctl …" runs the registered handler
+        // immediately (this is how !new/!model/… execute in real pi).
+        if (
+          typeof text === "string" &&
+          text.startsWith("/weechat-ctl ") &&
+          opts?.expandPromptTemplates
+        ) {
+          const raw = text.slice("/weechat-ctl ".length);
+          void commands["weechat-ctl"]?.handler(raw, commandCtx);
+        }
       },
       getSessionName: () => "itg-session",
     },
@@ -89,7 +121,7 @@ const MOCK_CTX = {
   abort() {},
 };
 
-// The extension module is a singleton (registered once); both scenarios
+// The extension module is a singleton (registered once); all scenarios
 // share one pi mock and re-fire session_start with different env.
 const mock = makePiMock();
 let extLoaded = false;
@@ -133,8 +165,15 @@ test("integration: real extension ↔ real weechat script", async (t) => {
   const sockPath = path.join(dir, "bridge.sock");
 
   const wc = startWeechatSide(sockPath);
+  // Hermetic: never read the real ~/.pi/agent/pi-weechat.json (a configured
+  // token would make the extension wait for a challenge the fake peer never
+  // sends). Restored in t.after.
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
   t.after(async () => {
     try { wc.child.kill("SIGKILL"); } catch {}
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -435,6 +474,123 @@ test("integration: config file pi-weechat.json + env precedence", async (t) => {
     !wc.lines.some((m) => m.type === "print" && m.text.includes("auth failed")),
     "no auth failure: the env token must win over the config file's"
   );
+
+  await mock.fire("session_shutdown");
+});
+
+// End-to-end over the REAL wire: buffer typing → command → fuzzy prompt
+// rendered in the buffer → !pick answering it → real session switch.
+test("integration: !cd + !pick round trip", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wc-itg-cd-"));
+  const sockPath = path.join(dir, "bridge.sock");
+  const projAlpha = path.join(dir, "proj-alpha");
+  fs.mkdirSync(projAlpha);
+  fs.mkdirSync(path.join(dir, "zzz-unrelated"));
+
+  const wc = startWeechatSide(sockPath);
+  const prevHome = process.env.HOME;
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  t.after(async () => {
+    try { wc.child.kill("SIGKILL"); } catch {}
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await wc.waitFor((m) => m.type === "ready", "python driver ready", 10_000);
+
+  delete process.env.PI_WEECHAT_URL;
+  delete process.env.PI_WEECHAT_TOKEN;
+  process.env.PI_WEECHAT_SOCK = sockPath;
+  // Hermetic: the fuzzy search scans $HOME, and SessionManager stores session
+  // files under <PI_CODING_AGENT_DIR>/sessions/… — both pointed at the sandbox.
+  process.env.HOME = dir;
+  process.env.PI_CODING_AGENT_DIR = dir;
+
+  await loadExt();
+  await mock.fire("session_start");
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("pi connected"),
+    "buffer: pi connected"
+  );
+
+  // --- exact path: switches immediately, no prompt on the wire ----------
+  wc.send({ op: "input", text: `!cd ${projAlpha}` });
+  await waitForMock(() => mock.switchCalls.length >= 1, "switchSession (exact)");
+  const hdrFile = mock.switchCalls[0];
+  assert.ok(fs.existsSync(hdrFile), "pre-written session file exists on disk");
+  const header = JSON.parse(fs.readFileSync(hdrFile, "utf8"));
+  assert.equal(header.cwd, projAlpha);
+  // emulate pi re-emitting session_start for the resumed session (new cwd)
+  await mock.fire("session_start", {}, { ...MOCK_CTX, cwd: projAlpha });
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes(projAlpha),
+    "buffer: session line with new cwd"
+  );
+
+  // --- typo'd path: fuzzy prompt renders in the buffer ------------------
+  wc.lines.length = 0;
+  wc.send({ op: "input", text: `!cd ${path.join(dir, "proj-alph")}` });
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("Which directory?"),
+    "buffer: ? prompt title"
+  );
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes(projAlpha),
+    "buffer: fuzzy match option"
+  );
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("➕ create"),
+    "buffer: create option"
+  );
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("!pick cancel"),
+    "buffer: pick hint line"
+  );
+  await wc.waitFor(
+    (m) => m.type === "title" && m.text.includes("awaiting !pick"),
+    "title: awaiting !pick"
+  );
+
+  // answering with !pick 1 completes the switch
+  wc.send({ op: "input", text: "!pick 1" });
+  await waitForMock(() => mock.switchCalls.length >= 2, "switchSession (picked)");
+  assert.equal(
+    JSON.parse(fs.readFileSync(mock.switchCalls[1], "utf8")).cwd,
+    projAlpha,
+    "picked option became the new cwd"
+  );
+
+  // --- no similar dirs: only the create option; !pick 1 mkdirs ----------
+  wc.lines.length = 0;
+  const brandNew = path.join(dir, "brand-new");
+  wc.send({ op: "input", text: `!cd ${brandNew}` });
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes(`➕ create ${brandNew} as new project`),
+    "buffer: create option only"
+  );
+  wc.send({ op: "input", text: "!pick 1" });
+  await waitForMock(() => mock.switchCalls.length >= 3, "switchSession (create)");
+  assert.ok(fs.existsSync(brandNew), "create option mkdir'd the project dir");
+  assert.equal(
+    JSON.parse(fs.readFileSync(mock.switchCalls[2], "utf8")).cwd,
+    brandNew
+  );
+
+  // --- !pick cancel: no switch, buffer notes it -------------------------
+  wc.lines.length = 0;
+  wc.send({ op: "input", text: `!cd ${path.join(dir, "proj-alph")}` });
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("Which directory?"),
+    "buffer: prompt (cancel case)"
+  );
+  wc.send({ op: "input", text: "!pick cancel" });
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("(cd cancelled)"),
+    "buffer: cd cancelled note"
+  );
+  assert.equal(mock.switchCalls.length, 3, "cancel must not switch sessions");
 
   await mock.fire("session_shutdown");
 });

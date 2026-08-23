@@ -80,6 +80,8 @@ Open the `pi` buffer:
   - `!abort` — abort the current run
   - `!status` — resend session info (works even mid-turn)
   - `!model` — list available models (scoped models if model scoping is configured, otherwise the full catalogue — same as pi's `/model`); `!model <provider/model>` switches model
+  - `!cd <path>` — switch pi to a different project directory (new session in that cwd). An exact existing dir switches immediately; anything else is fuzzy-searched and shown as a numbered list in the buffer — always including a “➕ create <path> as new project” option
+  - `!pick …` — answer the numbered list / prompt that pi shows after `!cd` (or any future interactive prompt): `!pick <n>` (or `!pick 1,3` for multiple), or the exact option text; `!pick cancel` aborts
   - `!tools [full|summary|off]` — tool output verbosity in the buffer
     (`summary` is the default: first/last 3 lines, middle elided like a smart
     filter; also settable via `/set pi_bridge.tool_output …`)

@@ -52,7 +52,7 @@ test("LineDecoder rejects messages without a string type", () => {
 
 test("MAX_LINE_BYTES is the shared 1 MiB limit", () => {
   assert.equal(MAX_LINE_BYTES, 1024 * 1024);
-  assert.equal(PROTOCOL_VERSION, 2);
+  assert.equal(PROTOCOL_VERSION, 3);
 });
 
 // ------------------------------------------------------- parseEndpoint unit
@@ -90,9 +90,9 @@ test("parseEndpoint: unknown scheme throws (extension point)", () => {
 });
 
 test("makeHello: proof only included when non-empty", () => {
-  assert.deepEqual(makeHello("pi"), { type: "hello", protocol: 2, name: "pi" });
-  assert.deepEqual(makeHello("pi", "ab12"), { type: "hello", protocol: 2, name: "pi", proof: "ab12" });
-  assert.deepEqual(makeHello("pi", ""), { type: "hello", protocol: 2, name: "pi" });
+  assert.deepEqual(makeHello("pi"), { type: "hello", protocol: PROTOCOL_VERSION, name: "pi" });
+  assert.deepEqual(makeHello("pi", "ab12"), { type: "hello", protocol: PROTOCOL_VERSION, name: "pi", proof: "ab12" });
+  assert.deepEqual(makeHello("pi", ""), { type: "hello", protocol: PROTOCOL_VERSION, name: "pi" });
 });
 
 // ------------------------------------------------------------ fake weechat
@@ -154,6 +154,10 @@ function waitFor(fn, what, timeoutMs = 3000) {
 
 async function loadExtension(socketPath) {
   process.env.PI_WEECHAT_SOCK = socketPath;
+  // Hermetic: never read the real ~/.pi/agent/pi-weechat.json (a configured
+  // token there would make the extension wait for a challenge the fake peer
+  // never sends, and endpoint/token would leak into these tests).
+  process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wc-ag-"));
   const mod = await import("../extensions/weechat-bridge.ts");
   const handlers = {};
   const commands = {};
@@ -311,6 +315,128 @@ test("end-to-end: handshake, output mirroring, input injection", async (t) => {
 
   // session_shutdown tears down (no reconnect loop afterwards)
   await ext.fire("session_shutdown", {});
+  t.after(() => weechat.close());
+});
+
+// ------------------------------------------------------------- !cd (!pick)
+
+test("!cd: exact switch, fuzzy select via ui_request, create, cancel", async (t) => {
+  const socketPath = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "pi-wc-cd-")), "bridge.sock"
+  );
+  // hermetic filesystem for the fuzzy search + session files
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cd-base-"));
+  const projAlpha = path.join(base, "proj-alpha");
+  const zzz = path.join(base, "zzz-unrelated");
+  fs.mkdirSync(projAlpha);
+  fs.mkdirSync(zzz);
+
+  const weechat = await startFakeWeechat(socketPath);
+  const ext = await loadExtension(socketPath);
+
+  const prevHome = process.env.HOME;
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  // os.homedir() reads $HOME live (POSIX): the fuzzy search scans home, so
+  // point it at the sandbox. PI_CODING_AGENT_DIR redirects SessionManager's
+  // session-file storage away from the real ~/.pi/agent.
+  process.env.HOME = base;
+  process.env.PI_CODING_AGENT_DIR = path.join(base, "agent");
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+  });
+
+  await ext.fire("session_start", {});
+  await waitFor(() => weechat.received.find((m) => m.type === "hello"), "pi hello");
+  weechat.send({ type: "hello", protocol: PROTOCOL_VERSION, name: "weechat-pi-bridge" });
+
+  const switches = [];
+  ext.ctx.cwd = base;
+  ext.ctx.waitForIdle = async () => {};
+  ext.ctx.switchSession = async (file) => {
+    switches.push(file);
+    return { cancelled: false };
+  };
+
+  const ctl = ext.commands["weechat-ctl"];
+  assert.ok(ctl, "weechat-ctl registered");
+  const uiRequests = () => weechat.received.filter((m) => m.type === "ui_request");
+
+  // --- command routing: !cd from the buffer arrives as /weechat-ctl cd …
+  weechat.send({ type: "command", name: "cd", arg: "~/somewhere" });
+  const routed = await waitFor(
+    () => ext.sent.find((s) => s.text === "/weechat-ctl cd ~/somewhere"),
+    "routed /weechat-ctl cd"
+  );
+  assert.deepEqual(routed.opts, { expandPromptTemplates: true });
+
+  // --- exact directory → switch immediately, no prompt
+  await ctl.handler("cd " + projAlpha, ext.ctx);
+  assert.equal(switches.length, 1, "exact dir switches without a prompt");
+  const hdr1 = JSON.parse(fs.readFileSync(switches[0], "utf8"));
+  assert.equal(hdr1.cwd, projAlpha);
+  assert.equal(hdr1.type, "session");
+  assert.equal(uiRequests().length, 0, "no ui_request for an exact dir");
+
+  // --- fuzzy: typo'd path → select prompt with the match + create option
+  const p1 = ctl.handler("cd " + path.join(base, "proj-alph"), ext.ctx);
+  const req1 = await waitFor(() => uiRequests()[0], "ui_request (fuzzy)");
+  assert.equal(req1.method, "select");
+  assert.match(String(req1.title), /No exact match for/);
+  assert.ok(req1.options.includes(projAlpha), "fuzzy match listed");
+  const createOpt = req1.options.find((o) => String(o).startsWith("➕ create "));
+  assert.ok(createOpt, "create option always offered");
+  // buffer title hint while waiting
+  await waitFor(
+    () => weechat.received.find((m) => m.type === "status" && m.detail === "awaiting !pick"),
+    "awaiting !pick status"
+  );
+  weechat.send({ type: "ui_response", id: req1.id, value: projAlpha });
+  await p1;
+  assert.equal(switches.length, 2);
+  assert.equal(JSON.parse(fs.readFileSync(switches[1], "utf8")).cwd, projAlpha);
+
+  // --- no similar dirs → only the create option; picking it mkdirs + switches
+  const brandNew = path.join(base, "brand-new");
+  const p2 = ctl.handler("cd " + brandNew, ext.ctx);
+  const req2 = await waitFor(() => uiRequests()[1], "ui_request (create)");
+  assert.match(String(req2.title), /Nothing similar to/);
+  assert.deepEqual(req2.options, [`➕ create ${brandNew} as new project`]);
+  weechat.send({ type: "ui_response", id: req2.id, value: req2.options[0] });
+  await p2;
+  assert.ok(fs.existsSync(brandNew) && fs.statSync(brandNew).isDirectory(), "create option mkdirs the dir");
+  assert.equal(switches.length, 3);
+  assert.equal(JSON.parse(fs.readFileSync(switches[2], "utf8")).cwd, brandNew);
+
+  // --- cancel: no switch, buffer gets a cancellation note
+  const p3 = ctl.handler("cd " + path.join(base, "proj-alph"), ext.ctx);
+  const req3 = await waitFor(() => uiRequests()[2], "ui_request (cancel case)");
+  weechat.send({ type: "ui_response", id: req3.id, cancelled: true });
+  await p3;
+  assert.equal(switches.length, 3, "cancel must not switch");
+  // the note is sent right after the handler settles — wait for it on the wire
+  const cancelledLine = await waitFor(
+    () => weechat.received.find((m) => m.type === "assistant_line" && m.text === "(cd cancelled)"),
+    "cd cancelled note"
+  );
+  assert.ok(cancelledLine);
+
+  // --- stale/unknown ui_response ids are ignored without throwing
+  weechat.send({ type: "ui_response", id: 9999, value: "x" });
+  weechat.send({ type: "ui_response", id: req1.id, value: "again" });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(switches.length, 3);
+
+  // --- empty arg → usage error, no switch
+  await ctl.handler("cd ", ext.ctx);
+  const usageErr = await waitFor(
+    () => weechat.received.find((m) => m.type === "error" && m.code === "cd_usage"),
+    "cd_usage error"
+  );
+  assert.ok(usageErr, "empty !cd answers with a usage error");
+  assert.equal(switches.length, 3);
+
   t.after(() => weechat.close());
 });
 

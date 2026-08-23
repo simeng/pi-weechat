@@ -11,6 +11,7 @@
  * when a token is configured — the token is never sent). See PLAN.md §2.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { CURRENT_SESSION_VERSION, SessionManager } from "@earendil-works/pi-coding-agent";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
@@ -153,6 +154,11 @@ export default function weechatBridge(pi: ExtensionAPI) {
   let helloSent = false;         // our hello went out for the current connection
   let challengeTimer: NodeJS.Timeout | null = null;
 
+  // Protocol-3 UI prompt channel: select/input prompts asked of the WeeChat
+  // buffer (answered with !pick). Keyed by the ui_request id.
+  let uiSeq = 0;
+  const pendingUIs = new Map<number, (v: string | string[] | null) => void>();
+
   // Streaming assembly: assistant text + thinking blocks, keyed by contentIndex.
   let blockBufs = new Map<number, string>();
   let thinkBufs = new Map<number, string>();
@@ -257,6 +263,8 @@ export default function weechatBridge(pi: ExtensionAPI) {
       challengeTimer = null;
     }
     helloSent = false;
+    setWeechatUIConnected(false); // other extensions fall back to local UI
+    clearPendingUIs("disconnect");
     if (sock) {
       sock.destroy();
       sock = null;
@@ -360,6 +368,10 @@ export default function weechatBridge(pi: ExtensionAPI) {
           send({ type: "error", code: "protocol_mismatch" });
           disconnect();
           scheduleReconnect();
+        } else {
+          // Server hello received ⇒ we are the connected client; make the UI
+          // channel usable for other extensions (see publishWeechatUIGlobal).
+          setWeechatUIConnected(true);
         }
         return;
       case "error":
@@ -408,6 +420,31 @@ export default function weechatBridge(pi: ExtensionAPI) {
         dbg(`command: ${msg.name} ${String(msg.arg ?? "")}`);
         handleCommand(msg.name as string | undefined, msg.arg as string | undefined);
         return;
+      case "ui_response": {
+        // Answer to one of our ui_request prompts (!pick in the buffer).
+        const id = intOf(msg.id);
+        const finish = pendingUIs.get(id);
+        if (!finish) {
+          dbg(`ui_response for unknown/stale id ${id} — ignored`);
+          return;
+        }
+        let value: string | string[] | null;
+        if (msg.cancelled === true) {
+          value = null;
+        } else if (typeof msg.value === "string") {
+          value = msg.value;
+        } else if (Array.isArray(msg.value) && msg.value.every((v) => typeof v === "string")) {
+          value = msg.value as string[];
+        } else {
+          dbg(`ui_response ${id} has a malformed value — treating as cancel`);
+          value = null;
+        }
+        finish(value);
+        // The buffer is no longer waiting on a prompt: clear the "awaiting
+        // !pick" title hint (the running state may have changed meanwhile).
+        send({ type: "status", state: busy ? "thinking" : "idle" });
+        return;
+      }
       default:
         // unknown type from weechat: ignore (forward-compat)
     }
@@ -428,6 +465,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
       case "compact":
       case "status":
       case "model":
+      case "cd":
         // Route through the registered extension command.
         // expandPromptTemplates: true is REQUIRED: sendUserMessage defaults
         // it to false, which skips extension-command dispatch and would send
@@ -733,6 +771,13 @@ export default function weechatBridge(pi: ExtensionAPI) {
             }
             return;
           }
+          case "cd": {
+            // !cd <path> — switch pi to another project directory (new
+            // session there). Fuzzy matches and the "create as new project"
+            // option are picked in the WeeChat buffer via !pick.
+            await runCd(ctx, arg);
+            return;
+          }
           default:
             send({ type: "error", code: "unknown_command", message: `!${name || "?"}` });
         }
@@ -745,6 +790,186 @@ export default function weechatBridge(pi: ExtensionAPI) {
       }
     },
   });
+
+  // ------------------------------------------- UI prompt channel (!pick)
+
+  /**
+   * Ask the WeeChat buffer for interactive input (protocol-3 `ui_request`):
+   *   - method "select": numbered options — answered with `!pick <n>`
+   *     (comma list when multiple, exact option text also accepted)
+   *   - method "input":  free-form text — answered with `!pick <text>`
+   * Resolves with the chosen option(s) / entered text, or null when the
+   * user cancels (`!pick cancel`), the optional timeout expires, or the
+   * client disconnects. Throws nothing: a not-connected socket resolves
+   * null immediately so callers can fall back to local UI.
+   */
+  function askWeechatUI(
+    req:
+      | { method: "select"; title: string; options: string[]; multiple?: boolean }
+      | { method: "input"; title: string; placeholder?: string },
+    timeoutMs?: number,
+  ): Promise<string | string[] | null> {
+    if (!sock || sock.destroyed) return Promise.resolve(null);
+    const id = ++uiSeq;
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v: string | string[] | null): void => {
+        if (done) return;
+        done = true;
+        pendingUIs.delete(id);
+        resolve(v);
+      };
+      pendingUIs.set(id, finish);
+      send({ type: "ui_request", id, ...req });
+      if (timeoutMs && timeoutMs > 0) {
+        const t = setTimeout(() => {
+          dbg(`ui_request ${id} timed out after ${timeoutMs}ms`);
+          finish(null);
+        }, timeoutMs);
+        void t.unref?.();
+      }
+    });
+  }
+
+  function clearPendingUIs(reason: string): void {
+    if (pendingUIs.size === 0) return;
+    dbg(`clearing ${pendingUIs.size} pending ui_request(s): ${reason}`);
+    for (const finish of pendingUIs.values()) finish(null);
+    pendingUIs.clear();
+  }
+
+  // Well-known handle on globalThis so OTHER extensions (e.g. ask_user-style
+  // tools) can offer their prompts in the WeeChat buffer instead of the TUI:
+  // check `globalThis.__pi_weechat_bridge__.isConnected()` first, and fall
+  // back to local UI when it is false.
+  const WEECHAT_UI_GLOBAL = "__pi_weechat_bridge__";
+  let weechatUIConnected = false;
+
+  function setWeechatUIConnected(v: boolean): void {
+    weechatUIConnected = v;
+    const g = globalThis as Record<string, unknown>;
+    const existing = g[WEECHAT_UI_GLOBAL] as { isConnected?: () => boolean } | undefined;
+    if (existing && typeof existing.isConnected === "function") return; // already published
+    g[WEECHAT_UI_GLOBAL] = {
+      isConnected: () => weechatUIConnected,
+      select: (
+        title: string,
+        options: string[],
+        opts?: { multiple?: boolean; timeoutMs?: number },
+      ) => askWeechatUI({ method: "select", title, options, multiple: opts?.multiple }, opts?.timeoutMs),
+      input: (title: string, placeholder?: string, opts?: { timeoutMs?: number }) =>
+        askWeechatUI({ method: "input", title, placeholder }, opts?.timeoutMs),
+    };
+  }
+
+  // ------------------------------------------------------------- !cd
+
+  /**
+   * !cd <path>: switch pi to a different project directory (new session in
+   * that cwd). Ported from the standalone /cd extension so it works over
+   * the bridge: an exact existing directory switches immediately; otherwise
+   * similar directories are fuzzy-searched and picked in the WeeChat buffer
+   * (!pick), always including a "create as new project" option.
+   */
+  async function runCd(ctx: any, rawArg?: string): Promise<void> {
+    await ctx.waitForIdle?.();
+    const input = expandTilde(String(rawArg ?? "").trim());
+    if (!input) {
+      send({ type: "error", code: "cd_usage", message: "usage: !cd <path> — e.g. !cd ~/my-project" });
+      return;
+    }
+    const target = path.isAbsolute(input) ? path.resolve(input) : path.resolve(ctx.cwd, input);
+
+    if (isExistingDirectory(target)) {
+      await switchSessionToDir(target, ctx);
+      return;
+    }
+
+    // Target exists but is not a directory: cannot create over it.
+    let targetBlocked = false;
+    try {
+      targetBlocked = !fs.statSync(target).isDirectory();
+    } catch {
+      /* does not exist — fine */
+    }
+
+    const matches = findSimilarDirs(target);
+    const createOption = `${CD_CREATE_PREFIX}${target} as new project`;
+
+    let title: string;
+    let options: string[];
+    if (matches.length > 0) {
+      title = `No exact match for ${target}. Which directory?`;
+      options = targetBlocked ? matches : [...matches, createOption];
+    } else {
+      title = `Nothing similar to "${path.basename(target)}" found.`;
+      options = targetBlocked ? [] : [createOption];
+    }
+
+    if (options.length === 0) {
+      send({ type: "error", code: "cd_not_a_dir", message: `${target} exists but is not a directory.` });
+      return;
+    }
+
+    // Tell the buffer we are waiting for !pick (shown in its title).
+    send({ type: "status", state: busy ? "thinking" : "idle", detail: "awaiting !pick" });
+    const choice = await askWeechatUI({ method: "select", title, options });
+    send({ type: "status", state: busy ? "thinking" : "idle" });
+    if (!choice || (Array.isArray(choice) && choice.length === 0)) {
+      send({ type: "assistant_line", msgId: 0, text: "(cd cancelled)" });
+      return;
+    }
+    const picked = Array.isArray(choice) ? choice[0] : choice;
+
+    let destination: string;
+    if (picked === createOption) {
+      try {
+        fs.mkdirSync(target, { recursive: true });
+      } catch (err) {
+        send({
+          type: "error",
+          code: "cd_create_failed",
+          message: `could not create ${target}: ${(err as Error).message}`,
+        });
+        return;
+      }
+      destination = target;
+    } else {
+      destination = picked;
+    }
+
+    await switchSessionToDir(destination, ctx);
+  }
+
+  /**
+   * Pre-write a minimal session header (cwd = target dir) into the default
+   * session directory for that cwd, then switch to it. A brand-new
+   * SessionManager does not flush its file until the first assistant message
+   * — without the pre-written header pi would stay on the old cwd. After the
+   * switch pi re-emits session_start (reason "resume"), which makes this
+   * extension resend session_info/status for the new cwd.
+   */
+  async function switchSessionToDir(targetCwd: string, ctx: any): Promise<void> {
+    const resolvedTarget = path.resolve(targetCwd);
+    const sessionDir = SessionManager.create(resolvedTarget).getSessionDir();
+    const id = crypto.randomUUID();
+    const timestamp = new Date().toISOString();
+    const fileTimestamp = timestamp.replace(/[:.]/g, "-");
+    const sessionFile = path.join(sessionDir, `${fileTimestamp}_${id}.jsonl`);
+    fs.writeFileSync(
+      sessionFile,
+      JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id, timestamp, cwd: resolvedTarget }) + "\n",
+    );
+    dbg(`cd: switching to ${resolvedTarget} (pre-wrote ${sessionFile})`);
+    const result = await ctx.switchSession(sessionFile, {
+      withSession: (next: any) => {
+        ctxRef = next; // old command ctx is stale after the replacement
+      },
+    });
+    if (result?.cancelled) {
+      send({ type: "assistant_line", msgId: 0, text: "(cd cancelled)" });
+    }
+  }
 }
 
 // ------------------------------------------------------------------ helpers
@@ -779,4 +1004,131 @@ function truncate(text: string, max: number): string {
     out += (out ? "\n" : "") + line;
   }
   return out + `\n… (${text.length - out.length} more characters truncated)`;
+}
+
+// ------------------------------------------------------------------ !cd search
+// Fuzzy directory search ported from the standalone /cd extension (same
+// scoring, pruning and caps) so !cd behaves like /cd did in the TUI.
+
+const CD_CREATE_PREFIX = "➕ create ";
+const CD_MIN_SCORE = 55;
+const CD_MAX_CANDIDATES = 8;
+const CD_MAX_SCANNED_ENTRIES = 15_000;
+const CD_PRUNED_DIRS = new Set(["node_modules", ".git", ".cache", ".npm"]);
+
+function expandTilde(input: string): string {
+  if (input === "~") return os.homedir();
+  if (input.startsWith("~/")) return path.join(os.homedir(), input.slice(2));
+  return input;
+}
+
+function isExistingDirectory(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(
+        prev[j] + 1, // deletion
+        cur[j - 1] + 1, // insertion
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1), // substitution
+      );
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+/** Case-insensitive similarity between a directory name and the requested one, 0-100. */
+function cdScoreName(name: string, targetName: string): number {
+  const n = name.toLowerCase();
+  const t = targetName.toLowerCase();
+  if (n === t) return 100;
+
+  let score = Math.round((1 - levenshtein(n, t) / Math.max(n.length, t.length)) * 100);
+
+  if (n.includes(t) || t.includes(n)) {
+    const coverage = Math.min(n.length, t.length) / Math.max(n.length, t.length);
+    score = Math.max(score, Math.round(60 + 40 * coverage));
+  }
+  return score;
+}
+
+/**
+ * Search for directories whose names resemble the requested path's basename.
+ * Scans the parent of the target (siblings) plus the home directory two
+ * levels deep, with pruning and a hard cap on scanned entries.
+ */
+function findSimilarDirs(target: string): string[] {
+  const targetName = path.basename(target);
+  const allowHidden = targetName.startsWith(".");
+  const parent = path.dirname(target);
+  const home = path.resolve(os.homedir());
+
+  interface Item {
+    dir: string;
+    depth: number;
+    maxDepth: number;
+  }
+
+  // parent and home can be the same directory — scan it once at the deeper depth.
+  const queue: Item[] = [];
+  const pushed = new Set<string>();
+  const pushRoot = (dir: string, maxDepth: number) => {
+    if (pushed.has(dir)) return;
+    pushed.add(dir);
+    queue.push({ dir, depth: 0, maxDepth });
+  };
+  if (isExistingDirectory(parent) && path.resolve(parent) !== home) pushRoot(path.resolve(parent), 1);
+  pushRoot(home, 2);
+
+  const visited = new Set<string>();
+  const found = new Map<string, number>(); // resolved path -> best score
+  let scanned = 0;
+
+  while (queue.length > 0 && scanned < CD_MAX_SCANNED_ENTRIES) {
+    const { dir, depth, maxDepth } = queue.shift()!;
+    if (visited.has(dir)) continue;
+    visited.add(dir);
+
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue; // unreadable — skip
+    }
+    scanned += entries.length;
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const name = entry.name.toLowerCase();
+      if (CD_PRUNED_DIRS.has(name)) continue;
+      if (name.startsWith(".") && !allowHidden) continue;
+
+      const full = path.resolve(path.join(dir, entry.name));
+      if (full === path.resolve(target)) continue;
+
+      const score = cdScoreName(entry.name, targetName);
+      if (score >= CD_MIN_SCORE) found.set(full, Math.max(found.get(full) ?? 0, score));
+
+      if (depth + 1 < maxDepth && scanned < CD_MAX_SCANNED_ENTRIES) {
+        queue.push({ dir: full, depth: depth + 1, maxDepth });
+      }
+    }
+  }
+
+  return [...found.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, CD_MAX_CANDIDATES)
+    .map(([p]) => p);
 }
