@@ -277,6 +277,15 @@ export default function weechatBridge(pi: ExtensionAPI) {
     clearConnectTimer();
     if (shutdown) return;
     if (sock && !sock.destroyed) return;
+    // A server-side close takes us through "close" → scheduleReconnect()
+    // without disconnect(), so handshake state must be reset here: a
+    // stale helloSent=true would skip the hello on the new socket and
+    // every reconnect would die on the server's auth timeout.
+    helloSent = false;
+    if (challengeTimer) {
+      clearTimeout(challengeTimer);
+      challengeTimer = null;
+    }
 
     const ep = endpoint;
     dbg(`dialing ${describeEndpoint(ep)}`);

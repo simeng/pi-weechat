@@ -598,15 +598,13 @@ class Bridge(object):
     def _print_msg(self, text, role):
         """Render one line for a role (message body colors unchanged).
 
-        'pi'   → prnt_date_tags, tags notify_message,prefix_nick_chat_nick,
-                 and `pi` as the line prefix (the text before the first TAB,
-                 the way the IRC plugin emits nicks): the prefix column shows
-                 the nick `pi` (theme chat_nick color), with WeeChat's nick
-                 brackets and same-nick prefix hiding applied. notify_message
-                 keeps notifications at message level on this private-type
-                 buffer (no per-line highlight).
-        'think' → same rendering as 'pi' but tag notify_none instead:
-                 💭 thinking lines must not notify at all.
+        'pi'   → prnt_date_tags, tags notify_none,prefix_nick_chat_nick, and
+                 `pi` as the line prefix (the text before the first TAB, the
+                 way the IRC plugin emits nicks): the prefix column shows the
+                 nick `pi` (theme chat_nick color), with WeeChat's nick
+                 brackets and same-nick prefix hiding applied. notify_none:
+                 no line-level notification — only the turn-settle `[x]
+                 ready!` banner (notify_highlight) pings the user.
         'user' → prnt_date_tags, tag prefix_nick_chat_nick_self (+ self_msg
                  like the IRC plugin's own echoes), the user's IRC nick as
                  prefix (chat_nick_self color). Empty nick ⇒ legacy
@@ -618,12 +616,11 @@ class Bridge(object):
         """
         # prnt_date_tags stamps the current time, so lines keep real dates
         # for relay clients (the no-leading-tab rule of _print is untouched).
-        if role in ("pi", "think"):
+        if role == "pi":
             if self.alive and self.buffer:
-                notify = "notify_none" if role == "think" else "notify_message"
                 weechat.prnt_date_tags(
                     self.buffer, int(time.time()),
-                    notify + ",prefix_nick_chat_nick",
+                    "notify_none,prefix_nick_chat_nick",
                     C_NICK + "pi" + R + "\t" + text)
         elif role == "user":
             nick = _user_nick()
@@ -1171,7 +1168,7 @@ class Bridge(object):
                 # turn settled: one extra highlight line below the last
                 # message line (left untouched); date 0 ⇒ now
                 weechat.prnt_date_tags(self.buffer, 0, "notify_highlight",
-                                       C_OK + "[x] ready!" + R)
+                                       C_OK + "✔ ready!" + R)
             return
         if t == "session_info":
             cwd = msg.get("cwd")
@@ -1198,7 +1195,7 @@ class Bridge(object):
         if t == "thinking_line":
             if not self.thinking_enabled():
                 return  # hidden; the line is dropped entirely
-            self._print_msg(C_DIM + "\U0001F4AD " + msg.get("text", "") + R, "think")
+            self._print_msg(C_DIM + "\U0001F4AD " + msg.get("text", "") + R, "pi")
             return
         if t == "assistant_flush":
             return  # lines already complete; nothing to render
