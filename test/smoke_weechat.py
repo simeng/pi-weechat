@@ -41,6 +41,7 @@ class WeechatStub:
         self.buffer_name = None
         self.registered = None
         self.plugin_opts = {}     # config_*_plugin storage
+        self.plugin_descs = {}    # config_set_desc_plugin storage
         self.timers = {}          # handle -> {cb, data, deadline, timeout, remain}
         self.config_hooks = []    # [(pattern, cb, data)]
         self.conf = {"irc.server_default.nicks": "alice,alice2"}  # global opts
@@ -71,6 +72,10 @@ class WeechatStub:
         for pattern, cb, data in list(self.config_hooks):
             if pattern == opt or pattern.endswith(".*"):
                 self.ns[cb](data, opt)
+        return 1
+
+    def config_set_desc_plugin(self, name, description):
+        self.plugin_descs[name] = description
         return 1
 
     def config_get(self, name):
@@ -284,6 +289,12 @@ def main():
     assert stub.plugin_opts.get("tcp_listen") == "", "tcp_listen defaults empty"
     assert stub.plugin_opts.get("token") == "", "token defaults empty"
     assert stub.plugin_opts.get("allowed_ips") == "", "allowed_ips defaults empty"
+    assert stub.plugin_opts.get("tool_output") == "summary", "tool_output defaults summary"
+    # help descriptions registered for every plugin option (/help set …)
+    for name in ("tcp_listen", "token", "allowed_ips",
+                "tool_output", "thinking", "highlight"):
+        assert name in stub.plugin_descs, "missing description for %s" % name
+        assert stub.plugin_descs[name], "empty description for %s" % name
     assert stub.localvars.get("nick") == "alice", \
         "buffer localvar nick = first irc.server_default.nicks entry"
 

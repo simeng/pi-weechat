@@ -387,6 +387,34 @@ DEFAULT_THINKING = "off"
 HIGHLIGHT_MODES = ("on", "off")
 DEFAULT_HIGHLIGHT = "on"
 
+# Config options: (name, default, description). Defaults are applied on
+# first load; descriptions registered via config_set_desc_plugin and shown
+# by /help set pi_bridge.<name>.
+PLUGIN_OPTIONS = (
+    ("tcp_listen", "",
+     'TCP listener address, "host:port" (e.g. "127.0.0.1:52311"; '
+     '"0.0.0.0:port" for LAN/Tailscale). Empty = disabled (Unix socket '
+     'only). Change rebinds live, no reload. Requires pi_bridge.token — '
+     'without one, TCP clients are accepted unauthenticated.'),
+    ("token", "",
+     'Shared secret for client auth: every client (TCP and Unix socket) '
+     'must answer an HMAC-SHA256 challenge proving knowledge of it. '
+     'Empty = anonymous (no auth). Recommended: store the secret with '
+     '/secure set pi_weechat_token <secret>, then set this option to '
+     '"${sec.data.pi_weechat_token}".'),
+    ("allowed_ips", "",
+     'Regex that a TCP client\'s source IP must match (search, not '
+     'fullmatch); empty = allow all. Not applied to the local Unix '
+     'socket. An invalid regex falls back to allow-all.'),
+    ("tool_output", DEFAULT_TOOL_OUTPUT,
+     'Tool result verbosity: full (all output lines) | summary (first 3 + '
+     'last 3 lines, middle elided) | off (hide output).'),
+    ("thinking", DEFAULT_THINKING,
+     'Show pi\'s thinking lines: on | off.'),
+    ("highlight", DEFAULT_HIGHLIGHT,
+     'Syntax-highlight fenced code blocks in pi\'s replies: on | off.'),
+)
+
 HELP_TEXT = (
     "!s <text> steer current turn · !q <text> queue follow-up\n"
     "!new new session · !compact compact context · !abort abort current turn\n"
@@ -1636,18 +1664,15 @@ def main():
     weechat.register("pi_bridge", "simeng", "0.5.0", "MIT",
                      "mirror a pi coding agent session through a WeeChat buffer",
                      "pi_shutdown_cb", "")
-    # plugin options (auto-created on first run; /set pi_bridge.<name> …).
+    # plugin options: PLUGIN_OPTIONS = (name, default, description).
+    # Defaults are auto-created on first run (/set pi_bridge.<name> …).
     # WeeChat options only — no env-var fallback on this side; ${sec.data.x}
-    # references are expanded by WeeChat at read time.
-    for name in ("tcp_listen", "token", "allowed_ips"):
+    # references are expanded by WeeChat at read time. Descriptions feed
+    # /help set pi_bridge.<name> (config_set_desc_plugin, spotify.py pattern).
+    for name, default, description in PLUGIN_OPTIONS:
         if not weechat.config_is_set_plugin(name):
-            weechat.config_set_plugin(name, "")
-    if not weechat.config_is_set_plugin("tool_output"):
-        weechat.config_set_plugin("tool_output", DEFAULT_TOOL_OUTPUT)
-    if not weechat.config_is_set_plugin("thinking"):
-        weechat.config_set_plugin("thinking", DEFAULT_THINKING)
-    if not weechat.config_is_set_plugin("highlight"):
-        weechat.config_set_plugin("highlight", DEFAULT_HIGHLIGHT)
+            weechat.config_set_plugin(name, default)
+        weechat.config_set_desc_plugin(name, description)
     BRIDGE.make_buffer()
     try:
         BRIDGE.make_unix_server()
