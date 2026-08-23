@@ -4,8 +4,9 @@
 Runs the real script against a stub `weechat` module and drives it with real
 (in-process) socket clients playing the role of the pi extension — both the
 Unix listener and the opt-in TCP listener. Verifies: handshake gating,
-shared-secret challenge auth (protocol 2), output rendering into the buffer,
-title updates, user input on the wire, and the abuse-resistance measures
+shared-secret challenge auth (protocol 2), output rendering into the buffer
+(incl. markdown fenced-code syntax highlighting), title updates, user input
+on the wire, and the abuse-resistance measures
 (auth deadline, pending cap, IP lockout, allowed_ips, read cap, rate limit).
 
 Run: python3 test/smoke_weechat.py   (no dependencies beyond stdlib)
@@ -49,7 +50,10 @@ class WeechatStub:
         # ([color] section of weechat.conf) are undefined in the test env,
         # so the bridge's palette fallbacks are exercised end-to-end.
         return {"white": "W", "magenta": "M", "cyan": "C", "blue": "B",
-                "yellow": "E", "green": "G", "red": "r", "236": "D"}.get(name, "")
+                "yellow": "E", "green": "G", "red": "r", "236": "D",
+                # syntax-highlight palette (HL_TOKENS) + reset marker
+                "reset": "0", "bold magenta": "K", "darkgray": "d",
+                "lightblue": "L", "lightgreen": "g"}.get(name, "")
 
     def config_is_set_plugin(self, name):
         return name in self.plugin_opts
@@ -376,8 +380,10 @@ def main():
 
     # echo of typed lines appears in the buffer
     echo_text = buffer_text(stub)
-    assert "> hello from weechat" in echo_text
-    assert "> !s do this instead" in echo_text
+    # the reset marker ("0" in the stub) sits between the prompt and the
+    # echoed text — a dropped reset would leak the white color into the line
+    assert "> 0hello from weechat" in echo_text
+    assert "> 0!s do this instead" in echo_text
 
     # ping → pong
     send({"type": "ping", "ts": 123})
@@ -461,6 +467,119 @@ def main():
     # line's date field (relay would render 01.01.1970)
     assert not any(t.startswith("\t") for k, t in stub.prints), \
         "lines must be printed without leading tabs so they keep real dates"
+
+    # ==================================================================
+    # Phase B2 — markdown fenced code blocks: syntax highlighting
+    # ==================================================================
+
+    # color chars from the stub palette (see WeechatStub.color); C_DIM falls
+    # back to palette cyan, so fence lines render "C…0" like status lines
+    KW, STR, NUM, COM, FN, VAR, TYP, RS = "K", "G", "C", "d", "L", "E", "g", "0"
+    DIM = "C"
+    hl = ns["highlight_code"]
+
+    # --- unit: bash — comment / string / var / env-assign / number
+    assert hl("ls -la # list files", "bash", {}) == (
+        "ls -la " + COM + "# list files" + RS), "bash comment"
+    assert hl('echo "hi" $HOME 42', "bash", {}) == (
+        "echo " + STR + '"hi"' + RS + " " + VAR + "$HOME" + RS
+        + " " + NUM + "42" + RS), "bash string/var/number"
+    assert hl("FOO=bar ls", "bash", {}) == (
+        VAR + "FOO" + RS + "=bar ls"), "bash env-assign prefix"
+
+    # --- unit: rust — kw/type/fn/num + block comment across lines
+    assert hl("fn main() { let x: u32 = 5; }", "rust", {}) == (
+        KW + "fn" + RS + " " + FN + "main" + RS + "() { "
+        + KW + "let" + RS + " x: " + TYP + "u32" + RS
+        + " = " + NUM + "5" + RS + "; }"), "rust basics"
+    ctx = {}
+    hl("let a = 1; /* open", "rust", ctx)
+    assert ctx.get("com") is True, "unterminated /* must set comment state"
+    assert hl("still */ let b = 2;", "rust", ctx) == (
+        COM + "still */" + RS + " " + KW + "let" + RS + " b = "
+        + NUM + "2" + RS + ";"), "block comment continues on next line"
+    assert ctx.get("com") is False, "state cleared once the comment closes"
+
+    # --- unit: css — at-rule, property names, hex color, units
+    assert hl("@media (min-width: 600px) { color: #fff; }", "css", {}) == (
+        KW + "@media" + RS + " (" + VAR + "min-width" + RS + ": "
+        + NUM + "600px" + RS + ") { " + VAR + "color" + RS + ": "
+        + NUM + "#fff" + RS + "; }"), "css at-rule/property/hex"
+
+    # --- unit: html — tag, attr, value, comment
+    assert hl('<div class="box">it<!-- c --></div>', "html", {}) == (
+        KW + "<div" + RS + " " + VAR + "class" + RS + "="
+        + STR + '"box"' + RS + ">it" + COM + "<!-- c -->" + RS
+        + KW + "</div" + RS + ">"), "html"  # tag name colored, bracket plain
+
+    # --- unit: php — open tag, keyword, variable, line comment
+    assert hl('<?php echo $name; // hi', "php", {}) == (
+        KW + "<?php" + RS + " " + KW + "echo" + RS + " "
+        + VAR + "$name" + RS + "; " + COM + "// hi" + RS), "php"
+
+    # --- unit: python — keyword, call, number, comment
+    assert hl("def foo(x=1): return None  # done", "python", {}) == (
+        KW + "def" + RS + " " + FN + "foo" + RS + "(x=" + NUM + "1" + RS
+        + "): " + KW + "return" + RS + " " + KW + "None" + RS + "  "
+        + COM + "# done" + RS), "python"
+
+    # --- unit: json — key vs value; yaml — key vs comment; unknown lang
+    assert hl('{"key": "val", "n": 3}', "json", {}) == (
+        "{" + VAR + '"key"' + RS + ": " + STR + '"val"' + RS + ", "
+        + VAR + '"n"' + RS + ": " + NUM + "3" + RS + "}"), "json key vs value"
+    assert hl("name: bob # the name", "yaml", {}) == (
+        VAR + "name" + RS + ": bob " + COM + "# the name" + RS), "yaml"
+    assert hl("val: ~", "yaml", {}) == (
+        VAR + "val" + RS + ": " + KW + "~" + RS), \
+        "yaml ~ (null) is a keyword, not plain text"
+    assert hl("whatever $x // c", "cobol", {}) == "whatever $x // c", \
+        "unknown language passes through verbatim"
+
+    # --- integration: streamed fence through dispatch (unix client live)
+    for text in ("Here is the command to run:", "```bash",
+                 "ls -la # list everything", "```",
+                 "and one we do not know:", "```cobol", "EQU 1", "```"):
+        send({"type": "assistant_line", "msgId": 42, "text": text})
+    pump_and_drain(client)
+    raw = [t for k, t in stub.prints if k == "PRINT"]
+    assert "Here is the command to run:" + RS in raw, "prose line stays uncolored"
+    assert DIM + "```bash" + RS in raw, "opening fence prints dim"
+    assert raw.count(DIM + "```" + RS) >= 1, "closing fence prints dim"
+    assert ("  ls -la " + COM + "# list everything" + RS) in raw, \
+        "known language: indented + highlighted body"
+    assert "  EQU 1" in raw, "unknown language: indented but plain"
+
+    # a msgId change must reset an open fence (next message is prose again)
+    send({"type": "assistant_line", "msgId": 43, "text": "```rust"})
+    send({"type": "assistant_line", "msgId": 99, "text": "let a = 1;"})
+    pump_and_drain(client)
+    raw = [t for k, t in stub.prints if k == "PRINT"]
+    assert DIM + "```rust" + RS in raw, "fence opened on its own message"
+    assert "let a = 1;" + RS in raw, \
+        "msgId change resets an open fence (line is prose, unindented)"
+
+    # --- the pi_bridge.highlight option gates coloring (structure kept)
+    ns["pi_input_cb"]("", "buffer", "!highlight")
+    pump_and_drain(client, 0.2)
+    assert recv_lines == [], "!highlight must not send anything to pi"
+    assert "code highlighting: on" in buffer_text(stub), \
+        "!highlight reports the default state"
+    ns["pi_input_cb"]("", "buffer", "!highlight off")
+    pump_and_drain(client, 0.2)
+    assert recv_lines == [], "!highlight off must not send anything to pi"
+    assert "code highlighting: off" in buffer_text(stub)
+    n0 = len(stub.prints)
+    for text in ("```bash", "ls # x", "```"):
+        send({"type": "assistant_line", "msgId": 44, "text": text})
+    pump_and_drain(client)
+    fresh = [t for k, t in stub.prints[n0:] if k == "PRINT"]
+    assert fresh[1] == "  ls # x", \
+        "highlight off: body indented but uncolored"
+    assert fresh[2] == DIM + "```" + RS, \
+        "fence tracking stays on while highlighting is off"
+    ns["pi_input_cb"]("", "buffer", "!highlight on")
+    pump_and_drain(client, 0.2)
+    assert buffer_text(stub).count("code highlighting: on") >= 1
 
     # ==================================================================
     # Phase C — user_input rate limit (buffer → pi is the LLM-spend path)

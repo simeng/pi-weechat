@@ -199,10 +199,11 @@ test("integration: real extension ↔ real weechat script", async (t) => {
     "followUp delivered"
   );
 
-  // typed lines echo back into the buffer (strip weechat color tags first)
+  // typed lines echo back into the buffer (strip weechat color tags first);
+  // the stub's reset marker ("0") sits between prompt and echoed text
   const strip = (s) => s.replace(/color:(?:white|default|blue|cyan|red|green|gray|reset)/g, "");
   await wc.waitFor(
-    (m) => m.type === "print" && strip(m.text).includes("> hello from weechat"),
+    (m) => m.type === "print" && strip(m.text).includes("> 0hello from weechat"),
     "buffer: echo"
   );
 
@@ -332,7 +333,7 @@ test("integration: real extension ↔ real weechat script over TCP with token", 
   );
   const strip = (s) => s.replace(/color:(?:white|default|blue|cyan|red|green|gray|reset)/g, "");
   await wc.waitFor(
-    (m) => m.type === "print" && strip(m.text).includes("> hello over tcp"),
+    (m) => m.type === "print" && strip(m.text).includes("> 0hello over tcp"),
     "buffer: echo over tcp"
   );
 

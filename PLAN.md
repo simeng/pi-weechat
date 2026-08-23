@@ -124,6 +124,7 @@ never reach the LLM):
 - `!status`    — force a status refresh (session file, model)
 - `!tools [full|summary|off]` — tool output verbosity in the buffer (`pi_bridge.tool_output`)
 - `!think [on|off]`           — show/hide thinking lines (`pi_bridge.thinking`, default off)
+- `!highlight [on|off]`       — syntax-highlight fenced code blocks (`pi_bridge.highlight`, default on)
 - `!help` / `?`               — print this command list (answered locally, never reaches pi)
 
 ## 3. WeeChat side — `weechat/pi_bridge.py`
@@ -174,13 +175,22 @@ Design:
   `chat_prefix_error`, success `chat_status_enabled`, hints/thinking 💭
   `chat_host`; the tool *output body* is a fixed palette color (`blue`,
   deliberately not theme-following so it stays distinct from the dim
-  thinking lines — see `C_TOOL_OUT` in pi_bridge.py).
+  thinking lines — see `C_TOOL_OUT` in pi_bridge.py); fenced-code tokens
+  (keywords/strings/comments/numbers/…) use a fixed 7-color palette
+  (see `HL_TOKENS`).
 - **Rendering** (one `weechat.prnt(buf, text)` per line). Lines are printed
   WITHOUT a leading `\t\t`: that trick would suppress the timestamp in the
   terminal UI but zero out the stored line date, which relay clients
   (Glowing Bear over the relay websocket) would render as 01.01.1970.
   Real dates give proper HH:MM timestamps everywhere: 
-  - `assistant_line`: print as-is (default color), one buffer line each.
+  - `assistant_line`: prose prints as-is (default color), one buffer line
+    each. Fenced code blocks are tracked per message (`msgId`): fence lines
+    print dim, the body is indented two spaces and syntax-highlighted for
+    known languages (bash/sh, rust, css, html/xml/svg, php, python, json,
+    yaml — `HL_LANGS`/`HL_ALIAS` in pi_bridge.py) by a small line tokenizer
+    (ordered regex alternation; block-comment state carried per fence).
+    Toggled by `pi_bridge.highlight` (`!highlight`, default on); unknown
+    languages render plain but stay indented.
   - `tool_start`: `⚙ tool_name <summary>` where `<summary>` is the main
     content of the args struct, per tool (`format_tool_args()`): bash→
     command, read/write→path (+content), edit→path + edit count,
@@ -312,6 +322,7 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 | `pi_bridge.token` | WeeChat option; recommended value `${sec.data.pi_weechat_token}` (`/secure set pi_weechat_token …`) | empty (no enforcement) |
 | `pi_bridge.allowed_ips` | WeeChat option; regex of peer IPs accepted on the TCP listener (empty = allow all) | empty |
 | `pi_bridge.tool_output` | WeeChat option (`/set pi_bridge.tool_output full\|summary\|off`, or `!tools <mode>` in the buffer) | `summary` |
+| `pi_bridge.highlight` | WeeChat option (`/set pi_bridge.highlight on\|off`, or `!highlight <mode>` in the buffer) — syntax highlighting of fenced code blocks in assistant messages | `on` |
 | `PI_WEECHAT_URL`     | pi extension env: `tcp://host:port` / `unix://<path>` / `host:port` / path | unset ⇒ config-file `url` ⇒ `PI_WEECHAT_SOCK` (deprecated) ⇒ default unix path |
 | `PI_WEECHAT_TOKEN`   | pi extension env: shared secret for the challenge (never in the URL) | unset (anonymous) ⇒ config-file `token` |
 | `pi-weechat.json`    | pi-side config file `<agent dir>/pi-weechat.json` (agent dir = `$PI_CODING_AGENT_DIR`, default `~/.pi/agent`); keys `url` / `token` / `debugLog` mirror the env vars above — **env always wins over the file**; re-read at each `session_start`; broken file ⇒ env/default behavior + red `config_error` line | missing (fine) |

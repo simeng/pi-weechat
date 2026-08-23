@@ -131,6 +131,210 @@ C_REJECT = _color("red")                             # auth failures / security
 C_TOOL_OUT = _color("blue")
 R = _color("reset")
 
+# --------------------------------------------- syntax highlighting (fences)
+
+# Fenced code blocks in assistant markdown are tokenized line by line and
+# colored inline with WeeChat binary color codes. Supported languages live in
+# HL_LANGS (aliases in HL_ALIAS); unknown info strings fall back to plain
+# text — the fence is still tracked so its body stays indented and its
+# closer is found. The tokenizer is deliberately simple (ordered regex
+# alternation, single-line patterns): it colors pi's output, not IDE-grade
+# editing.
+
+# token → fixed palette color. Fixed (not theme-following) on purpose: these
+# roles have no canonical weechat.conf [color] slot, and theme colors would
+# collapse onto the chat/toolbar palette (same rationale as C_TOOL_OUT).
+HL_TOKENS = {
+    "kw":   _color("bold magenta"),  # keywords, @-rules, html tags, <?php …
+    "str":  _color("green"),         # string literals, attribute values
+    "num":  _color("cyan"),          # numbers, hex colors
+    "com":  _color("darkgray"),      # comments
+    "fn":   _color("lightblue"),     # function calls
+    "var":  _color("yellow"),        # $vars, css properties, yaml/json keys, html attrs
+    "type": _color("lightgreen"),    # rust primitive types
+}
+
+# Per-language rules: ordered (token, pattern) pairs. The FIRST alternative
+# matching at a position wins, so comments and strings come before keywords.
+# Patterns are single-line; block comments that may span lines are listed in
+# HL_BLOCK_COMMENTS and their state is carried per fence in a ctx dict.
+HL_LANGS = {
+    "bash": (
+        ("com",  r"(?:(?<=\s)|(?<=[;|&(])|^)#.*$"),
+        ("str",  r'"(?:[^"\\]|\\.)*"?'),
+        ("str",  r"'(?:[^'\\]|\\.)*'?"),
+        ("var",  r"\$(?:\{[^}]*\}|[A-Za-z0-9_*?#@!]+)"),
+        ("kw",   r"\b(?:if|then|else|elif|fi|for|in|do|done|case|esac|function|while|until|select|time)\b"),
+        ("var",  r"^[A-Za-z_]\w*(?==)"),
+        ("num",  r"\b\d+(?:\.\d+)?\b"),
+    ),
+    "rust": (
+        ("com",  r"//.*$"),
+        ("com",  r"/\*(?:.*?\*/|.*$)"),
+        ("str",  r'r#*"(?:[^"\\]|\\.)*"?'),
+        ("str",  r"'(?:\\.|[^'\\])'"),
+        ("kw",   r"\b(?:let|mut|fn|struct|enum|impl|trait|use|mod|pub|match|if|else|for|while|loop|return|const|static|where|move|async|await|dyn|ref|self|Self|super|crate|as|in|break|continue|unsafe|extern|type)\b"),
+        ("type", r"\b(?:i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize|bool|str|f32|f64|char)\b"),
+        ("fn",   r"[A-Za-z_]\w*(?=\s*[(\[!])"),
+        ("num",  r"\b(?:0[xXoObB][0-9a-fA-F_]+|\d[\d_]*(?:\.[\d_]+)?)\b"),
+    ),
+    "css": (
+        ("com",  r"/\*(?:.*?\*/|.*$)"),
+        ("kw",   r"@[\w-]+"),
+        ("str",  r'"[^"\n]*"?|\'[^\'\n]*\'?'),
+        ("num",  r"#[0-9a-fA-F]{3,8}\b"),
+        ("var",  r"[a-zA-Z-]+(?=\s*:(?![:/]))"),
+        ("fn",   r"[a-zA-Z-]+(?=\()"),
+        ("num",  r"\b\d+(?:\.\d+)?(?:px|em|rem|%|vh|vw|vmin|vmax|s|ms|deg|fr|ch)?"),
+    ),
+    "html": (
+        ("com",  r"<!--(?:.*?-->|.*$)"),
+        ("kw",   r"<!\s*(?i:doctype)[^>]*>"),
+        ("kw",   r"</?[a-zA-Z][\w:-]*"),
+        ("var",  r"[a-zA-Z-]+(?=\s*=)"),
+        # double quotes only — single-quote "strings" would eat apostrophes
+        # in the visible text between tags
+        ("str",  r'"[^"\n]*"?'),
+    ),
+    "php": (
+        ("com",  r"//.*$"),
+        ("com",  r"#.*$"),
+        ("com",  r"/\*(?:.*?\*/|.*$)"),
+        ("kw",   r"<\?(?i:php)?|<\?=|\?>"),
+        ("str",  r'"(?:[^"\\]|\\.)*"?'),
+        ("str",  r"'[^'\n]*'?"),
+        ("var",  r"\$\w+"),
+        ("kw",   r"\b(?i:echo|print|function|fn|return|if|else|elseif|endif|for|foreach|while|do|switch|case|break|continue|class|interface|trait|extends|implements|namespace|use|new|as|array|list|public|private|protected|static|const|try|catch|finally|throw|match|global|require|require_once|include|include_once|exit|die|isset|empty|unset|typeof|instanceof|null|true|false|void|int|string|bool|float)\b"),
+        ("fn",   r"[a-zA-Z_]\w*(?=\s*\()"),
+        ("num",  r"\b\d+(?:\.\d+)?\b"),
+    ),
+    "python": (
+        ("com",  r"#.*$"),
+        ("kw",   r"^[ \t]*@[A-Za-z_][\w.]*"),
+        ("str",  r'[rbufRBUF]{0,2}""".*?(?:"""|$)'),
+        ("str",  r"[rbufRBUF]{0,2}'''.*?(?:'''|$)"),
+        ("str",  r"[rbufRBUF]{0,2}'(?:[^'\\]|\\.)*'?"),
+        ("str",  r'[rbufRBUF]{0,2}"(?:[^"\\]|\\.)*"?'),
+        ("kw",   r"\b(?:def|class|if|elif|else|for|while|return|import|from|as|with|try|except|finally|lambda|pass|break|continue|global|nonlocal|yield|async|await|in|is|not|and|or|None|True|False|raise|assert|del)\b"),
+        ("fn",   r"[A-Za-z_]\w*(?=\s*\()"),
+        ("num",  r"\b(?:0[xXoObB][0-9a-fA-F_]+|\d[\d_]*(?:\.[\d_]+)?)[jJ]?\b"),
+    ),
+    "json": (
+        ("var",  r'"(?:[^"\\]|\\.)*"(?=\s*:)'),
+        ("kw",   r"\b(?:true|false|null)\b"),
+        ("num",  r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b"),
+        ("str",  r'"(?:[^"\\]|\\.)*"?'),
+    ),
+    "yaml": (
+        ("com",  r"(?:(?<=\s)|(?<=[-#])|^)#.*$"),
+        ("var",  r"^[ \t]*[^ \t#][^:#]*(?=\s*:)"),
+        ("kw",   r"\b(?:true|false|null|yes|no|on|off)\b|(?:(?<=\s)|^)~(?=\s|$)"),
+        ("str",  r'"[^"\n]*"?|\'[^\'\n]*\'?'),
+        ("num",  r"-?\b\d+(?:\.\d+)?\b"),
+    ),
+}
+
+# fence info word → language (lower-cased before lookup)
+HL_ALIAS = {
+    "bash": "bash", "sh": "bash", "shell": "bash", "zsh": "bash",
+    "rust": "rust", "rs": "rust", "rustc": "rust",
+    "css": "css",
+    "html": "html", "htm": "html", "xml": "html", "svg": "html", "xhtml": "html",
+    "php": "php",
+    "python": "python", "py": "python", "python3": "python",
+    "json": "json",
+    "yaml": "yaml", "yml": "yaml",
+}
+
+# languages whose block comments may span lines: (open, close) delimiters
+HL_BLOCK_COMMENTS = {
+    "rust": ("/*", "*/"),
+    "css":  ("/*", "*/"),
+    "php":  ("/*", "*/"),
+    "html": ("<!--", "-->"),
+}
+
+
+def _hl_compile(langs):
+    """One combined regex per language: ordered named-group alternation."""
+    compiled, groups = {}, {}
+    for name, rules in langs.items():
+        parts, gmap = [], {}
+        for i, (token, pattern) in enumerate(rules):
+            gid = "%s%d" % (token, i)
+            gmap[gid] = token
+            parts.append("(?P<%s>%s)" % (gid, pattern))
+        compiled[name] = re.compile("|".join(parts))
+        groups[name] = gmap
+    return compiled, groups
+
+
+_HL_COMPILED, _HL_GROUPS = _hl_compile(HL_LANGS)
+
+
+def highlight_code(line, lang, ctx):
+    """Tokenize + color one line of fenced code (embedded binary colors).
+
+    `lang` is the fence info word (e.g. "bash"); unknown languages and empty
+    lines pass through unchanged. `ctx` (dict) carries block-comment state
+    across lines within one fence and is mutated in place.
+    """
+    canon = HL_ALIAS.get(lang.lower()) if lang else None
+    if canon is None or not line:
+        return line
+    spec = HL_BLOCK_COMMENTS.get(canon)
+    if ctx.get("com"):
+        close = spec[1]
+        idx = line.find(close)
+        if idx < 0:
+            return HL_TOKENS["com"] + line + R
+        ctx["com"] = False
+        head = HL_TOKENS["com"] + line[:idx + len(close)] + R
+        rest = line[idx + len(close):]
+        return head + (highlight_code(rest, lang, ctx) if rest else "")
+    out = []
+    pos = 0
+    for m in _HL_COMPILED[canon].finditer(line):
+        if m.start() > pos:
+            out.append(line[pos:m.start()])
+        token = _HL_GROUPS[canon][m.lastgroup]
+        if (token == "com" and spec
+                and m.group(0).startswith(spec[0])
+                and spec[1] not in m.group(0)):
+            ctx["com"] = True  # block comment continues on the next line
+        out.append(HL_TOKENS[token] + m.group(0) + R)
+        pos = m.end()
+    if pos < len(line):
+        out.append(line[pos:])
+    return "".join(out)
+
+
+# Markdown fences: ``` or ~~~, 3+ markers (CommonMark allows up to 3 leading
+# spaces; LLMs indent fences deeper inside list items, so be lenient).
+FENCE_OPEN_RE = re.compile(r"^(\s*)(`{3,}|~{3,})(.*)$")
+
+
+def _fence_open(line):
+    """Parse an opening fence line → fence dict (with ctx + close regex), or None."""
+    m = FENCE_OPEN_RE.match(line)
+    if not m:
+        return None
+    marker, rest = m.group(2), m.group(3)
+    if marker[0] == "`" and "`" in rest:
+        return None  # backticks are not allowed in the info string
+    words = rest.split()
+    return {
+        "lang": words[0] if words else "",
+        "ctx": {},
+        "close": re.compile(r"^\s*%s{%d,}\s*$"
+                            % (re.escape(marker[0]), len(marker))),
+    }
+
+
+def _fence_closed(fence, line):
+    return bool(fence["close"].match(line))
+
+
 # Per-tool summary of tool_start args: the "main content" of each tool's
 # argument struct, in display order (see format_tool_args).
 TOOL_ARG_KEYS = {
@@ -166,12 +370,17 @@ DEFAULT_TOOL_OUTPUT = "summary"
 THINKING_MODES = ("on", "off")
 DEFAULT_THINKING = "off"
 
+# Syntax highlighting of fenced code blocks (pi_bridge.highlight option)
+HIGHLIGHT_MODES = ("on", "off")
+DEFAULT_HIGHLIGHT = "on"
+
 HELP_TEXT = (
     "!s <text> steer current turn · !q <text> queue follow-up\n"
     "!new new session · !compact compact context · !abort abort current turn\n"
     "!status refresh session/model info · !model [provider/id] list or set model\n"
     "!tools [full|summary|off] tool output verbosity (default: summary)\n"
     "!think [on|off] show/hide thinking lines (default: off)\n"
+    "!highlight [on|off] syntax-highlight fenced code blocks (default: on)\n"
     "anything else is sent to pi as a normal message"
 )
 
@@ -252,6 +461,9 @@ class Bridge(object):
         # user_input (buffer → pi) rate-limit window
         self.ui_times = []
         self.state = "waiting"        # waiting | idle | thinking | tool:<name>
+        # markdown fence tracking for streamed assistant lines (per message)
+        self._md_msg = None           # msgId of the last assistant_line seen
+        self._md_fence = None         # open fence dict (see _fence_open), or None
 
     # ------------------------------------------------------- connection state
 
@@ -368,6 +580,43 @@ class Bridge(object):
     def thinking_enabled(self):
         """pi_bridge.thinking option: on | off."""
         return self._plugin_option("thinking", THINKING_MODES, DEFAULT_THINKING) == "on"
+
+    def highlight_enabled(self):
+        """pi_bridge.highlight option: on | off."""
+        return self._plugin_option("highlight", HIGHLIGHT_MODES,
+                                   DEFAULT_HIGHLIGHT) == "on"
+
+    # ------------------------------------------------ markdown code blocks
+
+    def _print_assistant(self, text, msg_id):
+        """Print one streamed assistant line (markdown-fence aware).
+
+        Prose prints in the chat color; fenced code blocks are tracked per
+        message (a new msgId resets an open fence). Fence lines print dim,
+        the body is indented two spaces and syntax-highlighted when the
+        language is supported and pi_bridge.highlight is on.
+        """
+        if msg_id != self._md_msg:
+            self._md_msg = msg_id
+            self._md_fence = None
+        if self._md_fence is None:
+            fence = _fence_open(text)
+            if fence is not None:
+                self._md_fence = fence
+                self._print(C_DIM + text + R)
+            else:
+                self._print(C_PI + text + R)
+            return
+        if _fence_closed(self._md_fence, text):
+            self._md_fence = None
+            self._print(C_DIM + text + R)
+            return
+        lang = self._md_fence["lang"]
+        if self.highlight_enabled() and HL_ALIAS.get(lang.lower()):
+            body = highlight_code(text, lang, self._md_fence["ctx"])
+        else:
+            body = text
+        self._print("  " + body)
 
     def _plugin_option(self, name, modes, default):
         if weechat is None:
@@ -702,6 +951,10 @@ class Bridge(object):
             self.pending.remove(conn)
         if self.client is conn:
             self.client = None
+            # a reconnect starts fresh msgIds on the pi side — stale fence
+            # state from the old connection must not leak into new messages
+            self._md_msg = None
+            self._md_fence = None
             self.set_state("waiting")
             self._print(C_DIM + "— pi disconnected —%s" % R)
 
@@ -798,8 +1051,7 @@ class Bridge(object):
                 self._print(C_USER + "> " + R + line)
             return
         if t == "assistant_line":
-            text = msg.get("text", "")
-            self._print(C_PI + text + R)
+            self._print_assistant(msg.get("text", ""), msg.get("msgId"))
             return
         if t == "thinking_line":
             if not self.thinking_enabled():
@@ -903,6 +1155,19 @@ class Bridge(object):
                 self._print(C_STATUS + "thinking: %s%s" % (arg, R))
             else:
                 self._print(C_ERR + "unknown thinking mode: %s (on | off)%s"
+                            % (arg, R))
+            return
+        if line == "!highlight":
+            self._print(C_STATUS + "code highlighting: %s (!highlight on|off)%s" % (
+                "on" if self.highlight_enabled() else "off", R))
+            return
+        if line.startswith("!highlight "):
+            arg = line[11:].strip().lower()
+            if arg in HIGHLIGHT_MODES:
+                self._set_plugin_option("highlight", arg)
+                self._print(C_STATUS + "code highlighting: %s%s" % (arg, R))
+            else:
+                self._print(C_ERR + "unknown highlight mode: %s (on | off)%s"
                             % (arg, R))
             return
         # buffer-local control commands → protocol 'command' messages
@@ -1106,6 +1371,8 @@ def main():
         weechat.config_set_plugin("tool_output", DEFAULT_TOOL_OUTPUT)
     if not weechat.config_is_set_plugin("thinking"):
         weechat.config_set_plugin("thinking", DEFAULT_THINKING)
+    if not weechat.config_is_set_plugin("highlight"):
+        weechat.config_set_plugin("highlight", DEFAULT_HIGHLIGHT)
     BRIDGE.make_buffer()
     try:
         BRIDGE.make_unix_server()

@@ -58,7 +58,11 @@ listens on the socket. In a running WeeChat:
 
 Open the `pi` buffer:
 
-- **Output**: assistant messages stream in as whole lines; tool calls show as
+- **Output**: assistant messages stream in as whole lines — fenced code
+  blocks are syntax-highlighted inline (bash/sh, rust, css, html/xml/svg,
+  php, python, json, yaml; unknown languages render plain but keep their
+  indent), with dim fence markers; toggle via `!highlight` or
+  `/set pi_bridge.highlight off`. Tool calls show as
   `⚙ name` + the main content of the call (bash: command, read/write: path,
   edit: path + edit count, memory tools: target/query/content — long values
   are clipped at 300 chars with a `…(+N)` marker), with indented results
@@ -82,6 +86,8 @@ Open the `pi` buffer:
   - `!think [on|off]` — show/hide the model's thinking lines (rendered dim,
     prefixed with 💭). Off by default; also settable via
     `/set pi_bridge.thinking on`
+  - `!highlight [on|off]` — syntax-highlight fenced code blocks in assistant
+    messages. On by default; also settable via `/set pi_bridge.highlight off`
 - Prompts you type directly in pi's own terminal are echoed into the buffer too,
   so both surfaces stay in sync.
 
