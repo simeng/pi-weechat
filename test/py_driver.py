@@ -7,7 +7,7 @@ event loop, and talks to the node test over stdin/stdout:
   stdin  lines:  {"op":"input","text":...}   simulate user typing in buffer
                  {"op":"set","name":...,"value":...}  set a pi_bridge option
                  {"op":"quit"}               shut down
-  stdout lines:  {"type":"print","text":...} every line rendered in the buffer
+  stdout lines:  {"type":"print","text":...,"tags":...}  every line rendered in the buffer
                  {"type":"title","text":...} buffer title changes
                  {"type":"ready","socket":...}
 """
@@ -35,6 +35,16 @@ def main():
         sys.stdout.flush()
         return 1
     stub.prnt = prnt
+
+    real_pdt = stub.prnt_date_tags
+    def prnt_date_tags(buf, date, tags, message):
+        r = real_pdt(buf, date, tags, message)
+        _, prefix, body = stub.printf_tags[-1]
+        sys.stdout.write(json.dumps({"type": "print", "text": body,
+                                     "tags": tags, "prefix": prefix}) + "\n")
+        sys.stdout.flush()
+        return r
+    stub.prnt_date_tags = prnt_date_tags
 
     real_set = stub.buffer_set
     def buffer_set(b, prop, value):

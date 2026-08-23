@@ -5,7 +5,7 @@ Runs the real script against a stub `weechat` module and drives it with real
 (in-process) socket clients playing the role of the pi extension — both the
 Unix listener and the opt-in TCP listener. Verifies: handshake gating,
 shared-secret challenge auth (protocol 2), output rendering into the buffer
-(incl. markdown fenced-code syntax highlighting), title updates, user input
+(incl. markdown fenced-code highlighting and role-based nick prefixes), title updates, user input
 on the wire, and the abuse-resistance measures
 (auth deadline, pending cap, IP lockout, allowed_ips, read cap, rate limit).
 
@@ -43,6 +43,9 @@ class WeechatStub:
         self.plugin_opts = {}     # config_*_plugin storage
         self.timers = {}          # handle -> {cb, data, deadline, timeout, remain}
         self.config_hooks = []    # [(pattern, cb, data)]
+        self.conf = {"irc.server_default.nicks": "alice,alice2"}  # global opts
+        self.printf_tags = []     # [(tags, prefix, body)] from prnt_date_tags
+        self.localvars = {}       # buffer localvars (localvar_set_*)
 
     # -- colors / plugin options -----------------------------------------
     def color(self, name):
@@ -70,6 +73,28 @@ class WeechatStub:
                 self.ns[cb](data, opt)
         return 1
 
+    def config_get(self, name):
+        # option name → pointer token, "" if the option doesn't exist (the
+        # IRC plugin not loaded) — like real WeeChat, config_string takes
+        # this pointer, not the name
+        return ("ptr:" + name) if name in self.conf else ""
+
+    def config_string(self, opt):
+        # takes the pointer returned by config_get; anything else ⇒ ""
+        if isinstance(opt, str) and opt.startswith("ptr:"):
+            return self.conf.get(opt[4:], "")
+        return ""
+
+    def set_config(self, name, value):
+        """Set a GLOBAL (non-plugin) option and fire hook_config callbacks
+        registered for exactly that option (config_set_plugin only fires
+        plugin-option patterns)."""
+        self.conf[name] = value
+        for pattern, cb, data in list(self.config_hooks):
+            if pattern == name:
+                self.ns[cb](data, name)
+        return 1
+
     def register(self, name, author, version, license, desc, shutdown_function, charset):
         self.registered = name
         return True
@@ -84,6 +109,10 @@ class WeechatStub:
         if prop == "title":
             self.title = value
             self.prints.append(("TITLE", value))
+        elif prop.startswith("localvar_set_"):
+            self.localvars[prop[len("localvar_set_"):]] = value
+        elif prop.startswith("localvar_unset_"):
+            self.localvars.pop(prop[len("localvar_unset_"):], None)
         return 1
 
     def buffer_get_string(self, buf, prop):
@@ -91,6 +120,17 @@ class WeechatStub:
 
     def prnt(self, buf, msg):
         self.prints.append(("PRINT", msg))
+        return 1
+
+    def prnt_date_tags(self, buf, date, tags, message):
+        # like the real API: the text before the first TAB is the line
+        # prefix (prefix column); everything after it is the message body
+        if "\t" in message:
+            prefix, body = message.split("\t", 1)
+        else:
+            prefix, body = "", message
+        self.prints.append(("PRINTF", body))
+        self.printf_tags.append((tags, prefix, body))
         return 1
 
     # -- hooks -----------------------------------------------------------
@@ -242,6 +282,8 @@ def main():
     assert stub.plugin_opts.get("tcp_listen") == "", "tcp_listen defaults empty"
     assert stub.plugin_opts.get("token") == "", "token defaults empty"
     assert stub.plugin_opts.get("allowed_ips") == "", "allowed_ips defaults empty"
+    assert stub.localvars.get("nick") == "alice", \
+        "buffer localvar nick = first irc.server_default.nicks entry"
 
     def pump_and_drain(c=None, seconds=0.3):
         stub.pump(seconds)
@@ -312,6 +354,8 @@ def main():
           "args": {"target": "long_term", "content": "remembered fact"}})
     send({"type": "tool_start", "toolCallId": "t5", "toolName": "bash",
           "args": {"command": "echo " + "z" * 400}})
+    send({"type": "user_echo", "text": "typed in pi terminal"})
+    send({"type": "error", "code": "test", "message": "boom"})
     pump_and_drain(client)
 
     text = buffer_text(stub)
@@ -324,6 +368,22 @@ def main():
     assert "…(+105)" in text, \
         "long bash commands must be clipped (405 - 300 = 105 more chars)"
     assert stub.title == "pi: (thinking…)", stub.title
+    # turn settle (busy → idle) ⇒ one extra highlight line below the last
+    # message line (left untouched); idle → idle is not a settle
+    send({"type": "status", "state": "idle"})
+    pump_and_drain(client, 0.2)
+    assert stub.title == "pi: (idle)", stub.title
+    hl = [(tags, p, b) for tags, p, b in stub.printf_tags
+          if "notify_highlight" in tags]
+    assert len(hl) == 1, "settle emits exactly one highlight line"
+    assert hl[0][1] == "", "highlight line has no nick prefix"
+    assert hl[0][2].strip("G0") == "[x] ready!", "highlight line text"
+    n_printf = len(stub.printf_tags)
+    send({"type": "status", "state": "idle"})  # idle → idle: not a settle
+    pump_and_drain(client, 0.2)
+    assert not [1 for tags, _, _ in stub.printf_tags[n_printf:]
+               if "notify_highlight" in tags], \
+        "idle → idle must not re-emit the ready line"
 
     # ------------------------------------------------- arg summary unit test
     fmt = ns["format_tool_args"]
@@ -378,12 +438,18 @@ def main():
     msg = json.loads(recv_lines.pop(0))
     assert msg == {"type": "command", "name": "new_session"}, msg
 
-    # echo of typed lines appears in the buffer
-    echo_text = buffer_text(stub)
-    # the reset marker ("0" in the stub) sits between the prompt and the
-    # echoed text — a dropped reset would leak the white color into the line
-    assert "> 0hello from weechat" in echo_text
-    assert "> 0!s do this instead" in echo_text
+    # echo of typed lines appears in the buffer — under the user's IRC nick
+    # (prnt_date_tags, tag prefix_nick_chat_nick_self, nick before the TAB;
+    # plain text body, no legacy '> ' marker)
+    me_tags = "self_msg,notify_none,no_highlight,prefix_nick_chat_nick_self"
+    me_rows = [(p, b) for tags, p, b in stub.printf_tags if tags == me_tags]
+    me_lines = [b for _, b in me_rows]
+    assert all("alice" in p for p, _ in me_rows), \
+        "user lines carry the user's nick as the line prefix"
+    assert "hello from weechat" in me_lines, "buffer input echo under user nick"
+    assert "!s do this instead" in me_lines, "!s echo under user nick"
+    assert not any(t.startswith("> ") for t in me_lines), \
+        "user-nick lines must not carry the legacy '> ' marker"
 
     # ping → pong
     send({"type": "ping", "ts": 123})
@@ -442,7 +508,7 @@ def main():
     assert "visible thought" in text, "!think on must render thinking lines"
 
     # tool output body and thinking lines must use different colors
-    raw = [t for k, t in stub.prints if k == "PRINT"]
+    raw = [t for k, t in stub.prints if k in ("PRINT", "PRINTF")]
     assert any(t.startswith("C\U0001F4AD ") for t in raw), \
         "thinking lines are flush-left (no indent), dim cyan"
     assert any(t.startswith("B  ") for t in raw), \
@@ -467,6 +533,74 @@ def main():
     # line's date field (relay would render 01.01.1970)
     assert not any(t.startswith("\t") for k, t in stub.prints), \
         "lines must be printed without leading tabs so they keep real dates"
+
+    # ==================================================================
+    # Nick prefixes — role-based rendering (irc.server_default.nicks)
+    # ==================================================================
+
+    RS = "0"  # the stub's reset marker (real WeeChat: color:reset)
+    # the buffer localvar carries the user nick (first config entry);
+    # user lines render in the prefix column under the real nick
+    assert stub.localvars.get("nick") == "alice", \
+        "buffer localvar nick = first irc.server_default.nicks entry"
+
+    # pi-originated lines render under the 'pi' nick (prnt_date_tags,
+    # tag prefix_nick_chat_nick, `pi` before the TAB): assistant prose,
+    # fences, tool lines, tool output body
+    pi_rows = [(p, b) for tags, p, b in stub.printf_tags if tags == "prefix_nick_chat_nick"]
+    assert all("pi" in p for p, _ in pi_rows), \
+        "pi lines carry `pi` as the line prefix"
+    pi_lines = [b for _, b in pi_rows]
+    assert "Hello from pi" + RS in pi_lines, \
+        "assistant prose via prnt_date_tags with the pi prefix"
+    assert any(t.startswith("M⚙ bash") for t in pi_lines), \
+        "tool_start under the pi nick"
+    assert any(t.startswith("G✔") for t in pi_lines), \
+        "tool_end under the pi nick"
+    assert "B  a.txt" + RS in pi_lines, "tool output body under the pi nick"
+    assert any(t.startswith("C\U0001F4AD ") for t in pi_lines), \
+        "thinking lines under the pi nick"
+
+    # user lines (buffer input, !s echo, user_echo) render under the user's
+    # nick — prefix_nick_chat_nick_self, no legacy '> ' marker in the text
+    me_lines = [b for tags, _, b in stub.printf_tags if tags == me_tags]
+    assert "typed in pi terminal" in me_lines, "user_echo under user nick"
+    assert not any(t.startswith("> ") for t in me_lines), \
+        "user-nick lines must not carry the legacy '> ' marker"
+
+    # system lines stay prefix-less: prnt, no nick tags
+    prnt_texts = [t for k, t in stub.prints if k == "PRINT"]
+    assert any("session: /home/x/proj prov/model-a" in t for t in prnt_texts), \
+        "session_info via prnt"
+    assert any("pi bridge: test: boom" in t for t in prnt_texts), \
+        "error line via prnt"
+    assert any("steer current turn" in t for t in prnt_texts), \
+        "!help line via prnt"
+    all_printf = [b for _, _, b in stub.printf_tags]
+    assert not any("session: " in t or "pi bridge:" in t
+                   or "steer current turn" in t for t in all_printf), \
+        "system lines must not carry nick tags"
+
+    # fallback: empty irc.server_default.nicks ⇒ legacy '> ' marker via prnt,
+    # no user-nick printf (and the hook clears the localvar)
+    n0 = len(stub.prints)
+    n1 = len(stub.printf_tags)
+    stub.set_config("irc.server_default.nicks", "")
+    assert "nick" not in stub.localvars, "empty nicks ⇒ localvar cleared"
+    ns["pi_input_cb"]("", "buffer", "nickless line")
+    pump_and_drain(client, 0.3)
+    msg = json.loads(recv_lines.pop(0))
+    assert msg == {"type": "user_input", "text": "nickless line"}, \
+        "the line still reaches pi (only the rendering falls back)"
+    assert any(k == "PRINT" and "> 0nickless line" in t
+               for k, t in stub.prints[n0:]), \
+        "empty nicks ⇒ user line falls back to the '> ' marker via prnt"
+    assert stub.printf_tags[n1:] == [], "no user-nick printf while nick is empty"
+
+    # live update: hook_config re-applies the localvar without a reload
+    stub.set_config("irc.server_default.nicks", "bob")
+    assert stub.localvars.get("nick") == "bob", \
+        "hook_config on irc.server_default.nicks re-applies the nick localvar"
 
     # ==================================================================
     # Phase B2 — markdown fenced code blocks: syntax highlighting
@@ -541,7 +675,7 @@ def main():
                  "and one we do not know:", "```cobol", "EQU 1", "```"):
         send({"type": "assistant_line", "msgId": 42, "text": text})
     pump_and_drain(client)
-    raw = [t for k, t in stub.prints if k == "PRINT"]
+    raw = [t for k, t in stub.prints if k in ("PRINT", "PRINTF")]
     assert "Here is the command to run:" + RS in raw, "prose line stays uncolored"
     assert DIM + "```bash" + RS in raw, "opening fence prints dim"
     assert raw.count(DIM + "```" + RS) >= 1, "closing fence prints dim"
@@ -553,7 +687,7 @@ def main():
     send({"type": "assistant_line", "msgId": 43, "text": "```rust"})
     send({"type": "assistant_line", "msgId": 99, "text": "let a = 1;"})
     pump_and_drain(client)
-    raw = [t for k, t in stub.prints if k == "PRINT"]
+    raw = [t for k, t in stub.prints if k in ("PRINT", "PRINTF")]
     assert DIM + "```rust" + RS in raw, "fence opened on its own message"
     assert "let a = 1;" + RS in raw, \
         "msgId change resets an open fence (line is prose, unindented)"
@@ -572,7 +706,7 @@ def main():
     for text in ("```bash", "ls # x", "```"):
         send({"type": "assistant_line", "msgId": 44, "text": text})
     pump_and_drain(client)
-    fresh = [t for k, t in stub.prints[n0:] if k == "PRINT"]
+    fresh = [t for k, t in stub.prints[n0:] if k in ("PRINT", "PRINTF")]
     assert fresh[1] == "  ls # x", \
         "highlight off: body indented but uncolored"
     assert fresh[2] == DIM + "```" + RS, \
