@@ -275,6 +275,8 @@ def main():
         code = f.read()
     exec(compile(code, SCRIPT, "exec"), ns)
     BRIDGE = ns["BRIDGE"]
+    # expected cwd rendering for title/session assertions (respects ~)
+    proj = ns["_short_path"]("/home/x/proj")
 
     assert stub.buffer_name == "pi", "buffer 'pi' must be created on load"
     assert os.path.exists(sock_path), "socket must be listening"
@@ -359,7 +361,7 @@ def main():
     pump_and_drain(client)
 
     text = buffer_text(stub)
-    assert "session: /home/x/proj prov/model-a" in text, "session line missing"
+    assert "session: %s prov/model-a" % proj in text, "session line missing"
     assert "Hello from pi" in text, "assistant line missing"
     assert "bash" in text and "ls" in text, "tool start missing"
     assert "a.txt" in text and "b.txt" in text, "tool output missing"
@@ -367,12 +369,12 @@ def main():
         "memory_write args must show target + content"
     assert "…(+105)" in text, \
         "long bash commands must be clipped (405 - 300 = 105 more chars)"
-    assert stub.title == "pi: (thinking…)", stub.title
+    assert stub.title == "π: %s (thinking…)" % proj, stub.title
     # turn settle (busy → idle) ⇒ one extra highlight line below the last
     # message line (left untouched); idle → idle is not a settle
     send({"type": "status", "state": "idle"})
     pump_and_drain(client, 0.2)
-    assert stub.title == "pi: (idle)", stub.title
+    assert stub.title == "π: %s (idle)" % proj, stub.title
     hl = [(tags, p, b) for tags, p, b in stub.printf_tags
           if "notify_highlight" in tags]
     assert len(hl) == 1, "settle emits exactly one highlight line"
@@ -416,6 +418,13 @@ def main():
                                else {"white": "W", "cyan": "C"}.get(name, ""))
     assert ns["_theme"]("chat_nick_self", "white") == "T", \
         "theme names must take precedence over palette fallbacks"
+    # _short_path: home prefix → ~, other paths unchanged
+    home = os.path.expanduser("~")
+    sp = ns["_short_path"]
+    if home != "~":
+        assert sp(home) == "~", sp(home)
+        assert sp(home + "/sub") == "~/sub", sp(home + "/sub")
+    assert sp("/elsewhere/x") == "/elsewhere/x", sp("/elsewhere/x")
     assert ns["_theme"]("no_such_name", "white") == "W", \
         "undefined theme names fall back to the palette color"
 
@@ -487,7 +496,7 @@ def main():
     assert "the beta one" in text, "option description must render"
     assert "!pick cancel" in text, "hint line must mention !pick"
     assert BRIDGE.pending_ui is not None and BRIDGE.pending_ui["id"] == 7
-    assert stub.title == "pi: (idle) — awaiting !pick", stub.title
+    assert stub.title == "π: %s (idle) — awaiting !pick" % proj, stub.title
 
     # !pick by number → ui_response with the option text; title hint clears
     ns["pi_input_cb"]("", "buffer", "!pick 2")
@@ -496,7 +505,7 @@ def main():
     assert msg == {"type": "ui_response", "id": 7,
                    "value": "/opt/beta"}, msg
     assert BRIDGE.pending_ui is None
-    assert stub.title == "pi: (idle)", stub.title
+    assert stub.title == "π: %s (idle)" % proj, stub.title
 
     # multi-select: comma list → array value; out-of-range number rejected
     send({"type": "ui_request", "id": 8, "method": "select",
@@ -684,7 +693,7 @@ def main():
 
     # system lines stay prefix-less: prnt, no nick tags
     prnt_texts = [t for k, t in stub.prints if k == "PRINT"]
-    assert any("session: /home/x/proj prov/model-a" in t for t in prnt_texts), \
+    assert any("session: %s prov/model-a" % proj in t for t in prnt_texts), \
         "session_info via prnt"
     assert any("pi bridge: test: boom" in t for t in prnt_texts), \
         "error line via prnt"

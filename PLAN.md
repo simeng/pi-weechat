@@ -231,9 +231,12 @@ Design:
   stored and unhooked on disconnect — stale hooks make WeeChat poll closed fds
   ("Bad file descriptor used in hook_fd") and double-fire when fd numbers are
   reused by the next client.
-  - `status`: update buffer `title` (`pi: (idle)`, `pi: (thinking…)`,
-    `pi: (tool: bash)`, `pi: (disconnected — waiting for pi)`).
-  - `session_info`: one cyan line with cwd + model + session name.
+  - `status`: update buffer `title` (`π: ~/proj (idle)`, `π: ~/proj (thinking…)`,
+    `π: ~/proj (tool: bash)`, `π: ~/proj (disconnected — waiting for pi)`);
+    the session cwd (home prefix shown as `~`) is prepended once
+    `session_info` has reported it.
+  - `session_info`: one cyan line with cwd + model + session name (cwd also
+    stored for the buffer title).
 - **Connection state in the buffer title:** `(idle)`, `(thinking…)`,
   `(tool: X)`, `(disconnected — waiting for pi)`.
 - **Cleanup:** on close callback / WeeChat quit, unhook fd, unlink socket file.
