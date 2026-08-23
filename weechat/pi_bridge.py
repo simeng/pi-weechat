@@ -479,6 +479,23 @@ def _user_nick():
     return ""
 
 
+def _short_path(path):
+    """Abbreviate a home-directory prefix to ~ (buffer title, session line).
+
+    Paths outside $HOME pass through unchanged; a missing or unexpanded
+    HOME (expanduser returning ~ itself) degrades to the raw path.
+    """
+    if not path:
+        return path
+    home = os.path.expanduser("~")
+    if not home or home == "~":
+        return path
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
 class Bridge(object):
     def __init__(self):
         self.buffer = None
@@ -502,6 +519,7 @@ class Bridge(object):
         # user_input (buffer → pi) rate-limit window
         self.ui_times = []
         self.state = "waiting"        # waiting | idle | thinking | tool:<name>
+        self.session_cwd = ""         # last cwd from session_info (buffer title)
         # markdown fence tracking for streamed assistant lines (per message)
         self._md_msg = None           # msgId of the last assistant_line seen
         self._md_fence = None         # open fence dict (see _fence_open), or None
@@ -538,7 +556,7 @@ class Bridge(object):
 
     def make_buffer(self):
         self.buffer = weechat.buffer_new("pi", "pi_input_cb", "", "pi_close_cb", "")
-        weechat.buffer_set(self.buffer, "title", "pi: (waiting for pi)")
+        weechat.buffer_set(self.buffer, "title", "π: (waiting for pi)")
         weechat.buffer_set(self.buffer, "localvar_set_no_log", "1")
         self.apply_user_nick()
         self.alive = True
@@ -614,17 +632,20 @@ class Bridge(object):
 
     def set_state(self, state, detail=None):
         self.state = state
+        prefix = "π:"
+        if self.session_cwd:
+            prefix += " " + _short_path(self.session_cwd)
         titles = {
-            "waiting": "pi: (disconnected — waiting for pi)",
-            "idle": "pi: (idle)",
-            "thinking": "pi: (thinking…)",
+            "waiting": " (disconnected — waiting for pi)",
+            "idle": " (idle)",
+            "thinking": " (thinking…)",
         }
         if state in titles:
-            title = titles[state]
+            title = prefix + titles[state]
             if detail and state == "idle":
                 title += " — " + detail
         elif state.startswith("tool:"):
-            title = "pi: (tool: %s)" % state[5:]
+            title = prefix + " (tool: %s)" % state[5:]
         else:
             title = None  # unknown state: keep current title
         if self.alive and self.buffer and title:
@@ -1144,9 +1165,13 @@ class Bridge(object):
                                        C_OK + "[x] ready!" + R)
             return
         if t == "session_info":
+            cwd = msg.get("cwd")
+            if isinstance(cwd, str) and cwd:
+                self.session_cwd = cwd
+                self.set_state(self.state)  # refresh the title with the path
             bits = []
-            if msg.get("cwd"):
-                bits.append(msg["cwd"])
+            if cwd:
+                bits.append(_short_path(str(cwd)))
             if msg.get("model"):
                 bits.append(msg["model"])
             if msg.get("name"):
