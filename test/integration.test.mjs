@@ -195,6 +195,15 @@ test("integration: real extension ↔ real weechat script", async (t) => {
     "buffer: session line"
   );
 
+  // a prompt typed in pi's terminal (user_echo) marks a request; the 1s tick
+  // (driven by the stub pump) starts the title counter from the current
+  // idle state — real wire, both sides
+  await mock.fire("input", { source: "interactive", text: "typed in pi terminal" });
+  await wc.waitFor(
+    (m) => m.type === "title" && /\(idle \d+s\)/.test(m.text),
+    "title: idle counter after user_echo (tick-driven)"
+  );
+
   // streaming assistant text → whole lines in the buffer
   await mock.fire("message_start", { message: { role: "assistant" } });
   await mock.fire("message_update", {
@@ -202,7 +211,7 @@ test("integration: real extension ↔ real weechat script", async (t) => {
   });
   await mock.fire("message_update", { assistantMessageEvent: { type: "text_end", contentIndex: 0 } });
   await mock.fire("message_end", { message: { role: "assistant" } });
-  await wc.waitFor((m) => m.type === "print" && m.tags === "prefix_nick_chat_nick" && m.prefix.includes("pi") && m.text.includes("line one from pi"), "buffer: line one (pi nick prefix)");
+  await wc.waitFor((m) => m.type === "print" && m.tags === "notify_none,prefix_nick_chat_nick" && m.prefix.includes("pi") && m.text.includes("line one from pi"), "buffer: line one (pi nick prefix)");
   await wc.waitFor((m) => m.type === "print" && m.text.includes("line two"), "buffer: line two (tail flush)");
 
   // tool execution renders
@@ -348,7 +357,7 @@ test("integration: real extension ↔ real weechat script over TCP with token", 
   });
   await mock.fire("message_update", { assistantMessageEvent: { type: "text_end", contentIndex: 0 } });
   await mock.fire("message_end", { message: { role: "assistant" } });
-  await wc.waitFor((m) => m.type === "print" && m.tags === "prefix_nick_chat_nick" && m.prefix.includes("pi") && m.text.includes("tcp line one"), "buffer: tcp line one (pi nick prefix)");
+  await wc.waitFor((m) => m.type === "print" && m.tags === "notify_none,prefix_nick_chat_nick" && m.prefix.includes("pi") && m.text.includes("tcp line one"), "buffer: tcp line one (pi nick prefix)");
   await wc.waitFor((m) => m.type === "print" && m.text.includes("tcp line two"), "buffer: tcp line two");
 
   // tool execution renders
