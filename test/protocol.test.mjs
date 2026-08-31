@@ -170,11 +170,14 @@ async function loadExtension(socketPath) {
     compact(opts) {
       opts?.onComplete?.();
     },
+    // No ask_user here → the bridge registers its built-in fallback tool.
+    getAllTools: () => [],
   };
   const pi = {
     on: (name, fn) => {
       (handlers[name] ??= []).push(fn);
     },
+    registerTool: () => {},
     registerCommand: (name, opts) => {
       commands[name] = opts;
     },

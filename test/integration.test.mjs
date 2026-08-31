@@ -64,6 +64,7 @@ function startWeechatSide(sockPath) {
 function makePiMock() {
   const handlers = {};
   const commands = {};
+  const registeredTools = {};
   const sentUserMessages = [];
   const switchCalls = [];
   // Command context emulating pi's ExtensionCommandContext: /weechat-ctl
@@ -85,9 +86,13 @@ function makePiMock() {
   return {
     sentUserMessages,
     switchCalls,
+    registeredTools,
     api: {
       on: (name, fn) => {
         (handlers[name] ??= []).push(fn);
+      },
+      registerTool: (tool) => {
+        registeredTools[tool.name] = tool;
       },
       registerCommand: (name, opts) => {
         commands[name] = opts;
@@ -119,6 +124,9 @@ const MOCK_CTX = {
   model: { provider: "prov", id: "model-itg" },
   isIdle: () => true,
   abort() {},
+  // No ask_user among the tools → the bridge registers its built-in fallback
+  // (exercises the registerTool path); real pi lists pi-ask-user's tool here.
+  getAllTools: () => [],
 };
 
 // The extension module is a singleton (registered once); all scenarios

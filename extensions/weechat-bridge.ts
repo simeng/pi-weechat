@@ -4,7 +4,11 @@
  * Dials (as client) the WeeChat script (weechat/pi_bridge.py) over a Unix
  * socket or TCP, mirrors assistant text (batched into whole lines), tool
  * calls/results, and status; forwards lines typed in the WeeChat buffer back
- * to pi as user input. Endpoint/token/debug are read from environment
+ * to pi as user input. Decision questions raised by ask_user-style tools are
+ * routed to the WeeChat buffer and answered with !pick (falling back to the pi
+ * terminal when the bridge is down); if no other extension provides an
+ * ask_user tool, a minimal built-in one is registered. Endpoint/token/debug
+ * are read from environment
  * variables (PI_WEECHAT_URL / PI_WEECHAT_TOKEN / PI_BRIDGE_DEBUG) or from the
  * config file <agent dir>/pi-weechat.json (default ~/.pi/agent/) — env vars
  * win when both set. Wire format: NDJSON, protocol 2 (challenge-response auth
@@ -17,6 +21,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Type } from "@sinclair/typebox";
 // @ts-ignore - plain ESM module, no types needed
 import { LineDecoder, PROTOCOL_VERSION, parseEndpoint } from "../lib/codec.mjs";
 // @ts-ignore - plain ESM module, no types needed
@@ -25,9 +30,73 @@ import { loadConfig } from "../lib/pi-config.mjs";
 const MAX_TOOL_OUTPUT = 8192;
 const DEBUG_LOG_MAX_BYTES = 1_000_000; // rotate above this
 
+// Same freeform sentinel pi-ask-user offers in its overlay, so !pick can pick
+// "type custom response" by number and follow up with an input prompt.
+const FREEFORM_SENTINEL = "\u270f\ufe0f Type custom response...";
+
+/** "off"/"0"/"false" disable ask interception; anything else keeps it on. */
+function pickEnabled(env: string | undefined, cfg?: string | boolean): boolean {
+  const v = env ?? (cfg === undefined ? undefined : String(cfg).trim().toLowerCase());
+  return v !== "off" && v !== "0" && v !== "false";
+}
+
+/** Tool names whose question prompts are routed to the buffer (default: ask_user). */
+function pickToolNames(env: string | undefined, cfg?: string | string[]): Set<string> {
+  const raw =
+    env ?? (Array.isArray(cfg) ? cfg.join(",") : typeof cfg === "string" ? cfg : undefined);
+  const names = String(raw ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return new Set(names.length > 0 ? names : ["ask_user"]);
+}
+
+/** Coerce the `options` param of an ask-style tool into {label, description?} entries. */
+function coerceAskOptions(raw: unknown): Array<{ label: string; description?: string }> {
+  if (!Array.isArray(raw)) return [];
+  const out: Array<{ label: string; description?: string }> = [];
+  for (const item of raw) {
+    if (typeof item === "string" && item.trim()) {
+      out.push({ label: item.trim() });
+    } else if (
+      item &&
+      typeof item === "object" &&
+      typeof (item as { title?: unknown }).title === "string" &&
+      ((item as { title: string }).title).trim()
+    ) {
+      const t = item as { title: string; description?: unknown };
+      const description =
+        typeof t.description === "string" && t.description.trim() ? t.description.trim() : undefined;
+      out.push({ label: t.title.trim(), description });
+    }
+  }
+  return out;
+}
+
+/** Question + optional (truncated) context, as the buffer prompt title. */
+function buildAskTitle(question: string, context: unknown): string {
+  const ctxText = typeof context === "string" ? context.trim() : "";
+  if (!ctxText) return question;
+  return `${question}\n\nContext:\n${truncate(ctxText, 800)}`;
+}
+
+/** Quote each choice so the LLM sees unambiguous tool-result text. */
+function formatPickSummary(value: string | string[]): string {
+  const vals = Array.isArray(value) ? value : [value];
+  return vals.map((v) => JSON.stringify(v)).join(", ");
+}
+
 // Values from the pi-side config file (lib/pi-config.mjs). Env vars always
 // win over these; see resolve*() below.
-type BridgeConfig = { url?: string; token?: string; debugLog?: string };
+type BridgeConfig = {
+  url?: string;
+  token?: string;
+  debugLog?: string;
+  /** "off" disables routing decision questions to the buffer (default: on). */
+  pick?: string | boolean;
+  /** Comma list / array of question tool names to route (default: ask_user). */
+  pickTools?: string | string[];
+};
 
 // Opt-in wire debug log. Enabled by PI_BRIDGE_DEBUG=<path>, then the
 // config-file "debugLog" key, then the marker file
@@ -150,14 +219,21 @@ export default function weechatBridge(pi: ExtensionAPI) {
   let lastPongAt = 0;
   let ctxRef: any = null; // latest ExtensionContext (for ctx.abort())
   let busy = false;           // agent_start seen without agent_settled
+  let askPickEnabled = true;              // PI_WEECHAT_PICK=off disables question routing
+  let askToolNames = new Set(["ask_user"]); // PI_WEECHAT_PICK_TOOLS (comma list)
+  let fallbackAskRegistered = false;      // we registered the built-in ask_user
   let pendingOut: string[] = []; // messages emitted before the socket is up
   let helloSent = false;         // our hello went out for the current connection
   let challengeTimer: NodeJS.Timeout | null = null;
 
   // Protocol-3 UI prompt channel: select/input prompts asked of the WeeChat
   // buffer (answered with !pick). Keyed by the ui_request id.
+  type UIAskOutcome =
+    | { kind: "value"; value: string | string[] } // user answered
+    | { kind: "cancelled" } // explicit `!pick cancel`
+    | { kind: "fallback" }; // timeout/disconnect/malformed/abort — caller falls back to local UI
   let uiSeq = 0;
-  const pendingUIs = new Map<number, (v: string | string[] | null) => void>();
+  const pendingUIs = new Map<number, (o: UIAskOutcome) => void>();
 
   // Streaming assembly: assistant text + thinking blocks, keyed by contentIndex.
   let blockBufs = new Map<number, string>();
@@ -184,6 +260,8 @@ export default function weechatBridge(pi: ExtensionAPI) {
     reinitDebugLog(cfg); // picks up a marker file / debugLog seen after load
     endpoint = resolveEndpoint(cfg, (m) => send({ type: "error", code: "config_error", message: m }));
     token = process.env.PI_WEECHAT_TOKEN ?? (cfg.token ?? "");
+    askPickEnabled = pickEnabled(process.env.PI_WEECHAT_PICK, cfg.pick);
+    askToolNames = pickToolNames(process.env.PI_WEECHAT_PICK_TOOLS, cfg.pickTools);
   }
   refreshConfig(); // at load time (session_start refreshes again)
 
@@ -437,18 +515,18 @@ export default function weechatBridge(pi: ExtensionAPI) {
           dbg(`ui_response for unknown/stale id ${id} — ignored`);
           return;
         }
-        let value: string | string[] | null;
+        let outcome: UIAskOutcome;
         if (msg.cancelled === true) {
-          value = null;
+          outcome = { kind: "cancelled" };
         } else if (typeof msg.value === "string") {
-          value = msg.value;
+          outcome = { kind: "value", value: msg.value };
         } else if (Array.isArray(msg.value) && msg.value.every((v) => typeof v === "string")) {
-          value = msg.value as string[];
+          outcome = { kind: "value", value: msg.value as string[] };
         } else {
-          dbg(`ui_response ${id} has a malformed value — treating as cancel`);
-          value = null;
+          dbg(`ui_response ${id} has a malformed value — falling back to local UI`);
+          outcome = { kind: "fallback" };
         }
-        finish(value);
+        finish(outcome);
         // The buffer is no longer waiting on a prompt: clear the "awaiting
         // !pick" title hint (the running state may have changed meanwhile).
         send({ type: "status", state: busy ? "thinking" : "idle" });
@@ -524,6 +602,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
     blockBufs.clear();
     sendSessionInfo(ctx);
     setState("idle");
+    maybeRegisterFallbackAskTool(ctx);
     connect();
   });
 
@@ -807,43 +886,75 @@ export default function weechatBridge(pi: ExtensionAPI) {
    *   - method "select": numbered options — answered with `!pick <n>`
    *     (comma list when multiple, exact option text also accepted)
    *   - method "input":  free-form text — answered with `!pick <text>`
-   * Resolves with the chosen option(s) / entered text, or null when the
-   * user cancels (`!pick cancel`), the optional timeout expires, or the
-   * client disconnects. Throws nothing: a not-connected socket resolves
-   * null immediately so callers can fall back to local UI.
+   * Resolves with a UIAskOutcome:
+   *   - { kind: "value" }     the chosen option(s) / entered text
+   *   - { kind: "cancelled" } the user typed `!pick cancel`
+   *   - { kind: "fallback" }  not connected, optional timeout expired, client
+   *     disconnected, malformed reply, or the abort signal fired — callers
+   *     should fall back to local UI. Throws nothing.
    */
-  function askWeechatUI(
+  function askWeechatUIOutcome(
     req:
-      | { method: "select"; title: string; options: string[]; multiple?: boolean }
+      | {
+          method: "select";
+          title: string;
+          options: Array<string | { label: string; description?: string }>;
+          multiple?: boolean;
+        }
       | { method: "input"; title: string; placeholder?: string },
-    timeoutMs?: number,
-  ): Promise<string | string[] | null> {
-    if (!sock || sock.destroyed) return Promise.resolve(null);
+    opts?: { timeoutMs?: number; signal?: AbortSignal },
+  ): Promise<UIAskOutcome> {
+    if (!sock || sock.destroyed) return Promise.resolve({ kind: "fallback" });
     const id = ++uiSeq;
     return new Promise((resolve) => {
       let done = false;
-      const finish = (v: string | string[] | null): void => {
+      const finish = (o: UIAskOutcome): void => {
         if (done) return;
         done = true;
         pendingUIs.delete(id);
-        resolve(v);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(o);
+      };
+      const signal = opts?.signal;
+      const onAbort = (): void => {
+        dbg(`ui_request ${id} aborted by the agent — falling back`);
+        finish({ kind: "fallback" });
       };
       pendingUIs.set(id, finish);
       send({ type: "ui_request", id, ...req });
-      if (timeoutMs && timeoutMs > 0) {
+      if (signal) {
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }
+      if (opts?.timeoutMs && opts.timeoutMs > 0) {
         const t = setTimeout(() => {
-          dbg(`ui_request ${id} timed out after ${timeoutMs}ms`);
-          finish(null);
-        }, timeoutMs);
+          dbg(`ui_request ${id} timed out after ${opts.timeoutMs}ms`);
+          finish({ kind: "fallback" });
+        }, opts.timeoutMs);
         void t.unref?.();
       }
     });
   }
 
+  /** Promise shape used by !cd and the global handle: value or null. */
+  function askWeechatUI(
+    req:
+      | {
+          method: "select";
+          title: string;
+          options: Array<string | { label: string; description?: string }>;
+          multiple?: boolean;
+        }
+      | { method: "input"; title: string; placeholder?: string },
+    timeoutMs?: number,
+  ): Promise<string | string[] | null> {
+    return askWeechatUIOutcome(req, { timeoutMs }).then((o) => (o.kind === "value" ? o.value : null));
+  }
+
   function clearPendingUIs(reason: string): void {
     if (pendingUIs.size === 0) return;
     dbg(`clearing ${pendingUIs.size} pending ui_request(s): ${reason}`);
-    for (const finish of pendingUIs.values()) finish(null);
+    for (const finish of pendingUIs.values()) finish({ kind: "fallback" });
     pendingUIs.clear();
   }
 
@@ -869,6 +980,227 @@ export default function weechatBridge(pi: ExtensionAPI) {
       input: (title: string, placeholder?: string, opts?: { timeoutMs?: number }) =>
         askWeechatUI({ method: "input", title, placeholder }, opts?.timeoutMs),
     };
+  }
+
+  // ------------------------- decision questions: route to the buffer (!pick)
+  //
+  // ask_user-style tools (pi-ask-user and friends) block inside execute()
+  // waiting for their TUI. We intercept them EARLIER — in the tool_call hook,
+  // before execution starts — so when the bridge is connected the question
+  // is asked of the WeeChat buffer instead, with no modification to the ask
+  // extension itself:
+  //   - answered  → block the call; the LLM receives `reason` as the tool
+  //                 result (a blocked tool_call surfaces it)
+  //   - cancelled → block with a "user cancelled" result
+  //   - fallback  → return undefined; the tool runs its own local UI
+  //                 (terminal user, bridge down, timeout, abort)
+  pi.on("tool_call", async (event: any, ctx: any) => {
+    if (!askPickEnabled) return;
+    const toolName = String(event?.toolName ?? "");
+    if (!askToolNames.has(toolName)) return;
+    const input = (event?.input ?? {}) as Record<string, unknown>;
+    const question = typeof input.question === "string" ? input.question.trim() : "";
+    if (!question) return; // not a question-shaped call — let it run locally
+    if (!weechatUIConnected) return; // no bridge: the tool's own UI handles it
+
+    const options = coerceAskOptions(input.options);
+    const allowMultiple = input.allowMultiple === true;
+    const allowFreeform = input.allowFreeform !== false;
+    const title = buildAskTitle(question, input.context);
+    const timeoutMs =
+      typeof input.timeout === "number" && Number.isFinite(input.timeout) && input.timeout > 0
+        ? input.timeout
+        : undefined;
+
+    let outcome: UIAskOutcome;
+    if (options.length === 0) {
+      outcome = await askWeechatUIOutcome(
+        { method: "input", title, placeholder: "Type your answer..." },
+        { timeoutMs, signal: ctx?.signal },
+      );
+    } else {
+      const selectOptions: Array<string | { label: string; description?: string }> = options.map(
+        (o) => (o.description ? { label: o.label, description: o.description } : o.label),
+      );
+      if (allowFreeform) selectOptions.push(FREEFORM_SENTINEL);
+      outcome = await askWeechatUIOutcome(
+        { method: "select", title, options: selectOptions, multiple: allowMultiple },
+        { timeoutMs, signal: ctx?.signal },
+      );
+      if (outcome.kind === "value") {
+        const picked = Array.isArray(outcome.value) ? outcome.value : [outcome.value];
+        if (picked.length === 1 && picked[0] === FREEFORM_SENTINEL) {
+          // The user chose the freeform option — ask for the text itself.
+          outcome = await askWeechatUIOutcome(
+            { method: "input", title, placeholder: "Type your answer..." },
+            { timeoutMs, signal: ctx?.signal },
+          );
+        }
+      }
+    }
+
+    if (outcome.kind === "fallback") return; // local TUI takes over
+    if (outcome.kind === "cancelled") {
+      send({ type: "assistant_line", msgId: 0, text: "(question cancelled)" });
+      return {
+        block: true,
+        reason:
+          "User cancelled the question via WeeChat (!pick cancel). No answer was given — do not assume one.",
+      };
+    }
+    const summary = formatPickSummary(outcome.value);
+    send({ type: "assistant_line", msgId: 0, text: `(question answered: ${summary})` });
+    return { block: true, reason: `User answered: ${summary} (via WeeChat !pick)` };
+  });
+
+  // ------------------- built-in ask_user fallback (when nothing else provides one)
+
+  const ASK_TOOL_NAME = "ask_user";
+
+  /**
+   * When no other extension provides an ask_user tool (e.g. pi-ask-user is
+   * not installed), register a minimal built-in one so decision questions
+   * are still asked structurally — and answered from WeeChat with !pick via
+   * the tool_call hook above (which intercepts before execute() runs). The
+   * local path below only runs when the bridge is down; it mirrors
+   * pi-ask-user's dialog fallback: select for single choice, comma-list
+   * input for multi-select, plain input when there are no options.
+   */
+  function maybeRegisterFallbackAskTool(ctx: any): void {
+    if (fallbackAskRegistered) return;
+    try {
+      const tools: Array<{ name?: unknown }> = ctx?.getAllTools?.() ?? [];
+      if (tools.some((t) => t?.name === ASK_TOOL_NAME)) {
+        dbg("ask_user already provided by another extension — skipping the built-in fallback");
+        return;
+      }
+    } catch (err) {
+      dbg(`getAllTools failed (${String((err as Error)?.message ?? err)}) — registering the fallback ask tool`);
+    }
+    fallbackAskRegistered = true;
+    dbg("no ask_user tool found — registering the built-in fallback (WeeChat !pick or local TUI)");
+    pi.registerTool({
+      name: ASK_TOOL_NAME,
+      label: "Ask User",
+      description:
+        "Ask the user a question with optional multiple-choice answers. Use this to gather information interactively. Ask exactly one focused question per call. When the WeeChat bridge is connected the question appears in the WeeChat buffer and is answered there (!pick); otherwise it appears in the pi terminal.",
+      promptSnippet:
+        "Ask the user one focused question with optional multiple-choice answers to gather information interactively",
+      promptGuidelines: [
+        "Before calling ask_user, gather context with tools and pass a short summary via the context field.",
+        "Use ask_user when the user's intent is ambiguous, when a decision requires explicit user input, or when multiple valid options exist.",
+        "Ask exactly one focused question per ask_user call.",
+        "Do not combine multiple numbered, multipart, or unrelated questions into one ask_user prompt.",
+      ],
+      executionMode: "sequential",
+      parameters: Type.Object({
+        question: Type.String({ description: "The question to ask the user" }),
+        context: Type.Optional(
+          Type.String({
+            description: "Relevant context to show before the question (summary of findings)",
+          }),
+        ),
+        options: Type.Optional(
+          Type.Array(
+            Type.Object({
+              title: Type.String({ description: "Short title for this option" }),
+              description: Type.Optional(
+                Type.String({ description: "Longer description explaining this option" }),
+              ),
+            }),
+            { description: "List of options for the user to choose from" },
+          ),
+        ),
+        allowMultiple: Type.Optional(
+          Type.Boolean({ description: "Allow selecting multiple options. Default: false" }),
+        ),
+        allowFreeform: Type.Optional(
+          Type.Boolean({ description: "Add a freeform text option. Default: true" }),
+        ),
+        timeout: Type.Optional(
+          Type.Number({
+            description: "Auto-dismiss after N milliseconds. Returns null (cancelled) when expired.",
+          }),
+        ),
+      }),
+      async execute(_toolCallId, params, signal, _onUpdate, ectx: any) {
+        // WeeChat answering happens in the tool_call hook BEFORE execution
+        // reaches here; this local path runs when the bridge is disconnected
+        // (or routing disabled via PI_WEECHAT_PICK=off).
+        const p = params as {
+          question?: string;
+          context?: string;
+          options?: unknown;
+          allowMultiple?: boolean;
+          allowFreeform?: boolean;
+          timeout?: number;
+        };
+        const question = String(p?.question ?? "").trim();
+        const options = coerceAskOptions(p?.options);
+        const allowMultiple = p?.allowMultiple === true;
+        const allowFreeform = p?.allowFreeform !== false;
+        const contextText = typeof p?.context === "string" ? p.context.trim() : "";
+        const prompt = contextText ? `${question}\n\nContext:\n${contextText}` : question;
+        const dialogOpts =
+          typeof p?.timeout === "number" && p.timeout > 0 ? { timeout: p.timeout } : undefined;
+
+        if (signal?.aborted) {
+          return { content: [{ type: "text", text: "Cancelled" }], details: {} };
+        }
+
+        if (!ectx?.hasUI || !ectx.ui) {
+          const optionText =
+            options.length > 0
+              ? `\n\nOptions:\n${options.map((o, i) => `${i + 1}. ${o.label}`).join("\n")}`
+              : "";
+          return {
+            content: [
+              { type: "text", text: `Ask requires interactive mode. Please answer:\n\n${prompt}${optionText}` },
+            ],
+            isError: true,
+            details: {},
+          };
+        }
+
+        let answer: string | undefined;
+        if (options.length === 0) {
+          answer = await ectx.ui.input(prompt, "Type your answer...", dialogOpts);
+        } else if (allowMultiple) {
+          // ui.select is single-choice only: mirror pi-ask-user's comma-list input
+          const optionList = options.map((o, i) => `${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ""}`).join("\n");
+          answer = await ectx.ui.input(
+            `${prompt}\n\nOptions (select one or more):\n${optionList}`,
+            "Type your selection(s)...",
+            dialogOpts,
+          );
+          if (answer) {
+            const names = answer.split(",").map((s) => s.trim()).filter(Boolean);
+            const labels = names.map((n) => {
+              const idx = parseInt(n, 10);
+              if (Number.isInteger(idx) && options[idx - 1]) return options[idx - 1].label;
+              const byTitle = options.find((o) => o.label === n);
+              return byTitle ? byTitle.label : n;
+            });
+            answer = labels.length > 0 ? labels.join(", ") : undefined;
+          }
+        } else {
+          const selectOptions = options.map((o) => o.label);
+          if (allowFreeform) selectOptions.push(FREEFORM_SENTINEL);
+          const selected = await ectx.ui.select(prompt, selectOptions, dialogOpts);
+          if (selected === FREEFORM_SENTINEL) {
+            answer = await ectx.ui.input(prompt, "Type your answer...", dialogOpts);
+          } else {
+            answer = selected;
+          }
+        }
+
+        const trimmed = typeof answer === "string" ? answer.trim() : "";
+        if (!trimmed) {
+          return { content: [{ type: "text", text: "User cancelled the question" }], details: {} };
+        }
+        return { content: [{ type: "text", text: `User answered: ${trimmed}` }], details: {} };
+      },
+    });
   }
 
   // ------------------------------------------------------------- !cd

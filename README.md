@@ -33,9 +33,13 @@ test/                          node:test suite + python smoke + cross-language i
 ### 1. pi extension (pi package)
 
 ```sh
-pi install /path/to/pi-weechat      # or: git clone … && pi install <dir>
+git clone … && cd pi-weechat && npm install   # fetches @sinclair/typebox (peer dep)
+pi install /path/to/pi-weechat
 ```
 
+Local packages are used in place (no copy, no `npm install` by pi itself), so
+run `npm install` once after cloning/checkout — the extension imports
+`@sinclair/typebox`, which is resolved from this directory's `node_modules`.
 This loads `extensions/weechat-bridge.ts` into every pi session. It stays dormant
 until a WeeChat bridge socket exists; when one appears it connects automatically
 (retries with backoff until then, and reconnects if the connection drops).
@@ -81,7 +85,7 @@ Open the `pi` buffer:
   - `!status` — resend session info (works even mid-turn)
   - `!model` — list available models (scoped models if model scoping is configured, otherwise the full catalogue — same as pi's `/model`); `!model <provider/model>` switches model
   - `!cd <path>` — switch pi to a different project directory (new session in that cwd). An exact existing dir switches immediately; anything else is fuzzy-searched and shown as a numbered list in the buffer — always including a “➕ create <path> as new project” option
-  - `!pick …` — answer the numbered list / prompt that pi shows after `!cd` (or any future interactive prompt): `!pick <n>` (or `!pick 1,3` for multiple), or the exact option text; `!pick cancel` aborts
+  - `!pick …` — answer a numbered list / prompt in the buffer: the `!cd` fuzzy match, decision questions from ask_user-style tools (below), or any other interactive prompt: `!pick <n>` (or `!pick 1,3` for multiple), or the exact option text; `!pick cancel` aborts
   - `!tools [full|summary|off]` — tool output verbosity in the buffer
     (`summary` is the default: first/last 3 lines, middle elided like a smart
     filter; also settable via `/set pi_bridge.tool_output …`)
@@ -114,6 +118,32 @@ file is fine. A *broken* file (invalid JSON, wrong types) never breaks the
 bridge — it degrades to env/default behavior, notes the problem in the debug
 log, and prints a red `config_error` line in the buffer. The file is re-read
 on every `/reload`, so edits apply without restarting pi.
+
+### Decision questions (ask_user → !pick)
+
+While pi is connected, decision questions raised by **ask_user-style tools**
+(pi-ask-user and friends) are asked in the buffer instead of the pi terminal:
+the question and context appear as a `?` prompt with numbered options (plus a
+“✏️ Type custom response…” option when freeform answers are allowed), answered
+with `!pick`. The choice is returned to the LLM as the tool's result — no
+modification to the ask extension itself: pi-weechat intercepts the call in
+pi's `tool_call` hook *before* execution and blocks it with your selection.
+
+- **No ask extension installed?** If nothing else provides an `ask_user`
+tool, pi-weechat registers a minimal built-in one (same parameter shape,
+single/multi-select + freeform), so decision questions are still structured
+and answerable from the buffer. When another provider is present the fallback
+is never registered. The local path of the fallback mirrors pi-ask-user's
+dialog fallback, so it also works in the pi terminal when the bridge is down.
+- **Graceful degradation**: if the bridge disconnects mid-question, or the
+tool's own timeout expires, or the run is aborted, the question falls back to
+the tool's normal terminal UI; `!pick cancel` gives the LLM an explicit
+“user cancelled” result instead.
+- **Opt-out / tuning** (env vars win over the config file):
+  - `$PI_WEECHAT_PICK=off` or `"pick": "off"` — never intercept; questions
+    always use the tools' own terminal UI.
+  - `$PI_WEECHAT_PICK_TOOLS=a,b` or `"pickTools": ["ask_user_question"]` —
+    which question tool names to route (default: `ask_user`).
 
 ### Endpoint (where pi dials)
 
