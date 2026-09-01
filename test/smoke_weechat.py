@@ -380,23 +380,77 @@ def main():
         "memory_write args must show target + content"
     assert "…(+105)" in text, \
         "long bash commands must be clipped (405 - 300 = 105 more chars)"
-    assert stub.title == "π: %s (thinking…)" % proj, stub.title
+    assert re.match(r"^π: %s \(thinking… \d+s\)$" % re.escape(proj), stub.title), stub.title
     # turn settle (busy → idle) ⇒ one extra highlight line below the last
     # message line (left untouched); idle → idle is not a settle
     send({"type": "status", "state": "idle"})
     pump_and_drain(client, 0.2)
-    assert stub.title == "π: %s (idle)" % proj, stub.title
+    assert re.match(r"^π: %s \(idle \d+s\)$" % re.escape(proj), stub.title), stub.title
     hl = [(tags, p, b) for tags, p, b in stub.printf_tags
           if "notify_highlight" in tags]
     assert len(hl) == 1, "settle emits exactly one highlight line"
     assert hl[0][1] == "", "highlight line has no nick prefix"
-    assert hl[0][2].strip("G0") == "[x] ready!", "highlight line text"
+    assert hl[0][2].strip("G0") == "✔ ready!", "highlight line text"
     n_printf = len(stub.printf_tags)
     send({"type": "status", "state": "idle"})  # idle → idle: not a settle
     pump_and_drain(client, 0.2)
     assert not [1 for tags, _, _ in stub.printf_tags[n_printf:]
                if "notify_highlight" in tags], \
         "idle → idle must not re-emit the ready line"
+
+    # ==================================================================
+    # Phase B3 — buffer-title turn counter (live while busy, frozen on settle)
+    # ==================================================================
+
+    # _fmt_elapsed unit: 0-99s "Ns", 100-3599s "Nm", >=3600s "NhMm"
+    fmt_elapsed = ns["_fmt_elapsed"]
+    assert fmt_elapsed(3) == "3s", fmt_elapsed(3)
+    assert fmt_elapsed(90) == "90s", fmt_elapsed(90)
+    assert fmt_elapsed(99) == "99s", fmt_elapsed(99)
+    assert fmt_elapsed(100) == "1m", fmt_elapsed(100)
+    assert fmt_elapsed(300) == "5m", fmt_elapsed(300)
+    assert fmt_elapsed(3599) == "59m", fmt_elapsed(3599)
+    assert fmt_elapsed(3600) == "1h", fmt_elapsed(3600)
+    assert fmt_elapsed(3665) == "1h1m", fmt_elapsed(3665)
+
+    # live counter: with request_at set, the 1s tick refreshes the title in
+    # both the thinking and tool states
+    BRIDGE.request_at = time.time() - 90
+    BRIDGE.state = "thinking"
+    ns["pi_tick_cb"]("", 0)
+    m = re.search(r"\(thinking… (\d+)s\)", stub.title)
+    assert m and 90 <= int(m.group(1)) <= 91, stub.title
+    BRIDGE.state = "tool:bash"
+    ns["pi_tick_cb"]("", 0)
+    m = re.search(r"\(tool: bash (\d+)s\)", stub.title)
+    assert m and 90 <= int(m.group(1)) <= 91, stub.title
+
+    # settle via the wire: thinking → idle freezes the counter; it persists
+    # across further ticks (no live clock) and a new request restarts it
+    BRIDGE.request_at = time.time() - 3
+    BRIDGE.state = "thinking"
+    send({"type": "status", "state": "idle"})
+    pump_and_drain(client, 0.2)
+    m = re.search(r"\(idle (\d+)s\)", stub.title)
+    assert m and 3 <= int(m.group(1)) <= 5, stub.title
+    frozen_title = stub.title
+    ns["pi_tick_cb"]("", 0)
+    ns["pi_tick_cb"]("", 0)
+    assert stub.title == frozen_title, "frozen counter must persist across ticks"
+    # a new request restarts the live clock from 0
+    BRIDGE._mark_request()
+    BRIDGE.state = "thinking"
+    ns["pi_tick_cb"]("", 0)
+    assert re.search(r"\(thinking… 0s\)", stub.title), stub.title
+
+    # no request ever → ticks leave the title counter-free
+    BRIDGE.request_at = None
+    BRIDGE.frozen = None
+    BRIDGE.state = "idle"
+    BRIDGE.set_state("idle")
+    assert stub.title == "π: %s (idle)" % proj, stub.title
+    ns["pi_tick_cb"]("", 0)
+    assert stub.title == "π: %s (idle)" % proj, stub.title
 
     # ------------------------------------------------- arg summary unit test
     fmt = ns["format_tool_args"]
@@ -507,7 +561,7 @@ def main():
     assert "the beta one" in text, "option description must render"
     assert "!pick cancel" in text, "hint line must mention !pick"
     assert BRIDGE.pending_ui is not None and BRIDGE.pending_ui["id"] == 7
-    assert stub.title == "π: %s (idle) — awaiting !pick" % proj, stub.title
+    assert re.match(r"^π: %s \(idle \d+s\) — awaiting !pick$" % re.escape(proj), stub.title), stub.title
 
     # !pick by number → ui_response with the option text; title hint clears
     ns["pi_input_cb"]("", "buffer", "!pick 2")
@@ -516,7 +570,7 @@ def main():
     assert msg == {"type": "ui_response", "id": 7,
                    "value": "/opt/beta"}, msg
     assert BRIDGE.pending_ui is None
-    assert stub.title == "π: %s (idle)" % proj, stub.title
+    assert re.match(r"^π: %s \(idle \d+s\)$" % re.escape(proj), stub.title), stub.title
 
     # multi-select: comma list → array value; out-of-range number rejected
     send({"type": "ui_request", "id": 8, "method": "select",
@@ -681,7 +735,7 @@ def main():
     # pi-originated lines render under the 'pi' nick (prnt_date_tags,
     # tag prefix_nick_chat_nick, `pi` before the TAB): assistant prose,
     # fences, tool lines, tool output body
-    pi_rows = [(p, b) for tags, p, b in stub.printf_tags if tags == "prefix_nick_chat_nick"]
+    pi_rows = [(p, b) for tags, p, b in stub.printf_tags if tags == "notify_none,prefix_nick_chat_nick"]
     assert all("pi" in p for p, _ in pi_rows), \
         "pi lines carry `pi` as the line prefix"
     pi_lines = [b for _, b in pi_rows]

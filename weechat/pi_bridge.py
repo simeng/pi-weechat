@@ -524,6 +524,21 @@ def _short_path(path):
         return "~" + path[len(home):]
     return path
 
+def _fmt_elapsed(secs):
+    """Compact elapsed-time label for the buffer-title counter.
+
+    0-99 s -> "Ns" (e.g. "42s"); 100-3599 s -> "Nm" (floor of seconds/60,
+    e.g. "5m"); >= 3600 s -> "NhMm" (e.g. "1h3m", with the minute part
+    dropped when it is 0, e.g. "1h").
+    """
+    s = int(secs)
+    if s < 100:
+        return "%ds" % s
+    if s < 3600:
+        return "%dm" % (s // 60)
+    h, m = s // 3600, (s % 3600) // 60
+    return ("%dh%dm" % (h, m)) if m else ("%dh" % h)
+
 class Bridge(object):
     def __init__(self):
         self.buffer = None
@@ -553,6 +568,15 @@ class Bridge(object):
         self._md_fence = None         # open fence dict (see _fence_open), or None
         # pending interactive prompt from pi (ui_request); answered via !pick
         self.pending_ui = None        # {id, method, options, multiple}, or None
+        # turn-elapsed counter (shown in the buffer title): a live clock
+        # while a request is in flight (request_at), frozen to the last
+        # settled turn's duration on settle (frozen). _last_title skips
+        # redundant buffer_set calls; tick_hook is the 1s refresh timer.
+        self.request_at = None        # float epoch of the active request, or None
+        self.frozen = None            # int seconds, last settled turn duration
+        self._last_title = None       # last title pushed (churn avoidance)
+        self.tick_hook = None         # 1s hook_timer handle (live counter)
+        self._detail = None           # current title detail hint, kept across ticks
 
     # ------------------------------------------------------- connection state
 
@@ -666,24 +690,63 @@ class Bridge(object):
 
     def set_state(self, state, detail=None):
         self.state = state
+        self._detail = detail         # stored so the 1s tick refresh keeps the hint
         prefix = "π:"
         if self.session_cwd:
             prefix += " " + _short_path(self.session_cwd)
-        titles = {
+        counter = self._counter_text()
+        # The counter sits inside the state parens (before any "— detail"),
+        # e.g. "(thinking… 3s)" / "(tool: bash 12s)" / "(idle 42s)". The
+        # waiting title carries no counter (no session to time).
+        base = {
             "waiting": " (disconnected — waiting for pi)",
-            "idle": " (idle)",
-            "thinking": " (thinking…)",
+            "idle": " (idle%s)" % ((" " + counter) if counter else ""),
+            "thinking": " (thinking…%s)" % ((" " + counter) if counter else ""),
         }
-        if state in titles:
-            title = prefix + titles[state]
+        if state in base:
+            title = prefix + base[state]
             if detail and state == "idle":
                 title += " — " + detail
         elif state.startswith("tool:"):
-            title = prefix + " (tool: %s)" % state[5:]
+            title = prefix + " (tool: %s%s)" % (
+                state[5:], (" " + counter) if counter else "")
         else:
             title = None  # unknown state: keep current title
-        if self.alive and self.buffer and title:
+        # Skip the buffer_set when the computed title is unchanged: the 1s
+        # tick fires set_state every second, and a settled (frozen) counter
+        # must not churn the title while its value stands still.
+        if self.alive and self.buffer and title and title != self._last_title:
             weechat.buffer_set(self.buffer, "title", title)
+            self._last_title = title
+
+    def _counter_text(self):
+        """The title counter: live `now - request_at` while a request is in
+        " flight, else the frozen last-settled duration, else "" (no
+        " request ever -> counter-free title).
+        """
+        if self.request_at is not None:
+            return _fmt_elapsed(time.time() - self.request_at)
+        if self.frozen is not None:
+            return _fmt_elapsed(self.frozen)
+        return ""
+
+    def _mark_request(self):
+        """Start (or restart) the active-request clock. A request is anything
+        " that reaches pi as a new prompt: buffer input, the !new/!compact/
+        " !abort/!status/!model/!cd commands, or a prompt typed in pi's
+        " terminal (user_echo). !pick (an answer, not a request) and the
+        " local-only commands do NOT mark.
+        """
+        self.request_at = time.time()
+
+    def tick(self):
+        """1s timer body: refresh the live counter. A no-op (no redraw) once
+        " the request has settled (request_at is None) — the frozen counter is
+        " already shown and re-setting the same title is pure churn.
+        """
+        if self.request_at is None:
+            return
+        self.set_state(self.state, self._detail)
 
     # ---------------------------------------------------------------- options
 
@@ -1111,6 +1174,10 @@ class Bridge(object):
             self._md_fence = None
             # no live peer left to answer a pending prompt
             self.pending_ui = None
+            # no live clock left (a stale request_at would show a bogus live
+            # counter on the next reconnect); the frozen value stays (last
+            # settled turn) until the next settle
+            self.request_at = None
             self.set_state("waiting")
             self._print(C_DIM + "— pi disconnected —%s" % R)
 
@@ -1191,6 +1258,18 @@ class Bridge(object):
             # tool events ⇒ "tool:<name>"). session_start and manual
             # status queries also send "idle" — those are not settles.
             was_busy = self.state == "thinking" or self.state.startswith("tool:")
+            now = time.time()
+            if state == "idle" and was_busy:
+                # settle: freeze the just-finished turn's duration, so the
+                # title keeps showing how long the last request took.
+                if self.request_at is not None:
+                    self.frozen = int(now - self.request_at)
+                self.request_at = None
+            elif state != "idle" and state != "waiting" and self.request_at is None:
+                # idle/waiting -> busy with no active clock (reconnect
+                # mid-turn): the original request time is unknowable, so the
+                # clock starts now.
+                self.request_at = now
             self.set_state(state, msg.get("detail"))
             if state == "idle" and was_busy and self.alive and self.buffer:
                 # turn settled: one extra highlight line below the last
@@ -1216,6 +1295,7 @@ class Bridge(object):
             text = msg.get("text", "")
             for line in str(text).splitlines() or [""]:
                 self._print_msg(line, "user")
+            self._mark_request()  # a prompt typed in pi's terminal
             return
         if t == "assistant_line":
             self._print_assistant(msg.get("text", ""), msg.get("msgId"))
@@ -1397,6 +1477,7 @@ class Bridge(object):
         else:
             self.ui_times.append(now)
             self._send(dict(msg, type="user_input", text=text))
+            self._mark_request()  # a real send reaches pi (not rate-limited)
         self._print_msg(echo, "user")
 
     def on_input(self, line):
@@ -1459,14 +1540,17 @@ class Bridge(object):
         }
         if line in command_map:
             self._send({"type": "command", "name": command_map[line]})
+            self._mark_request()  # !new/!compact/!abort/!status reach pi
             self._print_msg(line, "user")
         elif line == "!model":
             self._send({"type": "command", "name": "model"})
+            self._mark_request()  # !model (list) reaches pi
             self._print_msg(line, "user")
         elif line.startswith("!model "):
             # pi's setModel via the weechat-ctl extension command
             self._send({"type": "command", "name": "model",
                         "arg": line[7:].strip()})
+            self._mark_request()  # !model <id> reaches pi
             self._print_msg(line, "user")
         elif line == "!cd" or (line.startswith("!cd ") and not line[4:].strip()):
             self._print(C_ERR + "usage: !cd <path> — e.g. !cd ~/my-project" + R)
@@ -1475,6 +1559,7 @@ class Bridge(object):
             # switch pi to a project dir; fuzzy matches (and the "create as
             # new project" option) come back as a ? prompt answered with !pick
             self._send({"type": "command", "name": "cd", "arg": line[4:].strip()})
+            self._mark_request()  # !cd <path> reaches pi (answered via !pick)
             self._print_msg(line, "user")
         elif line == "!pick" or line.startswith("!pick "):
             self.handle_pick(line[5:].strip(), line)
@@ -1518,6 +1603,9 @@ class Bridge(object):
         if self.nick_config_hook:
             weechat.unhook(self.nick_config_hook)
             self.nick_config_hook = None
+        if self.tick_hook:
+            weechat.unhook(self.tick_hook)
+            self.tick_hook = None
         try:
             os.unlink(self.sock_path)
         except OSError:
@@ -1610,6 +1698,11 @@ def pi_auth_timeout_cb(data, *args):
     BRIDGE.auth_timeout(int(data))
     return weechat.WEECHAT_RC_OK
 
+def pi_tick_cb(data, *args):
+    """1s timer: refresh the buffer-title turn counter while a request runs."""
+    BRIDGE.tick()
+    return weechat.WEECHAT_RC_OK
+
 
 def pi_config_cb(data, option, *args):
     """Fired on any plugins.var.python.pi_bridge.* option change.
@@ -1661,7 +1754,7 @@ def pi_shutdown_cb():
 
 def main():
     dbg("main(): loading (sock=%s, debug=%s)" % (default_socket_path(), bool(_DBG_PATH)))
-    weechat.register("pi_bridge", "simeng", "0.5.0", "MIT",
+    weechat.register("pi_bridge", "simeng", "0.6.0", "MIT",
                      "mirror a pi coding agent session through a WeeChat buffer",
                      "pi_shutdown_cb", "")
     # plugin options: PLUGIN_OPTIONS = (name, default, description).
@@ -1674,6 +1767,8 @@ def main():
             weechat.config_set_plugin(name, default)
         weechat.config_set_desc_plugin(name, description)
     BRIDGE.make_buffer()
+    # 1s tick timer: refresh the buffer-title turn counter while a request runs
+    BRIDGE.tick_hook = weechat.hook_timer(1000, 0, 0, "pi_tick_cb", "")
     try:
         BRIDGE.make_unix_server()
     except OSError as err:

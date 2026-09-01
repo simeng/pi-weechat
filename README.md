@@ -72,7 +72,19 @@ Open the `pi` buffer:
   are clipped at 300 chars with a `…(+N)` marker), with indented results
   (`✔` ok / `✘` error); the buffer title
   tracks state — `(idle)`, `(thinking…)`, `(tool: bash)` — and shows
-  `(disconnected — waiting for pi)` when pi is not connected.
+  `(disconnected — waiting for pi)` when pi is not connected. A turn-elapsed
+  counter sits inside the state parens — `π: ~/proj (thinking… 3s)`,
+  `(tool: bash 12s)`, `(idle 42s)`. It counts up **live** while a request is
+  in flight and **freezes** on settle, so the settled title keeps showing how
+  long the last request took. Format: `Ns` below 100 s, `Nm` below an hour,
+  `NhMm` beyond (the `Mm` drops when it is 0). A request is anything that
+  reaches pi as a new prompt — a line you type, `!new` / `!compact` /
+  `!abort` / `!status` / `!model` / `!cd`, or a prompt typed in pi's
+  terminal; `!pick` (an answer) and the local-only commands (`!help`,
+  `!tools`, `!think`, `!highlight`) do not restart it. After a mid-turn
+  reconnect the clock starts when the busy state is first seen (the original
+  request time is unknowable), and the frozen value survives `!new` until the
+  next request.
 - **Input**: type a line and press enter to send it as a prompt to pi. Plain
   messages typed while a turn is running are queued as follow-ups (delivered
   when pi settles) instead of being dropped.
