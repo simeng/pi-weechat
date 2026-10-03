@@ -152,6 +152,12 @@ test("integration: ask_user → WeeChat !pick (built-in fallback tool)", async (
   assert.equal(tool.executionMode, "sequential");
   assert.ok(tool.parameters && typeof tool.parameters === "object", "has a parameter schema");
 
+  // Run a live tool prompt so the title also verifies pause accounting and
+  // that accepting !pick clears only the prompt hint, not the tool state.
+  await mock.fire("agent_start");
+  await mock.fire("tool_execution_start", {
+    toolCallId: "q1", toolName: "ask_user", args: { question: "Which color?" },
+  });
   // --- flow 1: single-select options → !pick <n> --------------------------
   const p1 = mock.fire(
     "tool_call",
@@ -176,8 +182,15 @@ test("integration: ask_user → WeeChat !pick (built-in fallback tool)", async (
     "allowFreeform:false → no freeform sentinel offered"
   );
   await wc.waitFor((m) => m.type === "title" && m.text.includes("awaiting !pick"), "title: awaiting !pick");
+  const titleWhilePrompt = wc.lines.filter((m) => m.type === "title").at(-1)?.text ?? "";
+  await mock.fire("ui_prompt_start", { kind: "select", reason: "ui_prompt" });
 
   await sleep(PICK_PAUSE_MS);
+  assert.equal(
+    wc.lines.filter((m) => m.type === "title").at(-1)?.text,
+    titleWhilePrompt,
+    "WeeChat !pick wait must pause the active run clock",
+  );
   wc.send({ op: "input", text: "!pick 2" });
   outs = await p1;
   assert.equal(outs.length, 1, "hook blocked the tool call");
@@ -187,6 +200,67 @@ test("integration: ask_user → WeeChat !pick (built-in fallback tool)", async (
     (m) => m.type === "print" && m.text.includes('(question answered: "Blue")'),
     "buffer: answered note",
   );
+  const titleAfterAnswer = wc.lines.filter((m) => m.type === "title").at(-1)?.text ?? "";
+  const runSeconds = (title) => Number(title.match(/ · run (\d+)s/)?.[1] ?? 0);
+  assert.match(titleAfterAnswer, /\(tool: ask_user · run \d+s\)$/);
+  assert.doesNotMatch(titleAfterAnswer, /awaiting !pick/);
+  await sleep(PICK_PAUSE_MS * 2);
+  const stillPiPaused = wc.lines.filter((m) => m.type === "title").at(-1)?.text ?? "";
+  assert.equal(stillPiPaused, titleAfterAnswer, "!pick must not release the overlapping Pi UI pause");
+  const elapsedBeforeResume = runSeconds(titleAfterAnswer);
+  const linesBeforePiResume = wc.lines.length;
+  await mock.fire("ui_prompt_end", { kind: "select", reason: "ui_prompt" });
+  await wc.waitFor(
+    (m) => m.type === "title" && wc.lines.indexOf(m) >= linesBeforePiResume &&
+      runSeconds(m.text) > elapsedBeforeResume,
+    "title: run timer resumes after overlapping prompts",
+    4000,
+  );
+  const afterPiResume = wc.lines.filter((m) => m.type === "title").at(-1)?.text ?? "";
+  assert.ok(runSeconds(afterPiResume) > elapsedBeforeResume, afterPiResume);
+  await mock.fire("tool_execution_end", {
+    toolCallId: "q1", isError: false, result: { content: [{ type: "text", text: "answered" }] },
+  });
+  await mock.fire("agent_settled");
+
+  // A run that settles (e.g. after abort) while paused stays frozen when a
+  // late prompt-end arrives, and the stale end cannot affect a new run.
+  await mock.fire("agent_start");
+  await mock.fire("ui_prompt_start", { kind: "input", reason: "ui_prompt" });
+  await sleep(PICK_PAUSE_MS * 2);
+  const linesBeforeSettle = wc.lines.length;
+  await mock.fire("agent_settled");
+  await wc.waitFor(
+    (m) => m.type === "title" && wc.lines.indexOf(m) >= linesBeforeSettle &&
+      /\(idle · last run \d+s · 0 turns\)$/.test(m.text),
+    "title: run settled while prompt paused",
+  );
+  const abortedTitle = wc.lines.filter((m) => m.type === "title").at(-1)?.text ?? "";
+  await mock.fire("ui_prompt_end", { kind: "input", reason: "ui_prompt" });
+  await sleep(PICK_PAUSE_MS * 2);
+  assert.equal(
+    wc.lines.filter((m) => m.type === "title").at(-1)?.text,
+    abortedTitle,
+    "late prompt completion must not restart settled clocks",
+  );
+
+  await mock.fire("agent_start");
+  await mock.fire("turn_start", { turnIndex: 0, timestamp: Date.now() });
+  const linesBeforeLateEnd = wc.lines.length;
+  await mock.fire("ui_prompt_end", { kind: "input", reason: "ui_prompt" });
+  await wc.waitFor(
+    (m) => {
+      if (m.type !== "title" || wc.lines.indexOf(m) < linesBeforeLateEnd) return false;
+      const run = runSeconds(m.text);
+      const turn = Number(m.text.match(/ · (\d+)s · turn 1\)$/)?.[1] ?? 0);
+      return run > 0 && turn > 0;
+    },
+    "title: new run continues after stale prompt end",
+    4000,
+  );
+  const afterLateEnd = wc.lines.filter((m) => m.type === "title").at(-1)?.text ?? "";
+  assert.match(afterLateEnd, /\(thinking… · run [1-9]\d*s · [1-9]\d*s · turn 1\)$/);
+  await mock.fire("agent_settled");
 
   // --- flow 2: freeform sentinel → follow-up input prompt -----------------
   wc.lines.length = 0;

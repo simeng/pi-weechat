@@ -21,6 +21,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { performance } from "node:perf_hooks";
 import { Type } from "@sinclair/typebox";
 // @ts-ignore - plain ESM module, no types needed
 import { LineDecoder, PROTOCOL_VERSION, parseEndpoint } from "../lib/codec.mjs";
@@ -219,6 +220,18 @@ export default function weechatBridge(pi: ExtensionAPI) {
   let lastPongAt = 0;
   let ctxRef: any = null; // latest ExtensionContext (for ctx.abort())
   let busy = false;           // agent_start seen without agent_settled
+  let currentState = "idle";
+  let bridgeReady = false;
+  let runActive = false;
+  let runHasStarted = false;
+  let runElapsedMs = 0;
+  let runStartedAt: number | null = null;
+  let turnActive = false;
+  let turnElapsedMs = 0;
+  let turnStartedAt: number | null = null;
+  let turnNumber: number | null = null;
+  let turnCount = 0;
+  const timingPauseReasons = new Set<string>();
   let askPickEnabled = true;              // PI_WEECHAT_PICK=off disables question routing
   let askToolNames = new Set(["ask_user"]); // PI_WEECHAT_PICK_TOOLS (comma list)
   let fallbackAskRegistered = false;      // we registered the built-in ask_user
@@ -283,6 +296,104 @@ export default function weechatBridge(pi: ExtensionAPI) {
     pendingOut = [];
   }
 
+  // Pi owns lifecycle timing; WeeChat receives elapsed snapshots and only
+  // advances them locally for title redraws. Use a monotonic clock so system
+  // clock adjustments cannot make an active run jump backwards or forwards.
+  function elapsedMs(total: number, startedAt: number | null, now: number): number {
+    return total + (startedAt === null ? 0 : Math.max(0, now - startedAt));
+  }
+
+  function sendTimingSnapshot(): void {
+    if (!bridgeReady) return;
+    const now = performance.now();
+    send({
+      type: "timing",
+      runMs: Math.floor(elapsedMs(runElapsedMs, runStartedAt, now)),
+      turnMs: Math.floor(elapsedMs(turnElapsedMs, turnStartedAt, now)),
+      turn: turnNumber,
+      turns: turnCount,
+      runActive,
+      turnActive,
+      runPaused: timingPauseReasons.size > 0,
+      hasRun: runHasStarted,
+    });
+  }
+
+  function resetTiming(): void {
+    runActive = false;
+    runHasStarted = false;
+    runElapsedMs = 0;
+    runStartedAt = null;
+    turnActive = false;
+    turnElapsedMs = 0;
+    turnStartedAt = null;
+    turnNumber = null;
+    turnCount = 0;
+    timingPauseReasons.clear();
+  }
+
+  function startAgentRun(): void {
+    resetTiming();
+    runHasStarted = true;
+    runActive = true;
+    runStartedAt = performance.now();
+  }
+
+  function startModelTurn(index: unknown): void {
+    const turnIndex = Math.max(0, intOf(index));
+    turnActive = true;
+    turnElapsedMs = 0;
+    turnStartedAt = timingPauseReasons.size === 0 ? performance.now() : null;
+    turnNumber = turnIndex + 1;
+    turnCount = Math.max(turnCount, turnNumber);
+    sendTimingSnapshot();
+  }
+
+  function finishModelTurn(index?: unknown): void {
+    if (typeof index === "number" && Number.isFinite(index)) {
+      turnNumber = Math.max(0, Math.trunc(index)) + 1;
+      turnCount = Math.max(turnCount, turnNumber);
+    }
+    if (turnStartedAt !== null) {
+      turnElapsedMs = elapsedMs(turnElapsedMs, turnStartedAt, performance.now());
+    }
+    turnStartedAt = null;
+    turnActive = false;
+    sendTimingSnapshot();
+  }
+
+  function settleAgentRun(): void {
+    if (turnActive) finishModelTurn();
+    if (runStartedAt !== null) {
+      runElapsedMs = elapsedMs(runElapsedMs, runStartedAt, performance.now());
+    }
+    runStartedAt = null;
+    runActive = false;
+    timingPauseReasons.clear();
+    sendTimingSnapshot();
+  }
+
+  function pauseTiming(reason: string): void {
+    if (timingPauseReasons.has(reason)) return;
+    const wasPaused = timingPauseReasons.size > 0;
+    timingPauseReasons.add(reason);
+    if (!runActive || wasPaused) return;
+    const now = performance.now();
+    if (runStartedAt !== null) runElapsedMs = elapsedMs(runElapsedMs, runStartedAt, now);
+    if (turnStartedAt !== null) turnElapsedMs = elapsedMs(turnElapsedMs, turnStartedAt, now);
+    runStartedAt = null;
+    turnStartedAt = null;
+    sendTimingSnapshot();
+  }
+
+  function resumeTiming(reason: string): void {
+    if (!timingPauseReasons.delete(reason) || timingPauseReasons.size > 0 || !runActive) return;
+    const now = performance.now();
+    runStartedAt = now;
+    if (turnActive) turnStartedAt = now;
+    sendTimingSnapshot();
+  }
+
   /**
    * Send the handshake hello, then the pending queue.
    *
@@ -341,6 +452,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
       challengeTimer = null;
     }
     helloSent = false;
+    bridgeReady = false;
     setWeechatUIConnected(false); // other extensions fall back to local UI
     clearPendingUIs("disconnect");
     if (sock) {
@@ -420,6 +532,9 @@ export default function weechatBridge(pi: ExtensionAPI) {
     });
     s.once("close", (hadError) => {
       dbg(`socket closed (hadError=${hadError})`);
+      bridgeReady = false;
+      setWeechatUIConnected(false);
+      clearPendingUIs("disconnect");
       if (!shutdown) scheduleReconnect();
     });
   }
@@ -456,9 +571,12 @@ export default function weechatBridge(pi: ExtensionAPI) {
           disconnect();
           scheduleReconnect();
         } else {
-          // Server hello received ⇒ we are the connected client; make the UI
-          // channel usable for other extensions (see publishWeechatUIGlobal).
+          bridgeReady = true;
           setWeechatUIConnected(true);
+          // A reconnect gets an authoritative current state and timing
+          // snapshot; never infer the offline interval on the WeeChat side.
+          setState(currentState);
+          sendTimingSnapshot();
         }
         return;
       case "error":
@@ -529,7 +647,13 @@ export default function weechatBridge(pi: ExtensionAPI) {
         finish(outcome);
         // The buffer is no longer waiting on a prompt: clear the "awaiting
         // !pick" title hint (the running state may have changed meanwhile).
-        send({ type: "status", state: busy ? "thinking" : "idle" });
+        const nextState =
+          busy && (currentState === "thinking" || currentState.startsWith("tool:"))
+            ? currentState
+            : busy
+              ? "thinking"
+              : "idle";
+        setState(nextState);
         return;
       }
       default:
@@ -546,7 +670,6 @@ export default function weechatBridge(pi: ExtensionAPI) {
         } catch {
           /* no active run */
         }
-        send({ type: "status", state: "idle" });
         return;
       case "new_session":
       case "compact":
@@ -571,6 +694,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
   // --------------------------------------------------------------- status
 
   function setState(state: string): void {
+    currentState = state;
     send({ type: "status", state });
   }
 
@@ -598,10 +722,12 @@ export default function weechatBridge(pi: ExtensionAPI) {
     shutdown = false;
     attempt = 0;
     busy = false;
+    resetTiming();
     ctxRef = ctx;
     blockBufs.clear();
     sendSessionInfo(ctx);
     setState("idle");
+    sendTimingSnapshot();
     maybeRegisterFallbackAskTool(ctx);
     connect();
   });
@@ -613,12 +739,31 @@ export default function weechatBridge(pi: ExtensionAPI) {
   pi.on("agent_start", async (_event, ctx) => {
     ctxRef = ctx;
     busy = true;
+    startAgentRun();
     setState("thinking");
+    sendTimingSnapshot();
+  });
+
+  pi.on("turn_start", (event) => {
+    startModelTurn(event.turnIndex);
+  });
+
+  pi.on("turn_end", (event) => {
+    finishModelTurn(event.turnIndex);
+  });
+
+  (pi as any).on("ui_prompt_start", () => {
+    pauseTiming("pi-ui");
+  });
+
+  (pi as any).on("ui_prompt_end", () => {
+    resumeTiming("pi-ui");
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
     ctxRef = ctx;
     busy = false;
+    settleAgentRun();
     setState("idle");
   });
 
@@ -791,7 +936,8 @@ export default function weechatBridge(pi: ExtensionAPI) {
             return;
           case "status":
             sendSessionInfo(ctx);
-            send({ type: "status", state: ctx.isIdle() ? "idle" : "thinking" });
+            setState(ctx.isIdle() ? "idle" : currentState === "idle" ? "thinking" : currentState);
+            sendTimingSnapshot();
             return;
           case "model": {
             // Mirror the TUI /model behavior: scoped models when scoping is
@@ -913,6 +1059,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
         done = true;
         pendingUIs.delete(id);
         signal?.removeEventListener("abort", onAbort);
+        resumeTiming(`weechat-ui:${id}`);
         resolve(o);
       };
       const signal = opts?.signal;
@@ -921,6 +1068,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
         finish({ kind: "fallback" });
       };
       pendingUIs.set(id, finish);
+      pauseTiming(`weechat-ui:${id}`);
       send({ type: "ui_request", id, ...req });
       if (signal) {
         if (signal.aborted) onAbort();

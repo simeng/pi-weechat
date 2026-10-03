@@ -568,12 +568,10 @@ class Bridge(object):
         self._md_fence = None         # open fence dict (see _fence_open), or None
         # pending interactive prompt from pi (ui_request); answered via !pick
         self.pending_ui = None        # {id, method, options, multiple}, or None
-        # turn-elapsed counter (shown in the buffer title): a live clock
-        # while a request is in flight (request_at), frozen to the last
-        # settled turn's duration on settle (frozen). _last_title skips
-        # redundant buffer_set calls; tick_hook is the 1s refresh timer.
-        self.request_at = None        # float epoch of the active request, or None
-        self.frozen = None            # int seconds, last settled turn duration
+        # Timing comes from the pi extension; WeeChat only advances a received
+        # active snapshot between lifecycle updates for title redraws.
+        self.timing_snapshot = None
+        self.timing_received_at = None
         self._last_title = None       # last title pushed (churn avoidance)
         self.tick_hook = None         # 1s hook_timer handle (live counter)
         self._detail = None           # current title detail hint, kept across ticks
@@ -694,57 +692,54 @@ class Bridge(object):
         prefix = "π:"
         if self.session_cwd:
             prefix += " " + _short_path(self.session_cwd)
-        counter = self._counter_text()
-        # The counter sits inside the state parens (before any "— detail"),
-        # e.g. "(thinking… 3s)" / "(tool: bash 12s)" / "(idle 42s)". The
-        # waiting title carries no counter (no session to time).
+        counter = self._timing_text(state)
         base = {
             "waiting": " (disconnected — waiting for pi)",
-            "idle": " (idle%s)" % ((" " + counter) if counter else ""),
-            "thinking": " (thinking…%s)" % ((" " + counter) if counter else ""),
+            "idle": " (idle%s)" % counter,
+            "thinking": " (thinking…%s)" % counter,
         }
         if state in base:
             title = prefix + base[state]
-            if detail and state == "idle":
-                title += " — " + detail
         elif state.startswith("tool:"):
-            title = prefix + " (tool: %s%s)" % (
-                state[5:], (" " + counter) if counter else "")
+            title = prefix + " (tool: %s%s)" % (state[5:], counter)
         else:
             title = None  # unknown state: keep current title
-        # Skip the buffer_set when the computed title is unchanged: the 1s
-        # tick fires set_state every second, and a settled (frozen) counter
-        # must not churn the title while its value stands still.
+        if title and detail and state != "waiting":
+            title += " — " + detail
+        # Skip redundant title writes; the 1s tick only changes live counters.
         if self.alive and self.buffer and title and title != self._last_title:
             weechat.buffer_set(self.buffer, "title", title)
             self._last_title = title
 
-    def _counter_text(self):
-        """The title counter: live `now - request_at` while a request is in
-        " flight, else the frozen last-settled duration, else "" (no
-        " request ever -> counter-free title).
-        """
-        if self.request_at is not None:
-            return _fmt_elapsed(time.time() - self.request_at)
-        if self.frozen is not None:
-            return _fmt_elapsed(self.frozen)
+    def _timing_text(self, state):
+        snapshot = self.timing_snapshot
+        if not snapshot or not snapshot["hasRun"]:
+            return ""
+        now = time.monotonic()
+        advance = 0
+        if snapshot["runActive"] and not snapshot["runPaused"]:
+            advance = max(0, now - self.timing_received_at) * 1000
+        run_ms = snapshot["runMs"] + advance
+        turn_ms = snapshot["turnMs"]
+        if snapshot["turnActive"] and not snapshot["runPaused"]:
+            turn_ms += advance
+        if snapshot["runActive"]:
+            parts = ["run " + _fmt_elapsed(run_ms / 1000)]
+            if snapshot["turn"] is not None:
+                parts.extend((_fmt_elapsed(turn_ms / 1000),
+                              "turn %d" % snapshot["turn"]))
+            return " · " + " · ".join(parts)
+        if state == "idle":
+            turns = snapshot["turns"]
+            label = "turn" if turns == 1 else "turns"
+            return " · last run %s · %d %s" % (
+                _fmt_elapsed(snapshot["runMs"] / 1000), turns, label)
         return ""
 
-    def _mark_request(self):
-        """Start (or restart) the active-request clock. A request is anything
-        " that reaches pi as a new prompt: buffer input, the !new/!compact/
-        " !abort/!status/!model/!cd commands, or a prompt typed in pi's
-        " terminal (user_echo). !pick (an answer, not a request) and the
-        " local-only commands do NOT mark.
-        """
-        self.request_at = time.time()
-
     def tick(self):
-        """1s timer body: refresh the live counter. A no-op (no redraw) once
-        " the request has settled (request_at is None) — the frozen counter is
-        " already shown and re-setting the same title is pure churn.
-        """
-        if self.request_at is None:
+        """Refresh live elapsed displays; Pi remains authoritative for state."""
+        snapshot = self.timing_snapshot
+        if not snapshot or not snapshot["runActive"] or snapshot["runPaused"]:
             return
         self.set_state(self.state, self._detail)
 
@@ -1174,10 +1169,10 @@ class Bridge(object):
             self._md_fence = None
             # no live peer left to answer a pending prompt
             self.pending_ui = None
-            # no live clock left (a stale request_at would show a bogus live
-            # counter on the next reconnect); the frozen value stays (last
-            # settled turn) until the next settle
-            self.request_at = None
+            # Drop the last timing snapshot while disconnected. The extension
+            # will send a fresh Pi-owned snapshot after the next handshake.
+            self.timing_snapshot = None
+            self.timing_received_at = None
             self.set_state("waiting")
             self._print(C_DIM + "— pi disconnected —%s" % R)
 
@@ -1252,24 +1247,39 @@ class Bridge(object):
         if t == "ping":
             self._send({"type": "pong", "ts": msg.get("ts")})
             return
+        if t == "timing":
+            run_ms = msg.get("runMs")
+            turn_ms = msg.get("turnMs")
+            turn = msg.get("turn")
+            turns = msg.get("turns")
+            run_active = msg.get("runActive")
+            turn_active = msg.get("turnActive")
+            run_paused = msg.get("runPaused")
+            has_run = msg.get("hasRun")
+            numbers = (run_ms, turn_ms, turns)
+            if any(type(v) is not int or v < 0 or v > 2**53 - 1
+                   for v in numbers):
+                return
+            if ((turn is not None and (type(turn) is not int or turn < 1))
+                    or any(type(v) is not bool for v in
+                           (run_active, turn_active, run_paused, has_run))):
+                return
+            self.timing_snapshot = {
+                "runMs": run_ms,
+                "turnMs": turn_ms,
+                "turn": turn,
+                "turns": max(turns, turn or 0),
+                "runActive": run_active,
+                "turnActive": turn_active,
+                "runPaused": run_paused,
+                "hasRun": has_run,
+            }
+            self.timing_received_at = time.monotonic()
+            self.set_state(self.state, self._detail)
+            return
         if t == "status":
             state = msg.get("state", "idle")
-            # busy = a turn is in flight (agent_start ⇒ "thinking",
-            # tool events ⇒ "tool:<name>"). session_start and manual
-            # status queries also send "idle" — those are not settles.
             was_busy = self.state == "thinking" or self.state.startswith("tool:")
-            now = time.time()
-            if state == "idle" and was_busy:
-                # settle: freeze the just-finished turn's duration, so the
-                # title keeps showing how long the last request took.
-                if self.request_at is not None:
-                    self.frozen = int(now - self.request_at)
-                self.request_at = None
-            elif state != "idle" and state != "waiting" and self.request_at is None:
-                # idle/waiting -> busy with no active clock (reconnect
-                # mid-turn): the original request time is unknowable, so the
-                # clock starts now.
-                self.request_at = now
             self.set_state(state, msg.get("detail"))
             if state == "idle" and was_busy and self.alive and self.buffer:
                 # turn settled: one extra highlight line below the last
@@ -1295,7 +1305,6 @@ class Bridge(object):
             text = msg.get("text", "")
             for line in str(text).splitlines() or [""]:
                 self._print_msg(line, "user")
-            self._mark_request()  # a prompt typed in pi's terminal
             return
         if t == "assistant_line":
             self._print_assistant(msg.get("text", ""), msg.get("msgId"))
@@ -1477,7 +1486,6 @@ class Bridge(object):
         else:
             self.ui_times.append(now)
             self._send(dict(msg, type="user_input", text=text))
-            self._mark_request()  # a real send reaches pi (not rate-limited)
         self._print_msg(echo, "user")
 
     def on_input(self, line):
@@ -1540,17 +1548,14 @@ class Bridge(object):
         }
         if line in command_map:
             self._send({"type": "command", "name": command_map[line]})
-            self._mark_request()  # !new/!compact/!abort/!status reach pi
             self._print_msg(line, "user")
         elif line == "!model":
             self._send({"type": "command", "name": "model"})
-            self._mark_request()  # !model (list) reaches pi
             self._print_msg(line, "user")
         elif line.startswith("!model "):
             # pi's setModel via the weechat-ctl extension command
             self._send({"type": "command", "name": "model",
                         "arg": line[7:].strip()})
-            self._mark_request()  # !model <id> reaches pi
             self._print_msg(line, "user")
         elif line == "!cd" or (line.startswith("!cd ") and not line[4:].strip()):
             self._print(C_ERR + "usage: !cd <path> — e.g. !cd ~/my-project" + R)
@@ -1559,7 +1564,6 @@ class Bridge(object):
             # switch pi to a project dir; fuzzy matches (and the "create as
             # new project" option) come back as a ? prompt answered with !pick
             self._send({"type": "command", "name": "cd", "arg": line[4:].strip()})
-            self._mark_request()  # !cd <path> reaches pi (answered via !pick)
             self._print_msg(line, "user")
         elif line == "!pick" or line.startswith("!pick "):
             self.handle_pick(line[5:].strip(), line)

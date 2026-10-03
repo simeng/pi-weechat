@@ -42,7 +42,8 @@ class WeechatStub:
         self.registered = None
         self.plugin_opts = {}     # config_*_plugin storage
         self.plugin_descs = {}    # config_set_desc_plugin storage
-        self.timers = {}          # handle -> {cb, data, deadline, timeout, remain}
+        self.timers = {}          # handle -> {cb, data, deadline, timeout, max_calls}
+        self._timer_seq = 0
         self.config_hooks = []    # [(pattern, cb, data)]
         self.conf = {"irc.server_default.nicks": "alice,alice2"}  # global opts
         self.printf_tags = []     # [(tags, prefix, body)] from prnt_date_tags
@@ -143,13 +144,15 @@ class WeechatStub:
         self.fd_hooks[cb] = [fd, fr, fw, data]
         return "hook:" + cb
 
-    def hook_timer(self, timeout, remain, synchro, cb, data):
-        tid = "timer-%d" % (len(self.timers) + 1)
+    def hook_timer(self, interval, align_second, max_calls, cb, data):
+        self._timer_seq += 1
+        tid = "timer-%d" % self._timer_seq
+        interval_s = max(interval, 1) / 1000.0
         self.timers[tid] = {
             "cb": cb, "data": data,
-            "deadline": time.time() + max(timeout, 1) / 1000.0,
-            "timeout": max(timeout, 1) / 1000.0,
-            "remain": remain,
+            "deadline": time.time() + interval_s,
+            "timeout": interval_s,
+            "max_calls": max_calls,
         }
         return tid
 
@@ -188,9 +191,11 @@ class WeechatStub:
             for tid in list(self.timers):
                 t = self.timers[tid]
                 if now >= t["deadline"]:
-                    if t["remain"] == 1:
+                    if t["max_calls"] == 1:
                         del self.timers[tid]
                     else:
+                        if t["max_calls"] > 1:
+                            t["max_calls"] -= 1
                         t["deadline"] = now + t["timeout"]
                     fired.append((t["cb"], t["data"]))
             for cb, data in fired:
@@ -380,12 +385,12 @@ def main():
         "memory_write args must show target + content"
     assert "…(+105)" in text, \
         "long bash commands must be clipped (405 - 300 = 105 more chars)"
-    assert re.match(r"^π: %s \(thinking… \d+s\)$" % re.escape(proj), stub.title), stub.title
+    assert stub.title == "π: %s (thinking…)" % proj, stub.title
     # turn settle (busy → idle) ⇒ one extra highlight line below the last
     # message line (left untouched); idle → idle is not a settle
     send({"type": "status", "state": "idle"})
     pump_and_drain(client, 0.2)
-    assert re.match(r"^π: %s \(idle \d+s\)$" % re.escape(proj), stub.title), stub.title
+    assert stub.title == "π: %s (idle)" % proj, stub.title
     hl = [(tags, p, b) for tags, p, b in stub.printf_tags
           if "notify_highlight" in tags]
     assert len(hl) == 1, "settle emits exactly one highlight line"
@@ -399,7 +404,7 @@ def main():
         "idle → idle must not re-emit the ready line"
 
     # ==================================================================
-    # Phase B3 — buffer-title turn counter (live while busy, frozen on settle)
+    # Phase B3 — Pi-owned run/turn clocks in the buffer title
     # ==================================================================
 
     # _fmt_elapsed unit: 0-99s "Ns", 100-3599s "Nm", >=3600s "NhMm"
@@ -413,44 +418,62 @@ def main():
     assert fmt_elapsed(3600) == "1h", fmt_elapsed(3600)
     assert fmt_elapsed(3665) == "1h1m", fmt_elapsed(3665)
 
-    # live counter: with request_at set, the 1s tick refreshes the title in
-    # both the thinking and tool states
-    BRIDGE.request_at = time.time() - 90
     BRIDGE.state = "thinking"
+    timing = {
+        "type": "timing", "runMs": 12_000, "turnMs": 42_000,
+        "turn": 10, "turns": 10, "runActive": True, "turnActive": True,
+        "runPaused": False, "hasRun": True,
+    }
+    send(timing)
+    pump_and_drain(client, 0.2)
+    assert stub.title == "π: %s (thinking… · run 12s · 42s · turn 10)" % proj, stub.title
+
+    # The local WeeChat tick advances a received active snapshot, not state
+    # reconstructed from inputs. Turn elapsed includes tool time.
+    BRIDGE.timing_received_at = time.monotonic() - 90
     ns["pi_tick_cb"]("", 0)
-    m = re.search(r"\(thinking… (\d+)s\)", stub.title)
-    assert m and 90 <= int(m.group(1)) <= 91, stub.title
+    assert stub.title == "π: %s (thinking… · run 1m · 2m · turn 10)" % proj, stub.title
     BRIDGE.state = "tool:bash"
     ns["pi_tick_cb"]("", 0)
-    m = re.search(r"\(tool: bash (\d+)s\)", stub.title)
-    assert m and 90 <= int(m.group(1)) <= 91, stub.title
+    assert stub.title == "π: %s (tool: bash · run 1m · 2m · turn 10)" % proj, stub.title
 
-    # settle via the wire: thinking → idle freezes the counter; it persists
-    # across further ticks (no live clock) and a new request restarts it
-    BRIDGE.request_at = time.time() - 3
-    BRIDGE.state = "thinking"
+    # A paused snapshot must not advance during a blocking UI prompt.
+    paused = dict(timing, runMs=15_000, turnMs=9_000, runPaused=True)
+    send(paused)
+    pump_and_drain(client, 0.2)
+    paused_title = stub.title
+    BRIDGE.timing_received_at = time.monotonic() - 90
+    ns["pi_tick_cb"]("", 0)
+    assert stub.title == paused_title
+    assert "run 15s · 9s · turn 10" in stub.title, stub.title
+
+    # A completed model turn freezes while the run clock continues.
+    between_turns = dict(timing, runMs=35_000, turnMs=42_000, turnActive=False)
+    send(between_turns)
+    pump_and_drain(client, 0.2)
+    BRIDGE.timing_received_at = time.monotonic() - 10
+    ns["pi_tick_cb"]("", 0)
+    assert "run 45s · 42s · turn 10" in stub.title, stub.title
+
+    # Settle freezes the final run summary, including Pi's turn count.
+    settled = dict(
+        timing, runMs=1_020_000, turnMs=42_000, runActive=False,
+        turnActive=False, runPaused=False,
+    )
+    send(settled)
+    BRIDGE.state = "idle"  # the settle banner is covered in the previous phase
     send({"type": "status", "state": "idle"})
     pump_and_drain(client, 0.2)
-    m = re.search(r"\(idle (\d+)s\)", stub.title)
-    assert m and 3 <= int(m.group(1)) <= 5, stub.title
+    assert stub.title == "π: %s (idle · last run 17m · 10 turns)" % proj, stub.title
     frozen_title = stub.title
+    BRIDGE.timing_received_at = time.monotonic() - 90
     ns["pi_tick_cb"]("", 0)
-    ns["pi_tick_cb"]("", 0)
-    assert stub.title == frozen_title, "frozen counter must persist across ticks"
-    # a new request restarts the live clock from 0
-    BRIDGE._mark_request()
-    BRIDGE.state = "thinking"
-    ns["pi_tick_cb"]("", 0)
-    assert re.search(r"\(thinking… 0s\)", stub.title), stub.title
+    assert stub.title == frozen_title, "settled timing summary must remain frozen"
 
-    # no request ever → ticks leave the title counter-free
-    BRIDGE.request_at = None
-    BRIDGE.frozen = None
-    BRIDGE.state = "idle"
-    BRIDGE.set_state("idle")
-    assert stub.title == "π: %s (idle)" % proj, stub.title
-    ns["pi_tick_cb"]("", 0)
-    assert stub.title == "π: %s (idle)" % proj, stub.title
+    # Local-only commands do not start or alter a timing clock.
+    ns["pi_input_cb"]("", "buffer", "!help")
+    assert stub.title == frozen_title
+
 
     # ------------------------------------------------- arg summary unit test
     fmt = ns["format_tool_args"]
@@ -561,7 +584,7 @@ def main():
     assert "the beta one" in text, "option description must render"
     assert "!pick cancel" in text, "hint line must mention !pick"
     assert BRIDGE.pending_ui is not None and BRIDGE.pending_ui["id"] == 7
-    assert re.match(r"^π: %s \(idle \d+s\) — awaiting !pick$" % re.escape(proj), stub.title), stub.title
+    assert stub.title == "π: %s (idle · last run 17m · 10 turns) — awaiting !pick" % proj, stub.title
 
     # !pick by number → ui_response with the option text; title hint clears
     ns["pi_input_cb"]("", "buffer", "!pick 2")
@@ -570,7 +593,7 @@ def main():
     assert msg == {"type": "ui_response", "id": 7,
                    "value": "/opt/beta"}, msg
     assert BRIDGE.pending_ui is None
-    assert re.match(r"^π: %s \(idle \d+s\)$" % re.escape(proj), stub.title), stub.title
+    assert stub.title == "π: %s (idle · last run 17m · 10 turns)" % proj, stub.title
 
     # multi-select: comma list → array value; out-of-range number rejected
     send({"type": "ui_request", "id": 8, "method": "select",
@@ -923,6 +946,7 @@ def main():
     stub.pump(0.3)
     assert "waiting for pi" in (stub.title or ""), stub.title
     assert BRIDGE.client is None
+    assert BRIDGE.timing_snapshot is None, "disconnect must discard the stale snapshot"
 
     # ==================================================================
     # Phase D — TCP listener
