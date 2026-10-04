@@ -138,6 +138,7 @@ never reach the LLM):
 - `!tools [full|summary|off]` — tool output verbosity in the buffer (`pi_bridge.tool_output`)
 - `!think [on|off]`           — show/hide thinking lines (`pi_bridge.thinking`, default off)
 - `!highlight [on|off]`       — syntax-highlight fenced code blocks (`pi_bridge.highlight`, default on)
+- `!nick [auto|pi]`           — nick column: tool names / `think` / `pi` vs the single legacy `pi` nick (`pi_bridge.nicks`, default auto)
 - `!help` / `?`               — print this command list (answered locally, never reaches pi)
 
 ## 3. WeeChat side — `weechat/pi_bridge.py`
@@ -186,7 +187,11 @@ Design:
   Role → theme name: user input `chat_nick_self`, assistant text `chat`,
   tool lines `chat_prefix_network`, info/status `chat_value`, errors
   `chat_prefix_error`, success `chat_status_enabled`, hints/thinking 💭
-  `chat_host`; the tool *output body* is a fixed palette color (`blue`,
+  `chat_host`; each **nick** is colored with WeeChat's own per-nick color
+  (`weechat.color(weechat.info_get("nick_color_name", nick))`, i.e. hashed out
+  of `weechat.color.chat_nick_colors` with `look.nick_color_hash` /
+  `nick_color_force` honored) — tags alone do NOT color a nick printed by a
+  script, so the color has to ride in the text; the tool *output body* is a fixed palette color (`blue`,
   deliberately not theme-following so it stays distinct from the dim
   thinking lines — see `C_TOOL_OUT` in pi_bridge.py); fenced-code tokens
   (keywords/strings/comments/numbers/…) use a fixed 7-color palette
@@ -197,9 +202,21 @@ Design:
   terminal UI but zero out the stored line date, which relay clients
   (Glowing Bear over the relay websocket) would render as 01.01.1970.
   Real dates give proper HH:MM timestamps everywhere: 
-  - **Prefix column (nick):** pi-originated lines (assistant prose/fences,
-    thinking 💭, tool ⚙/✔ lines, tool output body) use tag `nick!pi` —
-    rendered under the literal nick `pi` in the theme's nick color. User
+  - **Prefix column (nick):** pi-originated lines render under the nick that
+    names *who* spoke (`pi_bridge.nicks = auto`, the default): tool ⚙/✔ lines
+    and their output body use the **tool name** (`read`, `bash`,
+    `memory_search`, …), thinking 💭 lines use `think`, assistant prose/fences
+    use `pi`. Tags are `notify_none,nick_<name>,prefix_nick_chat_nick`; the
+    nick is colored per nick by WeeChat's own color assignment (see Colors
+    above). `pi_bridge.nicks = pi` (`!nick pi`) restores the legacy rendering:
+    tag `notify_none,prefix_nick_chat_nick` and the literal nick `pi` for
+    every pi-side line, tool name back in the body (its ✔/✘ line names the
+    tool that ran, where it used to print the literal `tool`). A tool's ✔/✘
+    line reuses the nick learned from its `tool_start` (`toolCallId` map,
+    cleared on disconnect) because `tool_end` carries no `toolName`. Nicks
+    are sanitized to
+    `[A-Za-z0-9_.-]`, capped at 32 chars, blank/non-string → `pi` — a nick is
+    both the prefix field (TAB-separated) and part of a tag name. User
     lines (typed buffer input, `!s`/`!q` echoes, `user_echo` from the pi
     terminal) use tag `nick!me` — rendered under the buffer localvar
     `nick`, set at buffer creation to the first non-empty entry of
@@ -354,11 +371,12 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 
 | setting              | where                          | default                             |
 |----------------------|--------------------------------|-------------------------------------|
-| `pi_bridge.tcp_listen` | WeeChat option (`/set pi_bridge.tcp_listen host:port`; `0.0.0.0:port` for LAN/Tailscale) — live rebind, no reload | empty (off) |
+| `pi_bridge.tcp_listen` | WeeChat option (`/set plugins.var.python.pi_bridge.tcp_listen host:port`; `0.0.0.0:port` for LAN/Tailscale) — live rebind, no reload | empty (off) |
 | `pi_bridge.token` | WeeChat option; recommended value `${sec.data.pi_weechat_token}` (`/secure set pi_weechat_token …`) | empty (no enforcement) |
 | `pi_bridge.allowed_ips` | WeeChat option; regex of peer IPs accepted on the TCP listener (empty = allow all) | empty |
-| `pi_bridge.tool_output` | WeeChat option (`/set pi_bridge.tool_output full\|summary\|off`, or `!tools <mode>` in the buffer) | `summary` |
-| `pi_bridge.highlight` | WeeChat option (`/set pi_bridge.highlight on\|off`, or `!highlight <mode>` in the buffer) — syntax highlighting of fenced code blocks in assistant messages | `on` |
+| `pi_bridge.tool_output` | WeeChat option (`/set plugins.var.python.pi_bridge.tool_output full\|summary\|off`, or `!tools <mode>` in the buffer) | `summary` |
+| `pi_bridge.highlight` | WeeChat option (`/set plugins.var.python.pi_bridge.highlight on\|off`, or `!highlight <mode>` in the buffer) — syntax highlighting of fenced code blocks in assistant messages | `on` |
+| `pi_bridge.nicks` | WeeChat option (`/set plugins.var.python.pi_bridge.nicks auto\|pi`, or `!nick <mode>` in the buffer) — `auto`: nick column names the tool on tool lines, `think` on thinking lines, `pi` on replies; `pi`: every pi-side line under the single nick `pi` | `auto` |
 | `irc.server_default.nicks` | WeeChat IRC option (read-only for the bridge): first non-empty entry = the user's nick for the `nick!me` prefix column; re-applied live via `hook_config`, no reload | the IRC plugin's `nicks` default |
 | `PI_WEECHAT_URL`     | pi extension env: `tcp://host:port` / `unix://<path>` / `host:port` / path | unset ⇒ config-file `url` ⇒ `PI_WEECHAT_SOCK` (deprecated) ⇒ default unix path |
 | `PI_WEECHAT_TOKEN`   | pi extension env: shared secret for the challenge (never in the URL) | unset (anonymous) ⇒ config-file `token` |

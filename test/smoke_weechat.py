@@ -379,7 +379,14 @@ def main():
     text = buffer_text(stub)
     assert "session: %s prov/model-a" % proj in text, "session line missing"
     assert "Hello from pi" in text, "assistant line missing"
-    assert "bash" in text and "ls" in text, "tool start missing"
+    tool_rows = [(tg, p, b) for tg, p, b in stub.printf_tags
+                 if "nick_bash" in tg]
+    assert tool_rows, "tool lines must carry the tool nick (auto mode)"
+    assert all("bash" in p for _, p, _ in tool_rows), \
+        "tool start/end/output name the tool in the PREFIX column"
+    assert any("ls" in b for _, _, b in tool_rows), "tool args stay in the body"
+    assert not any("bash" in b for _, _, b in tool_rows), \
+        "auto nick mode drops the tool name from the body (it is the nick)"
     assert "a.txt" in text and "b.txt" in text, "tool output missing"
     assert "long_term remembered fact" in text, \
         "memory_write args must show target + content"
@@ -746,7 +753,7 @@ def main():
         "lines must be printed without leading tabs so they keep real dates"
 
     # ==================================================================
-    # Nick prefixes — role-based rendering (irc.server_default.nicks)
+    # Nick prefixes — who-spoke rendering (pi_bridge.nicks + irc nicks)
     # ==================================================================
 
     RS = "0"  # the stub's reset marker (real WeeChat: color:reset)
@@ -755,22 +762,43 @@ def main():
     assert stub.localvars.get("nick") == "alice", \
         "buffer localvar nick = first irc.server_default.nicks entry"
 
-    # pi-originated lines render under the 'pi' nick (prnt_date_tags,
-    # tag prefix_nick_chat_nick, `pi` before the TAB): assistant prose,
-    # fences, tool lines, tool output body
-    pi_rows = [(p, b) for tags, p, b in stub.printf_tags if tags == "notify_none,prefix_nick_chat_nick"]
-    assert all("pi" in p for p, _ in pi_rows), \
-        "pi lines carry `pi` as the line prefix"
+    # pi-originated lines render under the nick that names who spoke
+    # (prnt_date_tags, tags notify_none,nick_<name>,prefix_nick_chat_nick):
+    # assistant prose/fences → `pi`, tool lines + their output → the tool
+    # name, thinking → `think`
+    def nick_rows(tag):
+        return [(p, b) for tags, p, b in stub.printf_tags if tag in tags]
+
+    pi_rows = nick_rows("nick_pi")
+    assert pi_rows and all("pi" in p for p, _ in pi_rows), \
+        "assistant lines carry `pi` as the line prefix"
     pi_lines = [b for _, b in pi_rows]
     assert "Hello from pi" + RS in pi_lines, \
         "assistant prose via prnt_date_tags with the pi prefix"
-    assert any(t.startswith("M⚙ bash") for t in pi_lines), \
-        "tool_start under the pi nick"
-    assert any(t.startswith("G✔") for t in pi_lines), \
-        "tool_end under the pi nick"
-    assert "B  a.txt" + RS in pi_lines, "tool output body under the pi nick"
-    assert any(t.startswith("C\U0001F4AD ") for t in pi_lines), \
-        "thinking lines under the pi nick"
+
+    bash_rows = nick_rows("nick_bash")
+    assert bash_rows and all("bash" in p for p, _ in bash_rows), \
+        "tool lines carry the tool name as the line prefix"
+    # exact body: C_TOOL + glyph, then C_DIM + " " + args — no double space in
+    # auto mode (the name lives in the nick, not the body)
+    assert "M⚙C ls" + RS in [b for _, b in bash_rows], \
+        "tool_start body is glyph + args (name lives in the nick)"
+    assert any(b.startswith("G✔") for _, b in bash_rows), \
+        "tool_end body is the bare glyph"
+    assert "B  a.txt" + RS in [b for _, b in bash_rows], \
+        "tool output body under the tool nick"
+
+    think_rows = nick_rows("nick_think")
+    assert think_rows and all("think" in p for p, _ in think_rows), \
+        "thinking lines carry the `think` nick"
+    assert any(b.startswith("C\U0001F4AD ") for _, b in think_rows), \
+        "thinking body under the think nick"
+
+    assert nick_rows("nick_memory_write"), \
+        "unknown/custom tool names get their own nick too"
+    assert not any("nick_bash" in tags and "pi" in p
+                   for tags, p, _ in stub.printf_tags), \
+        "a tool line is never labelled `pi` in auto mode"
 
     # user lines (buffer input, !s echo, user_echo) render under the user's
     # nick — prefix_nick_chat_nick_self, no legacy '> ' marker in the text
@@ -791,6 +819,117 @@ def main():
     assert not any("session: " in t or "pi bridge:" in t
                    or "steer current turn" in t for t in all_printf), \
         "system lines must not carry nick tags"
+
+    # ==================================================================
+    # pi_bridge.nicks — auto (tool / think / pi) vs pi (legacy one nick)
+    # ==================================================================
+
+    # _nick_for: a nick is a prefix field AND part of a tag name, so TAB,
+    # space, comma and anything outside [A-Za-z0-9_.-] must not survive
+    sanitize = ns["_nick_for"]
+    assert sanitize("read") == "read"
+    assert sanitize("memory_search") == "memory_search"
+    assert sanitize("bad\ttool,name here") == "bad_tool_name_here", \
+        "TAB/space/comma are the prefix-split and tag-list separators"
+    assert sanitize("  \t ") == "pi" and sanitize("") == "pi", "blank → pi"
+    assert sanitize(None) == "pi" and sanitize(42) == "pi", "non-string → pi"
+    assert sanitize("héllo") == "h_llo", "non-ASCII collapses to _"
+    assert len(sanitize("x" * 200)) == 32, "nick length is capped"
+
+    ns["pi_input_cb"]("", "buffer", "!nick")
+    pump_and_drain(client, 0.2)
+    assert recv_lines == [], "!nick must not send anything to pi"
+    assert "nick mode: auto" in buffer_text(stub), "!nick reports the mode"
+
+    ns["pi_input_cb"]("", "buffer", "!nick bogus")
+    pump_and_drain(client, 0.2)
+    assert "unknown nick mode" in buffer_text(stub), "!nick rejects bad modes"
+    assert BRIDGE.nicks_mode() == "auto", "a rejected mode must not stick"
+
+    # !nick pi restores the single-nick rendering, tool name back in the body
+    ns["pi_input_cb"]("", "buffer", "!nick pi")
+    pump_and_drain(client, 0.2)
+    n_before = len(stub.printf_tags)
+    send({"type": "tool_start", "toolCallId": "t7", "toolName": "bash",
+          "args": {"command": "uname -a"}})
+    send({"type": "tool_end", "toolCallId": "t7", "isError": True,
+          "output": "nope"})
+    pump_and_drain(client, 0.3)
+    legacy = stub.printf_tags[n_before:]
+    assert legacy and all(tags == "notify_none,prefix_nick_chat_nick"
+                          for tags, _, _ in legacy), \
+        "!nick pi emits exactly today's tags (no nick_<tool> tag)"
+    assert all(p.endswith("pi" + RS) for _, p, _ in legacy), \
+        "!nick pi prefixes every pi line with `pi`"
+    assert any("bash" in b and "uname -a" in b for _, _, b in legacy), \
+        "pi mode keeps the tool name in the tool_start body"
+    assert any("✘ bash" in b for _, _, b in legacy), \
+        "pi mode keeps the tool name on the tool_end line"
+
+    # back to auto: tool_end reuses the nick learned from its tool_start
+    ns["pi_input_cb"]("", "buffer", "!nick auto")
+    pump_and_drain(client, 0.2)
+    n_before = len(stub.printf_tags)
+    send({"type": "tool_start", "toolCallId": "t8", "toolName": "web_fetch",
+          "args": {"url": "https://x.test"}})
+    send({"type": "tool_end", "toolCallId": "t8", "isError": False,
+          "output": "fetched"})
+    pump_and_drain(client, 0.3)
+    rows = stub.printf_tags[n_before:]
+    assert rows and all("nick_web_fetch" in tags and "web_fetch" in p
+                        for tags, p, _ in rows), \
+        "tool_end/output reuse the nick learned from tool_start"
+    assert not any("web_fetch" in b for _, _, b in rows), \
+        "auto mode: the name is the nick, not part of the body"
+    # interleaved calls: a tool_end must reuse the nick of ITS OWN tool_start,
+    # not the most recent one (parallel tool calls are normal in pi)
+    n_before = len(stub.printf_tags)
+    send({"type": "tool_start", "toolCallId": "t9", "toolName": "read",
+          "args": {"path": "/etc/hosts"}})
+    send({"type": "tool_start", "toolCallId": "t10", "toolName": "grep",
+          "args": {"pattern": "nick"}})
+    send({"type": "tool_end", "toolCallId": "t10", "isError": False,
+          "output": "2 matches"})
+    send({"type": "tool_end", "toolCallId": "t9", "isError": True,
+          "output": "permission denied"})
+    pump_and_drain(client, 0.3)
+    rows = stub.printf_tags[n_before:]
+    assert any("nick_grep" in tags and "2 matches" in body
+               for tags, _, body in rows), "grep end keeps the grep nick"
+    assert any("nick_read" in tags and "permission denied" in body
+               for tags, _, body in rows), "read end keeps the read nick"
+    assert "t9" not in BRIDGE.tool_nicks and "t10" not in BRIDGE.tool_nicks, \
+        "completed calls are dropped from the id map"
+
+    # an end whose start was never seen (reconnect mid-call) still renders,
+    # under the generic `tool` nick
+    n_before = len(stub.printf_tags)
+    send({"type": "tool_end", "toolCallId": "ghost", "isError": False,
+          "output": "orphan output"})
+    pump_and_drain(client, 0.3)
+    rows = stub.printf_tags[n_before:]
+    assert rows and all("nick_tool" in tags for tags, _, _ in rows), \
+        "unmatched tool_end falls back to the `tool` nick"
+
+    # mode switch in the middle of a call: the call line is auto, the result
+    # line is legacy — and the result still knows which tool it belongs to
+    n_before = len(stub.printf_tags)
+    send({"type": "tool_start", "toolCallId": "t11", "toolName": "edit",
+          "args": {"path": "a.txt"}})
+    pump_and_drain(client, 0.2)
+    ns["pi_input_cb"]("", "buffer", "!nick pi")
+    pump_and_drain(client, 0.2)
+    send({"type": "tool_end", "toolCallId": "t11", "isError": False,
+          "output": "saved"})
+    pump_and_drain(client, 0.3)
+    rows = stub.printf_tags[n_before:]
+    assert any("nick_edit" in tags for tags, _, _ in rows), \
+        "the call line rendered in auto mode"
+    legacy_rows = [r for r in rows if r[0] == "notify_none,prefix_nick_chat_nick"]
+    assert legacy_rows and any("✔ edit" in body for _, _, body in legacy_rows), \
+        "the result line rendered in legacy mode, naming the remembered tool"
+    ns["pi_input_cb"]("", "buffer", "!nick auto")
+    pump_and_drain(client, 0.2)
 
     # fallback: empty irc.server_default.nicks ⇒ legacy '> ' marker via prnt,
     # no user-nick printf (and the hook clears the localvar)
@@ -942,10 +1081,18 @@ def main():
     assert "input rate limited" in buffer_text(stub), "buffer line for the drop"
 
     # client disconnect → title back to waiting (unix client is done)
+    # an unfinished call leaves an entry in the toolCallId→nick map; a new
+    # connection can never complete it, so disconnect must drop the whole map
+    send({"type": "tool_start", "toolCallId": "t12", "toolName": "bash",
+          "args": {"command": "sleep 60"}})
+    pump_and_drain(client, 0.2)
+    assert BRIDGE.tool_nicks.get("t12") == "bash", "open call remembered by id"
+
     client.close()
     stub.pump(0.3)
     assert "waiting for pi" in (stub.title or ""), stub.title
     assert BRIDGE.client is None
+    assert BRIDGE.tool_nicks == {}, "disconnect must clear the toolCallId→nick map"
     assert BRIDGE.timing_snapshot is None, "disconnect must discard the stale snapshot"
 
     # ==================================================================
