@@ -227,14 +227,26 @@ Design:
     `prnt`. System lines (session info, connection state, command status,
     errors) stay prefix-less (`prnt`). Message body colors are unchanged —
     only the prefix column moves.
-  - `assistant_line`: prose prints as-is (default color), one buffer line
-    each. Fenced code blocks are tracked per message (`msgId`): fence lines
-    print dim, the body is indented two spaces and syntax-highlighted for
-    known languages (bash/sh, rust, css, html/xml/svg, php, python, json,
-    yaml — `HL_LANGS`/`HL_ALIAS` in pi_bridge.py) by a small line tokenizer
-    (ordered regex alternation; block-comment state carried per fence).
-    Toggled by `pi_bridge.highlight` (`!highlight`, default on); unknown
-    languages render plain but stay indented.
+  - `assistant_line`: rendered as markdown, block by block
+    (`pi_bridge.markdown`, `!markdown`, on by default). Fenced code blocks
+    are tracked per message (`msgId`) and stream straight through, line by
+    line: fence lines print dim, the body is indented two spaces and
+    syntax-highlighted for known languages (bash/sh, rust, css, html/xml/svg,
+    php, python, json, yaml — `HL_LANGS`/`HL_ALIAS` in pi_bridge.py) by a small
+    line tokenizer (ordered regex alternation; block-comment state carried per
+    fence). Toggled by `pi_bridge.highlight` (`!highlight`, default on);
+    unknown languages render plain but stay indented. Every other line is
+    accumulated into a block (paragraph, list, quote, heading, rule, setext)
+    and printed when the block completes, so the renderer sees the whole
+    construct: ATX/setext headings (magenta, tiered by level), bold/italic
+    (`**`/`*` with backslash escapes, no in-word emphasis), yellow inline
+    code, bulleted lists (`•`/`◦`/`▪`, hanging continuation), `│`-barred dim
+    quotes, and a fixed 20-column `─` rule (v1 does not query the window
+    width, so nothing is padded and the renderer never hard-wraps). A block
+    remembers the mode it started under, so a live `!markdown` toggle never
+    re-renders text already on screen; with markdown off, lines print as-is.
+    Blank-line separators are deferred (printed before the NEXT block, so a
+    message never ends with a blank line).
   - `tool_start`: `⚙ tool_name <summary>` where `<summary>` is the main
     content of the args struct, per tool (`format_tool_args()`): bash→
     command, read/write→path (+content), edit→path + edit count,
@@ -377,6 +389,7 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 | `pi_bridge.tool_output` | WeeChat option (`/set plugins.var.python.pi_bridge.tool_output full\|summary\|off`, or `!tools <mode>` in the buffer) | `summary` |
 | `pi_bridge.highlight` | WeeChat option (`/set plugins.var.python.pi_bridge.highlight on\|off`, or `!highlight <mode>` in the buffer) — syntax highlighting of fenced code blocks in assistant messages | `on` |
 | `pi_bridge.nicks` | WeeChat option (`/set plugins.var.python.pi_bridge.nicks auto\|pi`, or `!nick <mode>` in the buffer) — `auto`: nick column names the tool on tool lines, `think` on thinking lines, `pi` on replies; `pi`: every pi-side line under the single nick `pi` | `auto` |
+| `pi_bridge.markdown` | WeeChat option (`/set plugins.var.python.pi_bridge.markdown on\|off`, or `!markdown <mode>` in the buffer) — block-level markdown rendering of assistant text (headings, emphasis, inline code, lists, quotes, rules) | `on` |
 | `irc.server_default.nicks` | WeeChat IRC option (read-only for the bridge): first non-empty entry = the user's nick for the `nick!me` prefix column; re-applied live via `hook_config`, no reload | the IRC plugin's `nicks` default |
 | `PI_WEECHAT_URL`     | pi extension env: `tcp://host:port` / `unix://<path>` / `host:port` / path | unset ⇒ config-file `url` ⇒ `PI_WEECHAT_SOCK` (deprecated) ⇒ default unix path |
 | `PI_WEECHAT_TOKEN`   | pi extension env: shared secret for the challenge (never in the URL) | unset (anonymous) ⇒ config-file `token` |

@@ -58,7 +58,12 @@ class WeechatStub:
                 "yellow": "E", "green": "G", "red": "r", "236": "D",
                 # syntax-highlight palette (HL_TOKENS) + reset marker
                 "reset": "0", "bold magenta": "K", "darkgray": "d",
-                "lightblue": "L", "lightgreen": "g"}.get(name, "")
+                "lightblue": "L", "lightgreen": "g",
+                # text attributes: exactly the codes real WeeChat 4.10.1
+                # returns (probed), which the TUI and relay clients decode
+                "bold": "\x1a\x01", "italic": "\x1a\x03",
+                "underline": "\x1a\x04", "reverse": "\x1a\x02",
+                "dim": "\x1a\x06"}.get(name, "")
 
     def config_is_set_plugin(self, name):
         return name in self.plugin_opts
@@ -688,6 +693,7 @@ def main():
             pass
         stub.pump(0.02)
     send({"type": "assistant_line", "msgId": 2, "text": "still alive"})
+    send({"type": "assistant_flush", "msgId": 2})  # block-level flush (see _print_assistant)
     pump_and_drain(client, 0.5)
     assert any("still alive" in t for k, t in stub.prints), "connection lost after oversize"
 
@@ -1036,6 +1042,7 @@ def main():
     # a msgId change must reset an open fence (next message is prose again)
     send({"type": "assistant_line", "msgId": 43, "text": "```rust"})
     send({"type": "assistant_line", "msgId": 99, "text": "let a = 1;"})
+    send({"type": "assistant_flush", "msgId": 99})
     pump_and_drain(client)
     raw = [t for k, t in stub.prints if k in ("PRINT", "PRINTF")]
     assert DIM + "```rust" + RS in raw, "fence opened on its own message"
@@ -1065,6 +1072,230 @@ def main():
     pump_and_drain(client, 0.2)
     assert buffer_text(stub).count("code highlighting: on") >= 1
 
+    # --- the pi_bridge.markdown option + !markdown command
+    ns["pi_input_cb"]("", "buffer", "!markdown")
+    pump_and_drain(client, 0.2)
+    assert recv_lines == [], "!markdown must not send anything to pi"
+    assert "markdown rendering: on" in buffer_text(stub), \
+        "!markdown reports the default state"
+    ns["pi_input_cb"]("", "buffer", "!markdown bogus")
+    pump_and_drain(client, 0.2)
+    assert "unknown markdown mode: bogus (on | off)" in buffer_text(stub), \
+        "invalid mode is rejected"
+    assert stub.config_get_plugin("markdown") == "on", \
+        "rejected mode leaves the option untouched"
+    ns["pi_input_cb"]("", "buffer", "!markdown off")
+    pump_and_drain(client, 0.2)
+    assert "markdown rendering: off" in buffer_text(stub)
+    assert stub.config_get_plugin("markdown") == "off", \
+        "!markdown off persists the plugin option"
+
+    # markdown off must reproduce today's rendering path byte for byte,
+    # fenced highlighting included (regression guard for the renderer)
+    n0 = len(stub.prints)
+    for text in ("Here is the command to run:", "```bash",
+                 "ls -la # list everything", "```"):
+        send({"type": "assistant_line", "msgId": 45, "text": text})
+    pump_and_drain(client)
+    fresh = [t for k, t in stub.prints[n0:] if k in ("PRINT", "PRINTF")]
+    assert fresh == ["Here is the command to run:" + RS,
+                     DIM + "```bash" + RS,
+                     "  ls -la " + COM + "# list everything" + RS,
+                     DIM + "```" + RS], \
+        "markdown off reproduces the legacy rendering exactly"
+
+    ns["pi_input_cb"]("", "buffer", "!markdown on")
+    pump_and_drain(client, 0.2)
+    assert stub.config_get_plugin("markdown") == "on", "!markdown on restores"
+
+    # ==================================================================
+    # Phase B3 — markdown block lifecycle (pi_bridge.markdown buffering)
+    # ==================================================================
+
+    def md_fresh(n0):
+        return [t for k, t in stub.prints[n0:] if k in ("PRINT", "PRINTF")]
+
+    # --- inline spans: emphasis, code, escapes (unit level)
+    mdi = ns["_md_inline"]
+    BOLD, ITAL, CODE = ns["A_BOLD"], ns["A_ITALIC"], ns["C_CODE"]
+    assert mdi("plain text") == ("plain text", None), "no markers, no codes"
+    assert mdi("**bold**") == (BOLD + "bold", None)
+    assert mdi("__bold__") == (BOLD + "bold", None)
+    assert mdi("*italic*") == (ITAL + "italic", None)
+    assert mdi("_italic_") == (ITAL + "italic", None)
+    nested = mdi("a **bold and *italic* inside** b")
+    assert nested == ("a " + BOLD + "bold and " + BOLD + ITAL + "italic" + BOLD +
+                      " inside b", None), "nested emphasis re-applies the outer style"
+    assert mdi("run `git status` now") == ("run " + CODE + "git status now", None), \
+        "inline code: backticks stripped, colored"
+    assert mdi("**bold `code` tail**") == (BOLD + "bold " + CODE + "code" + BOLD + " tail",
+                                           None), "code inside bold restores bold after it"
+    assert mdi("`code with **stars** inside`") == (CODE + "code with **stars** inside", None), \
+        "no emphasis inside a code span"
+    assert mdi("snake_case_words and a*b*c") == ("snake_case_words and a*b*c", None), \
+        "emphasis inside words stays literal"
+    assert mdi("**unclosed") == ("**unclosed", None), "unclosed marker stays literal"
+    assert mdi("~~strike~~") == ("~~strike~~", None), \
+        "WeeChat has no strikethrough attribute: left alone"
+    assert mdi("a \\*b \\_c \\`d") == ("a *b _c `d", None), "backslash escapes the marker"
+
+    # emphasis that wraps across the lines of one paragraph
+    assert mdi("starts **bold that", "", None, "continues here**") == (
+        "starts " + BOLD + "bold that", "**"), "line 1 leaves the span open"
+    assert mdi("continues here**", "", "**") == (BOLD + "continues here", None), \
+        "line 2 closes it and restores the base style"
+
+    # --- headings (unit level): tiered attributes, markers stripped
+    rmb = BRIDGE._render_md_block
+    HEAD, UNDER, DIMA = ns["C_HEADING"], ns["A_UNDERLINE"], ns["A_DIM"]
+    assert rmb(["# Title"], "heading", True) == [HEAD + BOLD + UNDER + "Title" + RS]
+    assert rmb(["## Second"], "heading", True) == [HEAD + BOLD + "Second" + RS]
+    assert rmb(["### Third"], "heading", True) == [HEAD + BOLD + DIMA + "Third" + RS]
+    assert rmb(["#### Fourth"], "heading", True) == [HEAD + DIMA + "Fourth" + RS]
+    assert rmb(["##### Fifth"], "heading", True) == [HEAD + DIMA + ITAL + "Fifth" + RS]
+    assert rmb(["###### Sixth"], "heading", True) == [HEAD + DIMA + ITAL + "Sixth" + RS]
+    assert ns["_md_block_kind"]("####### Seventh") == "para", \
+        "seven hashes is not a heading (CommonMark stops at six)"
+    assert ns["_md_block_kind"]("#Heading") == "para", \
+        "no space after the hashes: prose, not a heading"
+    assert rmb(["## Heading ##"], "heading", True) == [HEAD + BOLD + "Heading" + RS], \
+        "the closing run of # is dropped"
+    assert rmb(["## Use **care**"], "heading", True) == [
+        HEAD + BOLD + "Use " + HEAD + BOLD + BOLD + "care" + HEAD + BOLD + RS], \
+        "inline emphasis inside a heading restores the heading style after it"
+    assert rmb(["## `code` head"], "heading", True) == [
+        HEAD + BOLD + CODE + "code" + HEAD + BOLD + " head" + RS], \
+        "inline code inside a heading restores the heading color afterwards"
+    # setext: the underline sets the level and is never printed
+    assert rmb(["Title", "==="], "setext", True) == [HEAD + BOLD + UNDER + "Title" + RS]
+    assert rmb(["Sub title", "---"], "setext", True) == [HEAD + BOLD + "Sub title" + RS]
+    assert rmb(["Two", "lines", "==="], "setext", True) == [
+        HEAD + BOLD + UNDER + "Two" + RS, HEAD + BOLD + UNDER + "lines" + RS], \
+        "a wrapped setext heading keeps its style on every line"
+    assert ns["_md_block_kind"]("---") == "hr", \
+        "--- with nothing before it is a rule, not an underline"
+
+    # the same rendering reaches the buffer through the wire
+    n0 = len(stub.prints)
+    for text in ("Use **care** with `rm -rf`:", "", "wrapped **emphasis that",
+                 "spans the paragraph**"):
+        send({"type": "assistant_line", "msgId": 69, "text": text})
+    send({"type": "assistant_flush", "msgId": 69})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [
+        "Use " + BOLD + "care" + " with " + CODE + "rm -rf:" + RS,
+        "",
+        "wrapped " + BOLD + "emphasis that" + RS,
+        BOLD + "spans the paragraph" + RS], \
+        "inline spans render in the buffer; wrapped emphasis carries across lines"
+
+    # markdown off: the same text keeps its markers and gets no codes
+    ns["pi_input_cb"]("", "buffer", "!markdown off")
+    pump_and_drain(client, 0.2)
+    n0 = len(stub.prints)
+    send({"type": "assistant_line", "msgId": 70, "text": "Use **care** with `rm -rf`:"})
+    send({"type": "assistant_flush", "msgId": 70})
+    pump_and_drain(client)
+    assert md_fresh(n0) == ["Use **care** with `rm -rf`:" + RS], \
+        "markdown off prints what pi wrote, markers included"
+    ns["pi_input_cb"]("", "buffer", "!markdown on")
+    pump_and_drain(client, 0.2)
+
+    # a paragraph is buffered until its blank line, then printed whole
+    n0 = len(stub.prints)
+    send({"type": "assistant_line", "msgId": 60, "text": "para line one"})
+    send({"type": "assistant_line", "msgId": 60, "text": "para line two"})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [], "an open paragraph is buffered, not printed line by line"
+    send({"type": "assistant_line", "msgId": 60, "text": ""})
+    pump_and_drain(client)
+    assert md_fresh(n0) == ["para line one" + RS, "para line two" + RS], \
+        "a blank line completes the block"
+
+    # separators are deferred: the blank prints before the NEXT block, and
+    # consecutive blanks collapse into one
+    n0 = len(stub.prints)
+    send({"type": "assistant_line", "msgId": 61, "text": ""})   # second blank in a row
+    send({"type": "assistant_line", "msgId": 61, "text": "after two blanks"})
+    send({"type": "assistant_flush", "msgId": 61})
+    pump_and_drain(client)
+    assert md_fresh(n0) == ["", "after two blanks" + RS], \
+        "one deferred separator, none trailing"
+
+    # a tool line while a paragraph is pending: the paragraph keeps its place
+    n0 = len(stub.prints)
+    send({"type": "assistant_line", "msgId": 62, "text": "text before the tool"})
+    send({"type": "tool_start", "toolCallId": "t20", "toolName": "bash",
+          "args": {"command": "ls"}})
+    pump_and_drain(client)
+    fresh = md_fresh(n0)
+    assert "text before the tool" in fresh[0] and "⚙" in fresh[1], \
+        "pending assistant text prints ahead of the tool line that follows it"
+
+    # a list stays one block, lazy continuation included
+    n0 = len(stub.prints)
+    for text in ("- one", "- two", "  wrapped continuation", ""):
+        send({"type": "assistant_line", "msgId": 63, "text": text})
+    pump_and_drain(client)
+    assert md_fresh(n0) == ["\u2022 one" + RS, "\u2022 two" + RS,
+                            "  wrapped continuation" + RS], \
+        "list items and their continuation flush together, without a trailing blank"
+
+    # a heading stands alone, and an opening fence flushes what came before it
+    n0 = len(stub.prints)
+    for text in ("## Heading", "para before fence", "```cobol", "x = 1", "```"):
+        send({"type": "assistant_line", "msgId": 64, "text": text})
+    pump_and_drain(client)
+    fresh = md_fresh(n0)
+    assert fresh[0] == "" and fresh[1] == HEAD + BOLD + "Heading" + RS, \
+        "the owed separator precedes the heading, which prints at once"
+    assert fresh[2] == "para before fence" + RS
+    assert fresh[3] == DIM + "```cobol" + RS, \
+        "the paragraph is printed before the fence that ends it"
+    assert fresh[4] == "  x = 1", "fence body still streams line by line"
+
+    # assistant_flush is idempotent: a second one prints nothing more
+    n0 = len(stub.prints)
+    send({"type": "assistant_line", "msgId": 65, "text": "flushed once"})
+    send({"type": "assistant_flush", "msgId": 65})
+    send({"type": "assistant_flush", "msgId": 65})
+    pump_and_drain(client)
+    assert md_fresh(n0) == ["flushed once" + RS], \
+        "flush is idempotent (no duplicate, no stray separator)"
+
+    # mode switch mid-block: the pending block keeps the mode it started under
+    n0 = len(stub.prints)
+    send({"type": "assistant_line", "msgId": 66, "text": "pending under on"})
+    pump_and_drain(client, 0.2)   # let the bridge read it before the command runs
+    ns["pi_input_cb"]("", "buffer", "!markdown off")
+    pump_and_drain(client, 0.2)
+    fresh = md_fresh(n0)
+    assert fresh[0] == "pending under on" + RS, \
+        "the pending block prints before the command answer that triggered it"
+    assert "markdown rendering: off" in fresh[1]
+    ns["pi_input_cb"]("", "buffer", "!markdown on")
+    pump_and_drain(client, 0.2)
+
+    # mode switch while a fence is open: fence tracking is untouched
+    n0 = len(stub.prints)
+    send({"type": "assistant_line", "msgId": 68, "text": "```bash"})
+    send({"type": "assistant_line", "msgId": 68, "text": "ls # y"})
+    pump_and_drain(client)
+    ns["pi_input_cb"]("", "buffer", "!markdown off")
+    pump_and_drain(client, 0.2)
+    send({"type": "assistant_line", "msgId": 68, "text": "ls # z"})
+    send({"type": "assistant_line", "msgId": 68, "text": "```"})
+    pump_and_drain(client)
+    fresh = md_fresh(n0)
+    assert fresh[0] == DIM + "```bash" + RS
+    assert fresh[1] == "  ls " + COM + "# y" + RS, "fence body is highlighted as before"
+    assert "markdown rendering: off" in fresh[2]
+    assert fresh[3] == "  ls " + COM + "# z" + RS, \
+        "fence body keeps streaming (and highlighting) after the mode switch"
+    assert fresh[4] == DIM + "```" + RS, "the open fence survives a mode switch"
+    ns["pi_input_cb"]("", "buffer", "!markdown on")
+    pump_and_drain(client, 0.2)
+
     # ==================================================================
     # Phase C — user_input rate limit (buffer → pi is the LLM-spend path)
     # ==================================================================
@@ -1080,6 +1311,150 @@ def main():
                for m in wire), "6th input answered with rate_limited"
     assert "input rate limited" in buffer_text(stub), "buffer line for the drop"
 
+    # setext underline vs horizontal rule: decided by what came before
+    n0 = len(stub.prints)
+    for text in ("Sub title", "---"):
+        send({"type": "assistant_line", "msgId": 71, "text": text})
+    send({"type": "assistant_flush", "msgId": 71})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [HEAD + BOLD + "Sub title" + RS], \
+        "a --- directly under a paragraph is a setext underline, not a rule"
+
+    n0 = len(stub.prints)
+    for text in ("after a blank", "", "---"):
+        send({"type": "assistant_line", "msgId": 72, "text": text})
+    send({"type": "assistant_flush", "msgId": 72})
+    pump_and_drain(client)
+    assert md_fresh(n0) == ["after a blank" + RS, "", DIMA + ns["MD_HR"] + RS], \
+        "--- after a blank line is a rule, and the paragraph is not a heading"
+
+    # a heading prints at once, and a tool line keeps its place after it
+    n0 = len(stub.prints)
+    send({"type": "assistant_line", "msgId": 73, "text": "# Next step"})
+    send({"type": "tool_start", "toolCallId": "t21", "toolName": "bash",
+          "args": {"command": "make"}})
+    pump_and_drain(client)
+    fresh = md_fresh(n0)
+    at = fresh.index(HEAD + BOLD + UNDER + "Next step" + RS)
+    assert "⚙" in fresh[at + 1], "the tool line follows the heading, never before it"
+
+    # --- lists (unit level): markers, nesting, hanging continuation
+    assert rmb(["- one", "* two", "+ three"], "list", True) == [
+        "\u2022 one" + RS, "\u2022 two" + RS, "\u2022 three" + RS], \
+        "all three unordered markers become bullets"
+    assert rmb(["1. first", "2) second", "10. tenth"], "list", True) == [
+        "1. first" + RS, "2) second" + RS, "10. tenth" + RS], \
+        "ordered items keep their number and delimiter"
+    assert rmb(["- top", "  - nested", "    - deep", "      - deeper"], "list", True) == [
+        "\u2022 top" + RS, "  \u25e6 nested" + RS, "    \u25aa deep" + RS,
+        "      \u25aa deeper" + RS], "bullets deepen with nesting, then hold"
+    assert rmb(["- item", "  wrapped text"], "list", True) == [
+        "\u2022 item" + RS, "  wrapped text" + RS], \
+        "a marker-less continuation hangs under the item text"
+    assert rmb(["10. item", "    wrapped text"], "list", True) == [
+        "10. item" + RS, "    wrapped text" + RS], \
+        "the hanging indent follows the width of the number column"
+    assert rmb(["  - nested", "    wrapped"], "list", True) == [
+        "  \u25e6 nested" + RS, "    wrapped" + RS], \
+        "continuation keeps the nested item's own indent"
+    assert rmb(["- use **care** here"], "list", True) == [
+        "\u2022 use " + BOLD + "care" + " here" + RS], \
+        "inline emphasis renders inside a list item"
+    assert rmb(["- starts **bold that", "  continues here**"], "list", True) == [
+        "\u2022 starts " + BOLD + "bold that" + RS,
+        "  " + BOLD + "continues here" + RS], \
+        "emphasis opened in an item carries to its continuation line"
+
+    # a list ends at a fence, and a tool line keeps its place after it
+    n0 = len(stub.prints)
+    for text in ("- first item", "```cobol", "x = 1", "```"):
+        send({"type": "assistant_line", "msgId": 74, "text": text})
+    pump_and_drain(client)
+    fresh = md_fresh(n0)
+    assert fresh[0] == "\u2022 first item" + RS
+    assert fresh[1] == DIM + "```cobol" + RS, "the list flushes before the fence"
+
+    n0 = len(stub.prints)
+    send({"type": "assistant_line", "msgId": 75, "text": "- last item"})
+    send({"type": "tool_start", "toolCallId": "t22", "toolName": "bash",
+          "args": {"command": "ls"}})
+    pump_and_drain(client)
+    fresh = md_fresh(n0)
+    assert fresh[0] == "\u2022 last item" + RS and "⚙" in fresh[1], \
+        "a pending list prints before the tool line that interrupts it"
+
+    # a pending block flushes when the user interrupts it (e.g. !abort)
+    n0 = len(stub.prints)
+    send({"type": "assistant_line", "msgId": 79, "text": "long paragraph that is"})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [], "the paragraph is still buffered"
+    ns["pi_input_cb"]("", "buffer", "!abort")
+    pump_and_drain(client)
+    fresh = md_fresh(n0)
+    assert fresh[0] == "long paragraph that is" + RS, \
+        "the pending paragraph prints before the interruption echo"
+    assert any("!abort" in x for x in fresh), "the abort echo follows it"
+
+    # and when the session reports an error mid-block
+    n0 = len(stub.prints)
+    send({"type": "assistant_line", "msgId": 80, "text": "text before the error"})
+    send({"type": "error", "code": "boom", "message": "exploded"})
+    pump_and_drain(client)
+    fresh = md_fresh(n0)
+    assert fresh[0] == "text before the error" + RS
+    assert any("boom" in x for x in fresh), "the error line follows the flushed text"
+
+    # --- blockquotes and horizontal rules (unit level)
+    BAR, QS = ns["MD_QUOTE_BAR"], ns["MD_QUOTE_STYLE"]
+    HR = ns["MD_HR"]
+    assert rmb(["> quoted"], "quote", True) == [BAR + QS + "quoted" + RS]
+    assert rmb(["> one", "> two"], "quote", True) == [
+        BAR + QS + "one" + RS, BAR + QS + "two" + RS], "every quoted line keeps its bar"
+    assert rmb(["> outer", ">> inner"], "quote", True) == [
+        BAR + QS + "outer" + RS, BAR + BAR + QS + "inner" + RS], \
+        "nested quotes print one bar per level"
+    assert rmb(["> quoted", "still quoted"], "quote", True) == [
+        BAR + QS + "quoted" + RS, BAR + QS + "still quoted" + RS], \
+        "an unmarked line continues the quote (CommonMark lazy continuation)"
+    assert rmb(["> quoted", "", "> second part"], "quote", True) == [
+        BAR + QS + "quoted" + RS, "", BAR + QS + "second part" + RS], \
+        "a quote survives the blank between its paragraphs, and never ends with one"
+    assert rmb(["> use **care**"], "quote", True) == [
+        BAR + QS + "use " + QS + BOLD + "care" + QS + RS], \
+        "emphasis inside a quote restores the quote style after it"
+    assert rmb(["> - item"], "quote", True) == [BAR + QS + "\u2022 item" + RS], \
+        "a list marker inside a quote still renders as a list item"
+    for rule in ("---", "***", "___", "- - -"):
+        assert rmb([rule], "hr", True) == [DIMA + HR + RS], \
+            "%s is a rule of the same fixed length" % rule
+        assert ns["_md_block_kind"](rule) == "hr"
+    assert len(HR) == 20, "rules are a fixed length: no width is knowable here"
+
+    # a quote ends where a paragraph starts, and rules stand alone
+    n0 = len(stub.prints)
+    for text in ("> quoted line", "", "plain paragraph"):
+        send({"type": "assistant_line", "msgId": 76, "text": text})
+    send({"type": "assistant_flush", "msgId": 76})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [BAR + QS + "quoted line" + RS, "", "plain paragraph" + RS], \
+        "after a blank, unquoted prose is a new paragraph, not part of the quote"
+
+    n0 = len(stub.prints)
+    for text in ("---", "between", "---"):
+        send({"type": "assistant_line", "msgId": 77, "text": text})
+    send({"type": "assistant_flush", "msgId": 77})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [DIMA + HR + RS, HEAD + BOLD + "between" + RS], \
+        "the first --- is a rule; between + --- is a setext heading, not a rule"
+
+    n0 = len(stub.prints)
+    for text in ("a paragraph", "", "---"):
+        send({"type": "assistant_line", "msgId": 78, "text": text})
+    send({"type": "assistant_flush", "msgId": 78})
+    pump_and_drain(client)
+    assert md_fresh(n0) == ["a paragraph" + RS, "", DIMA + HR + RS], \
+        "--- after a blank is a rule, at the end of a message as much as at its start"
+
     # client disconnect → title back to waiting (unix client is done)
     # an unfinished call leaves an entry in the toolCallId→nick map; a new
     # connection can never complete it, so disconnect must drop the whole map
@@ -1088,10 +1463,19 @@ def main():
     pump_and_drain(client, 0.2)
     assert BRIDGE.tool_nicks.get("t12") == "bash", "open call remembered by id"
 
+    send({"type": "assistant_line", "msgId": 67, "text": "stranded by disconnect"})
+    pump_and_drain(client, 0.2)
+    assert not any("stranded by disconnect" in t for k, t in stub.prints), \
+        "the block is still pending while the connection is up"
+
     client.close()
     stub.pump(0.3)
     assert "waiting for pi" in (stub.title or ""), stub.title
     assert BRIDGE.client is None
+    assert any("stranded by disconnect" in t for k, t in stub.prints), \
+        "disconnect flushes a half-built block instead of losing it"
+    assert BRIDGE._md_block == [] and BRIDGE._md_block_type is None, \
+        "disconnect resets the block accumulator"
     assert BRIDGE.tool_nicks == {}, "disconnect must clear the toolCallId→nick map"
     assert BRIDGE.timing_snapshot is None, "disconnect must discard the stale snapshot"
 
@@ -1169,6 +1553,7 @@ def main():
         except BlockingIOError:
             pass
         stub.pump(0.02)
+    send_line(tc, {"type": "assistant_flush", "msgId": blob_lines})  # settle the last block
     stub.pump(1.5)
     rendered = sum(1 for k, t in stub.prints if "burst-" in t)
     assert rendered == blob_lines, \

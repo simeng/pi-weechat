@@ -146,6 +146,34 @@ C_REJECT = _color("red")                             # auth failures / security
 C_TOOL_OUT = _color("blue")
 R = _color("reset")
 
+# Text attributes (WeeChat's own codes; verified on 4.10.1: bold \x1a\x01,
+# italic \x1a\x03, underline \x1a\x04, reverse \x1a\x02, dim \x1a\x06). They
+# survive the relay and Glowing Bear maps them to .a-b/.a-i/.a-u/.a-r/.a-d.
+# A \x19 color code RESETS attributes in WeeChat's renderer, so a style is
+# always built as color-then-attributes and re-applied in full after a span.
+A_BOLD = _color("bold") or "\x1a\x01"
+A_ITALIC = _color("italic") or "\x1a\x03"
+A_UNDERLINE = _color("underline") or "\x1a\x04"
+A_DIM = _color("dim") or "\x1a\x06"
+A_REVERSE = _color("reverse") or "\x1a\x02"
+# Inline code: fixed palette yellow (spike decision — no chat_code slot exists
+# in 4.10.1, and yellow collides with neither cyan thinking nor blue output).
+C_CODE = _color("yellow")
+# Headings: WeeChat has no chat_heading color slot, so headings use one fixed
+# accent (magenta — the same structural accent as tool activity, never prose),
+# tiered by level: deeper levels get fewer attributes.
+C_HEADING = _color("magenta")
+# Color first, attributes after: a \x19 color code resets attributes, so every
+# style prefix is built in this order and re-applied in full after a span.
+MD_HEADING_LEVELS = {
+    1: A_BOLD + A_UNDERLINE,
+    2: A_BOLD,
+    3: A_BOLD + A_DIM,
+    4: A_DIM,
+    5: A_DIM + A_ITALIC,
+    6: A_DIM + A_ITALIC,
+}
+
 
 def _nick_color(nick):
     """Inline color for a nick prefix: WeeChat's own per-nick assignment.
@@ -369,6 +397,233 @@ def _fence_closed(fence, line):
     return bool(fence["close"].match(line))
 
 
+# Markdown block classification (see pi_bridge.markdown). CommonMark allows up
+# to three leading spaces before a block marker; LLM output rarely uses more.
+MD_ATX_RE = re.compile(r"^ {0,3}(#{1,6})(?:\s|$)")
+MD_SETEXT_RE = re.compile(r"^ {0,3}(=+|-+)\s*$")
+MD_HR_RE = re.compile(r"^ {0,3}(?:(?:[-*_])\s*){3,}$")
+MD_LIST_RE = re.compile(r"^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:\s+\S|\s*$)")
+MD_QUOTE_RE = re.compile(r"^ {0,3}>")
+
+MD_BLOCK_PARA = "para"
+MD_BLOCK_LIST = "list"
+MD_BLOCK_QUOTE = "quote"
+MD_BLOCK_HEADING = "heading"
+MD_BLOCK_HR = "hr"
+MD_BLOCK_SETEXT = "setext"
+
+
+def _md_block_kind(line):
+    """Classify a markdown line: None (blank) | heading | hr | list | quote | para.
+
+    A line that starts with `*` or `_` is emphasis, not a list item or a rule:
+    MD_LIST_RE needs whitespace after the marker, MD_HR_RE needs three markers.
+    """
+    if not line.strip():
+        return None
+    if MD_ATX_RE.match(line):
+        return MD_BLOCK_HEADING
+    if MD_HR_RE.match(line):
+        return MD_BLOCK_HR
+    if MD_LIST_RE.match(line):
+        return MD_BLOCK_LIST
+    if MD_QUOTE_RE.match(line):
+        return MD_BLOCK_QUOTE
+    return MD_BLOCK_PARA
+
+
+def _md_setext_level(line):
+    """Setext underline → heading level (=== is 1, --- is 2), or None.
+
+    Only the line right after a paragraph is an underline; the same `---` with
+    nothing before it is a horizontal rule (the caller decides which).
+    """
+    m = MD_SETEXT_RE.match(line)
+    if not m:
+        return None
+    return 1 if m.group(1)[0] == "=" else 2
+
+
+MD_ATX_TEXT_RE = re.compile(r"^ {0,3}(#{1,6})(?:\s|$)(.*?)\s*#*\s*$")
+
+
+def _md_atx(line):
+    """ATX heading → (level, text), or None when it is not one.
+
+    `#Heading` (no space after the hashes) is not a heading in CommonMark and
+    stays prose; the optional closing run of `#` is dropped.
+    """
+    m = MD_ATX_TEXT_RE.match(line)
+    if not m:
+        return None
+    return len(m.group(1)), m.group(2).strip()
+
+
+def _md_heading_style(level):
+    """Style prefix for a heading level: color codes then attribute codes."""
+    return C_HEADING + MD_HEADING_LEVELS.get(level, MD_HEADING_LEVELS[6])
+
+
+# Lists. Indent depth is read from the marker column (2 spaces per level, as
+# CommonMark counts it); bullets deepen • → ◦ → ▪.
+MD_LIST_UL_RE = re.compile(r"^( *)([-*+])\s+(.*)$")
+MD_LIST_OL_RE = re.compile(r"^( *)(\d{1,9})([.)])\s+(.*)$")
+MD_BULLETS = ("\u2022", "\u25e6", "\u25aa")
+
+# Blockquotes: a │ bar per nesting level and a dimmed body. No color on purpose
+# — cyan already means thinking and blue already means tool output.
+MD_QUOTE_MARK_RE = re.compile(r"^ *((?:> ?)+)(.*)$")
+MD_QUOTE_BAR = "\u2502 "
+MD_QUOTE_STYLE = A_DIM
+# Horizontal rule: a fixed-length light box-drawing line. v1 does not query
+# the window width (no usable width source was found in the spike), and
+# padding to a guessed width would wrap in a narrower window.
+MD_HR = "\u2500" * 20
+
+
+def _md_list_items(lines):
+    """List block → [(prefix, content)] in print order.
+
+    `prefix` is the exact text printed before the item content: a bullet or a
+    number for a marker line, and the same width of spaces for a lazy
+    continuation line, so an item's wrapped text hangs under its own text.
+    """
+    items = []
+    hang = ""            # marker width of the item being continued
+    for line in lines:
+        m = MD_LIST_UL_RE.match(line)
+        if m:
+            spaces, depth = m.group(1), len(m.group(1)) // 2
+            bullet = MD_BULLETS[min(depth, len(MD_BULLETS) - 1)]
+            hang = spaces + bullet + " "
+            items.append((hang, m.group(3)))
+            continue
+        m = MD_LIST_OL_RE.match(line)
+        if m:
+            spaces = m.group(1)
+            marker = m.group(2) + m.group(3)
+            hang = spaces + marker + " "
+            items.append((hang, m.group(4)))
+            continue
+        # no marker: lazy continuation of the item above it (an item whose
+        # wrapped text the model put on its own line) — same prefix, so the
+        # text lines up under the item's own text
+        if hang:
+            items.append((" " * len(hang), line.strip()))
+        else:
+            items.append(("", line))
+    return items
+
+
+# Inline markdown: emphasis and code. Backslash escapes, and markers that do
+# not open a span stay literal (including ~~strikethrough~~ — WeeChat has no
+# attribute for it).
+_MD_ESCAPES = set("\\`*_{}[]()#+-.!>~")
+_MD_ATTR = {"**": A_BOLD, "__": A_BOLD, "*": A_ITALIC, "_": A_ITALIC}
+
+
+def _md_word_char(ch):
+    return ch.isalnum() or ch == "_"
+
+
+def _md_mid_word(text, i, length):
+    """True when a delimiter sits inside a word: snake_case_words, a*b*c.
+
+    Those stay literal — identifiers and glob-ish text are common in agent
+    output and italicising them would corrupt what they say.
+    """
+    prev = text[i - 1] if i > 0 else ""
+    nxt = text[i + length] if i + length < len(text) else ""
+    return _md_word_char(prev) and _md_word_char(nxt)
+
+
+def _md_close(text, start, delim):
+    """Index of the closing `delim` at or after start, skipping escapes; -1."""
+    i = start
+    n = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n and text[i + 1] in _MD_ESCAPES:
+            i += 2
+            continue
+        if text.startswith(delim, i):
+            return i
+        i += 1
+    return -1
+
+
+def _md_inline(text, base="", pending=None, lookahead=None):
+    """Render the inline markdown of one line → (printable line, still_open).
+
+    `base` is the enclosing style (color codes then attribute codes) that is
+    re-applied in full after every span, because a color code drops the
+    attributes that were active before it. `pending` is emphasis left open by
+    the previous line of the same block; the returned `still_open` is what the
+    next line inherits. A marker only stays open across a line break when
+    `lookahead` (the rest of the block) actually closes it — otherwise it is
+    printed literally, which is what markdown does with `**unclosed`.
+    """
+    out = []
+
+    if pending:
+        style = base + _MD_ATTR[pending]
+        close = _md_close(text, 0, pending)
+        if close < 0:
+            return style + _md_inline(text, style)[0], pending
+        inner = _md_inline(text[:close], style)[0]
+        out.append(style + inner + base)
+        text = text[close + len(pending):]
+
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] in _MD_ESCAPES:
+            out.append(text[i + 1])   # \* \_ \` … print the marker itself
+            i += 2
+            continue
+        if ch == "`":
+            j = i
+            while j < n and text[j] == "`":
+                j += 1
+            fence = text[i:j]
+            close = text.find(fence, j)
+            if close < 0:
+                out.append(fence)     # unbalanced backticks stay literal
+                i = j
+                continue
+            # color first, then the outer style again: inline code must not
+            # swallow the bold/italic it sits inside
+            out.append(C_CODE + text[j:close] + base)
+            i = close + len(fence)
+            continue
+        two = text[i:i + 2]
+        if two in ("**", "__") and not _md_mid_word(text, i, 2):
+            close = _md_close(text, i + 2, two)
+            if close >= 0:
+                inner = _md_inline(text[i + 2:close], base + _MD_ATTR[two])[0]
+                out.append(base + _MD_ATTR[two] + inner + base)
+                i = close + 2
+                continue
+            if lookahead is not None and _md_close(lookahead, 0, two) >= 0:
+                return ("".join(out) + base + _MD_ATTR[two] + text[i + 2:], two)
+            # not an emphasis opener: consume BOTH markers, so the second half
+            # of `**unclosed` is never re-read as a lone `*`
+            out.append(two)
+            i += 2
+            continue
+        if ch in "*_" and not _md_mid_word(text, i, 1):
+            close = _md_close(text, i + 1, ch)
+            if close >= 0:
+                inner = _md_inline(text[i + 1:close], base + _MD_ATTR[ch])[0]
+                out.append(base + _MD_ATTR[ch] + inner + base)
+                i = close + 1
+                continue
+            if lookahead is not None and _md_close(lookahead, 0, ch) >= 0:
+                return ("".join(out) + base + _MD_ATTR[ch] + text[i + 1:], ch)
+        out.append(ch)
+        i += 1
+    return "".join(out), None
+
+
 # Per-tool summary of tool_start args: the "main content" of each tool's
 # argument struct, in display order (see format_tool_args).
 TOOL_ARG_KEYS = {
@@ -407,6 +662,12 @@ DEFAULT_THINKING = "off"
 # Syntax highlighting of fenced code blocks (pi_bridge.highlight option)
 HIGHLIGHT_MODES = ("on", "off")
 DEFAULT_HIGHLIGHT = "on"
+
+# Markdown rendering of pi's replies (pi_bridge.markdown option): on = render
+# headings/emphasis/lists/quotes into WeeChat color+attribute codes, off = print
+# the text exactly as pi wrote it.
+MARKDOWN_MODES = ("on", "off")
+DEFAULT_MARKDOWN = "on"
 
 # Nick column mode (pi_bridge.nicks option): auto = tool name on tool lines,
 # think on thinking lines, pi on replies; pi = every pi-side line under the
@@ -463,6 +724,10 @@ PLUGIN_OPTIONS = (
      'Who the nick column names: auto (tool name on tool lines, "think" on '
      'thinking lines, "pi" on replies) | pi (every pi-side line under the '
      'single nick "pi"). Nick colors come from weechat.color.chat_nick_colors.'),
+    ("markdown", DEFAULT_MARKDOWN,
+     'Render pi’s markdown replies (headings, bold/italic, inline code, lists, '
+     'blockquotes, rules) with WeeChat color and attribute codes: on | off. '
+     'Blocks are printed when complete, so a paragraph appears at its blank line.'),
 )
 
 HELP_TEXT = (
@@ -475,6 +740,7 @@ HELP_TEXT = (
     "!think [on|off] show/hide thinking lines (default: off)\n"
     "!highlight [on|off] syntax-highlight fenced code blocks (default: on)\n"
     "!nick [auto|pi] nick column: tool names vs just “pi” (default: auto)\n"
+    "!markdown [on|off] render pi's markdown replies (default: on)\n"
     "anything else is sent to pi as a normal message"
 )
 
@@ -617,6 +883,14 @@ class Bridge(object):
         # markdown fence tracking for streamed assistant lines (per message)
         self._md_msg = None           # msgId of the last assistant_line seen
         self._md_fence = None         # open fence dict (see _fence_open), or None
+        # Markdown block accumulator: prose/lists/quotes are printed once the
+        # block is complete, so the renderer sees the whole construct. Fenced
+        # code keeps streaming (highlighting needs it line by line).
+        self._md_block = []           # raw lines of the block being built
+        self._md_block_type = None    # MD_BLOCK_* while a block is open
+        self._md_block_mode = True    # pi_bridge.markdown state when it started
+        self._md_blank_owed = False   # blank separator owed before the NEXT block
+        self._md_printing = False     # inside a flush: never flush recursively
         # pending interactive prompt from pi (ui_request); answered via !pick
         self.pending_ui = None        # {id, method, options, multiple}, or None
         # toolCallId → nick, learned from tool_start: tool_end carries no
@@ -680,6 +954,7 @@ class Bridge(object):
         websocket) would then show 01.01.1970 or no useful time. With a real
         date, both the TUI and relay clients show proper HH:MM timestamps.
         """
+        self._flush_md_block()  # pending assistant text precedes any status line
         if self.alive and self.buffer:
             weechat.prnt(self.buffer, text)
 
@@ -722,6 +997,10 @@ class Bridge(object):
                  info, connect/disconnect notices, errors, command status
                  answers, rate-limit warnings, ready/listening lines.
         """
+        # A pending markdown block belongs to the assistant text that came
+        # before this line, so it prints first (_md_printing stops the flush's
+        # own prints from recursing back through here).
+        self._flush_md_block()
         # prnt_date_tags stamps the current time, so lines keep real dates
         # for relay clients (the no-leading-tab rule of _print is untouched).
         if role == "pi":
@@ -867,6 +1146,10 @@ class Bridge(object):
         """pi_bridge.nicks option: auto (tool/think/pi nicks) | pi (legacy)."""
         return self._plugin_option("nicks", NICK_MODES, DEFAULT_NICKS)
 
+    def markdown_enabled(self):
+        """pi_bridge.markdown option: on | off."""
+        return self._plugin_option("markdown", MARKDOWN_MODES, DEFAULT_MARKDOWN) == "on"
+
     def _remember_tool(self, call_id, name):
         """Learn toolCallId → nick so the result line can reuse it.
 
@@ -885,28 +1168,87 @@ class Bridge(object):
     # ------------------------------------------------ markdown code blocks
 
     def _print_assistant(self, text, msg_id):
-        """Print one streamed assistant line (markdown-fence aware).
+        """Print one streamed assistant line (markdown aware).
 
-        Prose prints in the chat color; fenced code blocks are tracked per
-        message (a new msgId resets an open fence). Fence lines print dim,
-        the body is indented two spaces and syntax-highlighted when the
-        language is supported and pi_bridge.highlight is on.
+        Fenced code streams straight through: it is already rendered line by
+        line and highlighting needs that incremental context. Everything else
+        is accumulated into a block (paragraph, list, quote) and printed when
+        the block is complete, so the renderer sees the whole construct —
+        setext headings, list continuations, blank-line separation. A block
+        remembers the pi_bridge.markdown mode it started under, so a live
+        !markdown toggle never re-renders text that is already on screen.
         """
         if msg_id != self._md_msg:
+            self._flush_md_block()   # a new message never extends the old block
             self._md_msg = msg_id
             self._md_fence = None
-        if self._md_fence is None:
-            fence = _fence_open(text)
-            if fence is not None:
-                self._md_fence = fence
+            self._md_block_done()
+        if self._md_fence is not None:
+            self._flush_md_block()   # no block may span a fence
+            if _fence_closed(self._md_fence, text):
+                self._md_fence = None
                 self._print_msg(C_DIM + text + R, "pi")
-            else:
-                self._print_msg(C_PI + text + R, "pi")
+                return
+            self._print_fence_body(text)
             return
-        if _fence_closed(self._md_fence, text):
-            self._md_fence = None
+        fence = _fence_open(text)
+        if fence is not None:
+            self._flush_md_block()
+            self._md_fence = fence
             self._print_msg(C_DIM + text + R, "pi")
             return
+        if not self.markdown_enabled():
+            self._flush_md_block()   # anything pending belongs to the other mode
+            self._print_msg(C_PI + text + R, "pi")
+            return
+
+        setext = _md_setext_level(text)
+        if setext and self._md_block_type == MD_BLOCK_PARA:
+            self._md_block.append(text)
+            self._md_block_type = MD_BLOCK_SETEXT
+            self._flush_md_block()
+            return
+
+        kind = _md_block_kind(text)
+        if kind is None:               # blank line: the block is complete
+            if self._md_block_type == MD_BLOCK_QUOTE:
+                # CommonMark keeps a quote open across blank lines, and we
+                # cannot know yet whether the next line is still quoted
+                self._md_block.append("")
+                return
+            self._flush_md_block()
+            self._md_blank_owed = True
+            return
+        if kind in (MD_BLOCK_HEADING, MD_BLOCK_HR):
+            self._flush_md_block()     # a heading or a rule stands alone
+            self._md_start_block(kind, text)
+            self._flush_md_block()
+            return
+
+        cur = self._md_block_type
+        if cur is None:
+            self._md_start_block(kind, text)
+            return
+        if cur == kind:
+            self._md_block.append(text)
+            return
+        if cur in (MD_BLOCK_LIST, MD_BLOCK_QUOTE) and kind == MD_BLOCK_PARA:
+            if cur == MD_BLOCK_QUOTE and self._md_block and \
+                    not self._md_block[-1].strip():
+                # CommonMark's lazy continuation only applies while the quoted
+                # paragraph is still running: after a blank line this prose is
+                # a new paragraph, not part of the quote
+                self._flush_md_block()
+                self._md_blank_owed = True   # the blank that ended the quote
+                self._md_start_block(kind, text)
+                return
+            self._md_block.append(text)  # lazy continuation of the open block
+            return
+        self._flush_md_block()
+        self._md_start_block(kind, text)
+
+    def _print_fence_body(self, text):
+        """Body line of an open fence: indented, highlighted when supported."""
         lang = self._md_fence["lang"]
         if self.highlight_enabled() and HL_ALIAS.get(lang.lower()):
             body = highlight_code(text, lang, self._md_fence["ctx"])
@@ -914,6 +1256,126 @@ class Bridge(object):
             body = text
         self._print_msg("  " + body, "pi")
 
+    def _md_start_block(self, kind, text):
+        self._md_block_type = kind
+        self._md_block_mode = self.markdown_enabled()
+        self._md_block = [text]
+
+    def _md_block_done(self):
+        """Forget the pending block (it has just been flushed)."""
+        self._md_block = []
+        self._md_block_type = None
+
+    def _flush_md_block(self):
+        """Print the pending block. Idempotent, and never re-entrant.
+
+        Blank-line separators are deferred: the blank is printed before the
+        NEXT block rather than trailing the one that ended, so a message never
+        ends with an empty line and consecutive blanks collapse into one.
+        """
+        if self._md_printing or not self._md_block:
+            return
+        lines = self._md_block
+        kind = self._md_block_type
+        mode = self._md_block_mode
+        self._md_block_done()
+        self._md_printing = True
+        try:
+            if self._md_blank_owed:
+                self._md_blank_owed = False
+                self._print("")   # a plain blank line, no nick on it
+            for line in self._render_md_block(lines, kind, mode):
+                self._print_msg(line, "pi")
+        finally:
+            self._md_printing = False
+
+    def _render_md_block(self, lines, kind, mode):
+        """Render one raw markdown block into printable lines.
+
+        mode False = the block started while pi_bridge.markdown was off: print
+        it exactly as pi wrote it. Otherwise render it by construct (headings,
+        emphasis, lists, quotes, rules). Emphasis may span the lines of one
+        wrapped paragraph: the open delimiter is carried from line to line.
+        """
+        if not mode:
+            return [C_PI + line + R for line in lines]
+        if kind == MD_BLOCK_HEADING:
+            parsed = _md_atx(lines[0])
+            if parsed is None:                # classified as one, is not one
+                return [C_PI + line + R for line in lines]
+            level, text = parsed
+            base = _md_heading_style(level)
+            return [base + _md_inline(text, base)[0] + R]
+        if kind == MD_BLOCK_SETEXT:
+            # the underline is structure, not text: it sets the level, it is
+            # never printed
+            level = _md_setext_level(lines[-1]) or 2
+            return self._render_styled(lines[:-1], _md_heading_style(level))
+        if kind == MD_BLOCK_QUOTE:
+            return self._render_quote(lines)
+        if kind == MD_BLOCK_HR:
+            return [MD_QUOTE_STYLE + MD_HR + R]
+        if kind == MD_BLOCK_LIST:
+            items = _md_list_items(lines)
+            out = []
+            pending = None
+            for idx, (prefix, content) in enumerate(items):
+                rest = "\n".join(c for _, c in items[idx + 1:]) \
+                    if idx + 1 < len(items) else None
+                rendered, pending = _md_inline(content, C_PI, pending, rest)
+                out.append(prefix + C_PI + rendered + R)
+            return out
+        return self._render_styled(lines, C_PI)
+
+    def _render_quote(self, lines):
+        """Blockquote block → bar-prefixed dimmed lines.
+
+        A line without `>` continues the quote at the current depth; nested
+        `>>` print one bar per level. Blank lines separate quoted paragraphs
+        and never trail the block.
+        """
+        body = []
+        depth = 0
+        for line in lines:
+            m = MD_QUOTE_MARK_RE.match(line)
+            if m:
+                depth = m.group(1).count(">")
+                inner = m.group(2).strip()
+            else:
+                inner = line.strip()
+                depth = depth or 1
+            # a list inside a quote keeps its list shape: the marker is read
+            # from the quoted text, not from the line's first column
+            if _md_block_kind(inner) == MD_BLOCK_LIST:
+                prefix, inner = _md_list_items([inner])[0]
+                body.append((depth, prefix + inner))
+            else:
+                body.append((depth, inner))
+        while body and not body[-1][1]:
+            body.pop()
+        out = []
+        pending = None
+        texts = [t for _, t in body]
+        for idx, (level, text) in enumerate(body):
+            rest = "\n".join(texts[idx + 1:]) if idx + 1 < len(texts) else None
+            rendered, pending = _md_inline(text, MD_QUOTE_STYLE, pending, rest)
+            if not text:
+                out.append("")           # blank between quoted paragraphs
+            else:
+                out.append(MD_QUOTE_BAR * level + MD_QUOTE_STYLE + rendered + R)
+        return out
+
+    def _render_styled(self, lines, base):
+        """Render block lines in one base style, carrying open emphasis across
+        the lines of a wrapped paragraph.
+        """
+        out = []
+        pending = None
+        for idx, line in enumerate(lines):
+            rest = "\n".join(lines[idx + 1:]) if idx + 1 < len(lines) else None
+            rendered, pending = _md_inline(line, base, pending, rest)
+            out.append(base + rendered + R)
+        return out
     def _plugin_option(self, name, modes, default):
         if weechat is None:
             return default
@@ -1251,6 +1713,9 @@ class Bridge(object):
             # state from the old connection must not leak into new messages
             self._md_msg = None
             self._md_fence = None
+            self._flush_md_block()   # never strand a half-built block on screen
+            self._md_block_done()
+            self._md_blank_owed = False
             # no live peer left to answer a pending prompt, and tool calls
             # from the old connection will never be completed on this one
             self.pending_ui = None
@@ -1402,7 +1867,8 @@ class Bridge(object):
                             "pi", THINK_NICK)
             return
         if t == "assistant_flush":
-            return  # lines already complete; nothing to render
+            self._flush_md_block()   # the message is over: print what is pending
+            return
         if t == "tool_start":
             name = msg.get("toolName") or "tool"
             nick = self._remember_tool(msg.get("toolCallId"), name)
@@ -1653,6 +2119,20 @@ class Bridge(object):
                 self._print(C_ERR + "unknown highlight mode: %s (on | off)%s"
                             % (arg, R))
             return
+        if line == "!markdown":
+            self._print(C_STATUS + "markdown rendering: %s (!markdown on|off)%s" % (
+                "on" if self.markdown_enabled() else "off", R))
+            return
+        if line.startswith("!markdown "):
+            arg = line[10:].strip().lower()
+            if arg in MARKDOWN_MODES:
+                self._flush_md_block()  # pending text keeps the mode it started in
+                self._set_plugin_option("markdown", arg)
+                self._print(C_STATUS + "markdown rendering: %s%s" % (arg, R))
+            else:
+                self._print(C_ERR + "unknown markdown mode: %s (on | off)%s"
+                            % (arg, R))
+            return
         # buffer-local control commands → protocol 'command' messages
         command_map = {
             "!new": "new_session",
@@ -1842,6 +2322,10 @@ def pi_config_cb(data, option, *args):
                                     "%s (%s)%s" % (new, err, R))
             else:
                 BRIDGE._print(C_STATUS + "tcp listener stopped%s" % R)
+    if name == "markdown":
+        # /set changed the mode under WeeChat's hands; whatever is buffered was
+        # built under the old one, so print it before the switch takes effect
+        BRIDGE._flush_md_block()
     if name in ("tcp_listen", "token"):
         BRIDGE.config_warnings()
     return weechat.WEECHAT_RC_OK

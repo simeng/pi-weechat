@@ -119,8 +119,38 @@ Open the `pi` buffer:
     back in the body (the pre-`!nick` look — except that its ✔/✘ line now
     names the tool that ran instead of the literal `tool`). Also settable via
     `/set plugins.var.python.pi_bridge.nicks auto|pi`
+  - `!markdown [on|off]` — render assistant markdown in the buffer (below). On by default; also settable via `/set plugins.var.python.pi_bridge.markdown on|off`
 - Prompts you type directly in pi's own terminal are echoed into the buffer too,
   so both surfaces stay in sync.
+### Markdown rendering
+
+Assistant text is rendered as markdown, block by block (on by default; see
+`!markdown` above for the switch):
+
+- **Headings** — `#`…`######` and setext underlines: magenta, tiered by level
+  (h1 bold + underline, h2 bold, deeper levels dimmer); markers are stripped.
+- **Emphasis** — `**bold**` / `*italic*` (and `_`/`__` variants) map to WeeChat
+  bold/italic; markers that do not close, and emphasis inside words
+  (`snake_case`), stay literal. There is no strikethrough attribute, so
+  `~~strike~~` passes through as text.
+- **Inline code** — `` `code` `` renders in yellow with the backticks stripped.
+- **Lists** — `-`/`*`/`+` items become `•` (then `◦`, `▪` as they nest); ordered
+  items keep their number; an item's unmarked continuation line hangs under its
+  text.
+- **Blockquotes** — `>` lines get a `│` bar (two for nested quotes) and a dimmed
+  body; a quote survives the blank lines between its paragraphs.
+- **Horizontal rules** — `---` / `***` / `___` alone on a line draw a fixed
+  20-column `─` rule (v1 does not query the window width, so nothing is padded
+  to a guessed width; the renderer never hard-wraps long lines).
+
+Fenced code blocks stream through as before (line by line, syntax-highlighted)
+and are the only assistant construct that never waits. Everything else is
+buffered until its block is complete, so a paragraph appears a moment after it
+streams — tool lines, thinking lines, and status lines always cut in at the
+right place, and switching `!markdown` off prints subsequent text exactly as pi
+wrote it (markers included) without re-rendering what is already on screen.
+
+Links, tables, and other constructs pass through as plain text in v1.
 
 ### pi-side config (`~/.pi/agent/pi-weechat.json`)
 

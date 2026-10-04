@@ -822,6 +822,14 @@ export default function weechatBridge(pi: ExtensionAPI) {
     bufs.set(key, "");
   }
 
+  // A one-off note the bridge itself emits (not part of a pi message). The
+  // buffer renders assistant text as blocks, so a note needs its own flush —
+  // otherwise it would sit unseen until the next pi message ends.
+  function sendNote(text: string): void {
+    send({ type: "assistant_line", msgId: 0, text });
+    send({ type: "assistant_flush", msgId: 0 });
+  }
+
   pi.on("message_start", async (event) => {
     const msg = event.message as any;
     if (msg?.role === "assistant") {
@@ -926,13 +934,13 @@ export default function weechatBridge(pi: ExtensionAPI) {
             ctx.compact({
               onComplete: () => {
                 send({ type: "status", state: "idle" });
-                send({ type: "assistant_line", msgId: 0, text: "(compaction complete)" });
+                sendNote("(compaction complete)");
               },
               onError: (err) => {
                 send({ type: "error", code: "compact_failed", message: String(err?.message ?? err) });
               },
             });
-            send({ type: "assistant_line", msgId: 0, text: "(compaction started…)" });
+            sendNote("(compaction started…)");
             return;
           case "status":
             sendSessionInfo(ctx);
@@ -990,7 +998,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
               return;
             }
             if (models.length === 0) {
-              send({ type: "assistant_line", msgId: 0, text: "(no available models)" });
+              sendNote("(no available models)");
             } else {
               for (const m of models) {
                 const label = `${m.provider ?? ""}/${m.id ?? "?"}`;
@@ -1002,6 +1010,8 @@ export default function weechatBridge(pi: ExtensionAPI) {
                   text: `model: ${label}${current ? "  (current)" : ""}`,
                 });
               }
+              // the list is one block: flush it once, after the last entry
+              send({ type: "assistant_flush", msgId: 0 });
             }
             return;
           }
@@ -1189,7 +1199,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
 
     if (outcome.kind === "fallback") return; // local TUI takes over
     if (outcome.kind === "cancelled") {
-      send({ type: "assistant_line", msgId: 0, text: "(question cancelled)" });
+      sendNote("(question cancelled)");
       return {
         block: true,
         reason:
@@ -1197,7 +1207,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
       };
     }
     const summary = formatPickSummary(outcome.value);
-    send({ type: "assistant_line", msgId: 0, text: `(question answered: ${summary})` });
+    sendNote(`(question answered: ${summary})`);
     return { block: true, reason: `User answered: ${summary} (via WeeChat !pick)` };
   });
 
@@ -1405,7 +1415,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
     const choice = await askWeechatUI({ method: "select", title, options });
     send({ type: "status", state: busy ? "thinking" : "idle" });
     if (!choice || (Array.isArray(choice) && choice.length === 0)) {
-      send({ type: "assistant_line", msgId: 0, text: "(cd cancelled)" });
+      sendNote("(cd cancelled)");
       return;
     }
     const picked = Array.isArray(choice) ? choice[0] : choice;
@@ -1456,7 +1466,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
       },
     });
     if (result?.cancelled) {
-      send({ type: "assistant_line", msgId: 0, text: "(cd cancelled)" });
+      sendNote("(cd cancelled)");
     }
   }
 }
