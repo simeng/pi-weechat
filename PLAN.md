@@ -239,8 +239,9 @@ Design:
     accumulated into a block (paragraph, list, quote, heading, rule, setext)
     and printed when the block completes, so the renderer sees the whole
     construct: ATX/setext headings (magenta, tiered by level), bold/italic
-    (`**`/`*` with backslash escapes, no in-word emphasis), yellow inline
-    code, bulleted lists (`•`/`◦`/`▪`, hanging continuation), `│`-barred dim
+    (`**`/`*` with backslash escapes, no in-word emphasis), ~~strikethrough~~
+    via a per-character U+0336 combining stroke overlay (no WeeChat attribute
+    exists for it), yellow inline code, bulleted lists (`•`/`◦`/`▪`, hanging continuation), `│`-barred dim
     quotes, and a fixed 20-column `─` rule (v1 does not query the window
     width, so nothing is padded and the renderer never hard-wraps). A block
     remembers the mode it started under, so a live `!markdown` toggle never

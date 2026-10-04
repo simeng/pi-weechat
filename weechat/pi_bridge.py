@@ -515,11 +515,15 @@ def _md_list_items(lines):
     return items
 
 
-# Inline markdown: emphasis and code. Backslash escapes, and markers that do
-# not open a span stay literal (including ~~strikethrough~~ — WeeChat has no
-# attribute for it).
+# Inline markdown: emphasis, code, strikethrough. Backslash escapes, and
+# markers that do not open a span stay literal.
 _MD_ESCAPES = set("\\`*_{}[]()#+-.!>~")
 _MD_ATTR = {"**": A_BOLD, "__": A_BOLD, "*": A_ITALIC, "_": A_ITALIC}
+# Strikethrough: WeeChat has no attribute for it, so ~~text~~ renders each
+# character with a combining long stroke overlay (U+0336). Zero width, so
+# wrapping and columns are unaffected; rendering depends on the font.
+MD_STRIKE = "\u0336"
+MD_STRIKE_PENDING = "~~\x00"      # open ~~ carried to the next line
 
 
 def _md_word_char(ch):
@@ -551,7 +555,12 @@ def _md_close(text, start, delim):
     return -1
 
 
-def _md_inline(text, base="", pending=None, lookahead=None):
+def _md_stroke(text, strike):
+    """Overlay the combining stroke on every character, or leave the text."""
+    return "".join(ch + MD_STRIKE for ch in text) if strike else text
+
+
+def _md_inline(text, base="", pending=None, lookahead=None, strike=False):
     """Render the inline markdown of one line → (printable line, still_open).
 
     `base` is the enclosing style (color codes then attribute codes) that is
@@ -561,23 +570,31 @@ def _md_inline(text, base="", pending=None, lookahead=None):
     next line inherits. A marker only stays open across a line break when
     `lookahead` (the rest of the block) actually closes it — otherwise it is
     printed literally, which is what markdown does with `**unclosed`.
+    `strike` marks text inside an open ~~span~~: every printed character gets
+    the combining stroke overlay, style codes never do.
     """
     out = []
 
     if pending:
-        style = base + _MD_ATTR[pending]
-        close = _md_close(text, 0, pending)
+        delim = pending.replace("\x00", "")
+        strike = strike or "\x00" in pending
+        # emphasis keeps its attribute while open; a strike span has none
+        # (the overlay rides on the characters themselves)
+        style = base if strike else base + _MD_ATTR[delim]
+        close = _md_close(text, 0, delim)
         if close < 0:
-            return style + _md_inline(text, style)[0], pending
-        inner = _md_inline(text[:close], style)[0]
+            # the span still runs on: the whole line belongs to it
+            inner = _md_inline(text, style, None, None, strike)[0]
+            return style + inner, pending
+        inner = _md_inline(text[:close], style, None, None, strike)[0]
         out.append(style + inner + base)
-        text = text[close + len(pending):]
+        text = text[close + len(delim):]
 
     i, n = 0, len(text)
     while i < n:
         ch = text[i]
         if ch == "\\" and i + 1 < n and text[i + 1] in _MD_ESCAPES:
-            out.append(text[i + 1])   # \* \_ \` … print the marker itself
+            out.append(_md_stroke(text[i + 1], strike))
             i += 2
             continue
         if ch == "`":
@@ -592,14 +609,29 @@ def _md_inline(text, base="", pending=None, lookahead=None):
                 continue
             # color first, then the outer style again: inline code must not
             # swallow the bold/italic it sits inside
-            out.append(C_CODE + text[j:close] + base)
+            out.append(C_CODE + _md_stroke(text[j:close], strike) + base)
             i = close + len(fence)
             continue
         two = text[i:i + 2]
+        if two == "~~":
+            close = _md_close(text, i + 2, "~~")
+            if close >= 0:
+                inner = _md_inline(text[i + 2:close], base, None, None, True)[0]
+                out.append(base + inner + base)
+                i = close + 2
+                continue
+            if lookahead is not None and _md_close(lookahead, 0, "~~") >= 0:
+                # the rest of this line is inside the new span: stroke it
+                tail = _md_stroke(text[i + 2:], True)
+                return "".join(out) + tail, MD_STRIKE_PENDING
+            out.append(two)           # literal: consume both tildes
+            i += 2
+            continue
         if two in ("**", "__") and not _md_mid_word(text, i, 2):
             close = _md_close(text, i + 2, two)
             if close >= 0:
-                inner = _md_inline(text[i + 2:close], base + _MD_ATTR[two])[0]
+                inner = _md_inline(text[i + 2:close], base + _MD_ATTR[two],
+                                   None, None, strike)[0]
                 out.append(base + _MD_ATTR[two] + inner + base)
                 i = close + 2
                 continue
@@ -613,13 +645,14 @@ def _md_inline(text, base="", pending=None, lookahead=None):
         if ch in "*_" and not _md_mid_word(text, i, 1):
             close = _md_close(text, i + 1, ch)
             if close >= 0:
-                inner = _md_inline(text[i + 1:close], base + _MD_ATTR[ch])[0]
+                inner = _md_inline(text[i + 1:close], base + _MD_ATTR[ch],
+                                   None, None, strike)[0]
                 out.append(base + _MD_ATTR[ch] + inner + base)
                 i = close + 1
                 continue
             if lookahead is not None and _md_close(lookahead, 0, ch) >= 0:
                 return ("".join(out) + base + _MD_ATTR[ch] + text[i + 1:], ch)
-        out.append(ch)
+        out.append(_md_stroke(ch, strike))
         i += 1
     return "".join(out), None
 

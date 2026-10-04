@@ -288,6 +288,7 @@ def main() -> int:
         for text in [
             "# Markdown heading",
             "Some **bold**, some *italic*, and `inline code` together.",
+            "One ~~struck~~ line.",
             "",
             "- first item",
             "  lazy continuation of the first item",
@@ -345,6 +346,11 @@ def main() -> int:
                              len(emph) == 1 and "\x1a\x01" in emph[0]["message_raw"]
                              and "\x1a\x03" in emph[0]["message_raw"]
                              and "\x19" in emph[0]["message_raw"]))
+        struck = [r for r in pi if "\u0336" in r["message"]]
+        results.append(check("strikethrough renders as the combining stroke overlay",
+                             len(struck) == 1
+                             and struck[0]["message"].startswith("One ")
+                             and "~~" not in struck[0]["message"]))
         results.append(check("list markers become bullets and the continuation hangs under them",
                              any(r["message"].startswith("\u2022 first item") for r in pi)
                              and any(r["message"].startswith("  lazy continuation") for r in pi)))

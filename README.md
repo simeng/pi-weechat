@@ -131,8 +131,9 @@ Assistant text is rendered as markdown, block by block (on by default; see
   (h1 bold + underline, h2 bold, deeper levels dimmer); markers are stripped.
 - **Emphasis** — `**bold**` / `*italic*` (and `_`/`__` variants) map to WeeChat
   bold/italic; markers that do not close, and emphasis inside words
-  (`snake_case`), stay literal. There is no strikethrough attribute, so
-  `~~strike~~` passes through as text.
+  (`snake_case`), stay literal.
+- **Strikethrough** — `~~text~~` overlays each character with a combining
+  stroke (U+0336); zero extra width, rendering depends on the font.
 - **Inline code** — `` `code` `` renders in yellow with the backticks stripped.
 - **Lists** — `-`/`*`/`+` items become `•` (then `◦`, `▪` as they nest); ordered
   items keep their number; an item's unmarked continuation line hangs under its

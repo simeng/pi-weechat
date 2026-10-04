@@ -1135,8 +1135,25 @@ def main():
     assert mdi("snake_case_words and a*b*c") == ("snake_case_words and a*b*c", None), \
         "emphasis inside words stays literal"
     assert mdi("**unclosed") == ("**unclosed", None), "unclosed marker stays literal"
-    assert mdi("~~strike~~") == ("~~strike~~", None), \
-        "WeeChat has no strikethrough attribute: left alone"
+    S = "\u0336"   # combining long stroke overlay
+    def stroked(t):
+        return "".join(c + S for c in t)
+    assert mdi("~~strike~~") == (stroked("strike"), None), \
+        "strikethrough: each character gets the combining stroke"
+    assert mdi("a ~~gone~~ b") == ("a " + stroked("gone") + " b", None)
+    assert mdi("**bold ~~strike~~ tail**") == (
+        BOLD + "bold " + BOLD + stroked("strike") + BOLD + " tail", None), \
+        "strike inside bold, bold restored after it"
+    assert mdi("~~bold **inner** end~~") == (
+        stroked("bold ") + BOLD + stroked("inner") + stroked(" end"), None), \
+        "strike over emphasis: the stroke hits text, never the style codes"
+    assert mdi("~~unclosed") == ("~~unclosed", None), "unclosed ~~ stays literal"
+    assert mdi("2~~3") == ("2~~3", None), "no closing ~~: the tildes stay literal"
+    assert mdi("text ~~gone that", "", None, "spans lines~~") == (
+        "text " + stroked("gone that"), ns["MD_STRIKE_PENDING"]), \
+        "strike opened on one line strokes the rest of it"
+    assert mdi("spans lines~~", "", ns["MD_STRIKE_PENDING"]) == (
+        stroked("spans lines"), None), "and closes on the next line"
     assert mdi("a \\*b \\_c \\`d") == ("a *b _c `d", None), "backslash escapes the marker"
 
     # emphasis that wraps across the lines of one paragraph
