@@ -7,16 +7,18 @@
 # extensions/weechat-bridge.ts) connects to it. Wire format: NDJSON, see
 # PLAN.md §2.
 
-# Rendering is role-based: pi-originated lines (assistant text, thinking,
-# tools) render under the nick `pi`; user lines (buffer input, pi-terminal
-# echoes) under the user's IRC nick — first entry of
-# irc.server_default.nicks, re-applied live via hook_config; system lines
-# stay prefix-less (channel-notice style).
+# Rendering is role-based: pi-originated lines render under a nick that names
+# *who* spoke — the tool name (`read`, `bash`, …) on tool lines, `think` on
+# thinking lines, `pi` on assistant text (pi_bridge.nicks = auto; `pi` restores
+# the single `pi` nick) — each colored with WeeChat's own per-nick color.
+# User lines (buffer input, pi-terminal echoes) render under the user's IRC
+# nick — first entry of irc.server_default.nicks, re-applied live via
+# hook_config; system lines stay prefix-less (channel-notice style).
 #
 # Transports (one client at a time, across both):
 #   * Unix socket — always on. Path: $PI_WEECHAT_SOCK, else
 #     $XDG_RUNTIME_DIR/pi-weechat.sock, else ~/.local/state/pi-weechat/.
-#   * TCP — opt-in via `/set pi_bridge.tcp_listen host:port` (live rebind,
+#   * TCP — opt-in via `/set plugins.var.python.pi_bridge.tcp_listen host:port` (live rebind,
 #     no reload). For remote pi; the TCP listener mirrors the design of
 #     WeeChat's own urlserver.py (blocking listen fd, one accept() per
 #     event, SO_REUSEADDR, listen(5)).
@@ -143,6 +145,25 @@ C_REJECT = _color("red")                             # auth failures / security
 # collapsing back onto chat_host/cyan and looking identical to thinking).
 C_TOOL_OUT = _color("blue")
 R = _color("reset")
+
+
+def _nick_color(nick):
+    """Inline color for a nick prefix: WeeChat's own per-nick assignment.
+
+    info_get("nick_color_name", nick) hashes the nick against
+    weechat.color.chat_nick_colors (honoring look.nick_color_hash and
+    look.nick_color_force). The name is turned into a color code because tags
+    alone do NOT color a nick printed by a script — the color has to ride in
+    the text. Falls back to C_NICK (theme chat_nick) when the lookup is
+    unavailable (older WeeChat, or the test stub).
+    """
+    if weechat is None:
+        return C_NICK
+    try:
+        name = weechat.info_get("nick_color_name", nick) or ""
+    except Exception:
+        name = ""
+    return _color(name) or C_NICK
 
 # --------------------------------------------- syntax highlighting (fences)
 
@@ -387,9 +408,34 @@ DEFAULT_THINKING = "off"
 HIGHLIGHT_MODES = ("on", "off")
 DEFAULT_HIGHLIGHT = "on"
 
+# Nick column mode (pi_bridge.nicks option): auto = tool name on tool lines,
+# think on thinking lines, pi on replies; pi = every pi-side line under the
+# single nick `pi` (the legacy rendering).
+NICK_MODES = ("auto", "pi")
+DEFAULT_NICKS = "auto"
+THINK_NICK = "think"
+NICK_MAX_LEN = 32
+TOOL_NICK_MAP_MAX = 256  # toolCallId→nick map cap (a turn never needs more)
+_NICK_BAD_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _nick_for(raw):
+    """Sanitize a nick so it is safe as both prefix field and tag name.
+
+    The nick is the text before the first TAB *and* part of the nick_<name>
+    tag, so it must hold no TAB (breaks the prefix split) and no space or
+    comma (breaks the tag list). Anything outside [A-Za-z0-9_.-] collapses to
+    "_", the result is capped at NICK_MAX_LEN, and blank or non-string input
+    (a missing toolName) falls back to `pi`.
+    """
+    if not isinstance(raw, str):
+        return "pi"
+    nick = _NICK_BAD_CHARS.sub("_", " ".join(raw.split()).strip())
+    return nick[:NICK_MAX_LEN] or "pi"
+
 # Config options: (name, default, description). Defaults are applied on
 # first load; descriptions registered via config_set_desc_plugin and shown
-# by /help set pi_bridge.<name>.
+# by /help set plugins.var.python.pi_bridge.<name>.
 PLUGIN_OPTIONS = (
     ("tcp_listen", "",
      'TCP listener address, "host:port" (e.g. "127.0.0.1:52311"; '
@@ -413,6 +459,10 @@ PLUGIN_OPTIONS = (
      'Show pi\'s thinking lines: on | off.'),
     ("highlight", DEFAULT_HIGHLIGHT,
      'Syntax-highlight fenced code blocks in pi\'s replies: on | off.'),
+    ("nicks", DEFAULT_NICKS,
+     'Who the nick column names: auto (tool name on tool lines, "think" on '
+     'thinking lines, "pi" on replies) | pi (every pi-side line under the '
+     'single nick "pi"). Nick colors come from weechat.color.chat_nick_colors.'),
 )
 
 HELP_TEXT = (
@@ -424,6 +474,7 @@ HELP_TEXT = (
     "!tools [full|summary|off] tool output verbosity (default: summary)\n"
     "!think [on|off] show/hide thinking lines (default: off)\n"
     "!highlight [on|off] syntax-highlight fenced code blocks (default: on)\n"
+    "!nick [auto|pi] nick column: tool names vs just “pi” (default: auto)\n"
     "anything else is sent to pi as a normal message"
 )
 
@@ -568,6 +619,10 @@ class Bridge(object):
         self._md_fence = None         # open fence dict (see _fence_open), or None
         # pending interactive prompt from pi (ui_request); answered via !pick
         self.pending_ui = None        # {id, method, options, multiple}, or None
+        # toolCallId → nick, learned from tool_start: tool_end carries no
+        # toolName on the wire, so the mapping is what lets the result line
+        # (and its output body) keep the same nick as the call that started it
+        self.tool_nicks = {}          # bounded by TOOL_NICK_MAP_MAX (see _remember_tool)
         # Timing comes from the pi extension; WeeChat only advances a received
         # active snapshot between lifecycle updates for title redraws.
         self.timing_snapshot = None
@@ -645,16 +700,19 @@ class Bridge(object):
             weechat.buffer_set(self.buffer, "localvar_unset_nick", "")
 
 
-    def _print_msg(self, text, role):
+    def _print_msg(self, text, role, nick=None):
         """Render one line for a role (message body colors unchanged).
 
-        'pi'   → prnt_date_tags, tags notify_none,prefix_nick_chat_nick, and
-                 `pi` as the line prefix (the text before the first TAB, the
-                 way the IRC plugin emits nicks): the prefix column shows the
-                 nick `pi` (theme chat_nick color), with WeeChat's nick
-                 brackets and same-nick prefix hiding applied. notify_none:
-                 no line-level notification — only the turn-settle `[x]
-                 ready!` banner (notify_highlight) pings the user.
+        'pi'   → prnt_date_tags, notify_none, and the nick as the line prefix
+                 (the text before the first TAB, the way the IRC plugin emits
+                 nicks). `nick` names *who* spoke — a tool name ("read",
+                 "bash") or "think" when pi_bridge.nicks is auto; ignored (and
+                 `pi` used) when it is `pi`. The nick is colored with WeeChat's
+                 own per-nick color (_nick_color); tags carry the identity
+                 (nick_<name>) plus today's prefix_nick_chat_nick, which is
+                 what applies WeeChat's nick brackets and same-nick handling.
+                 notify_none: no line-level notification — only the turn-settle
+                 `[x] ready!` banner (notify_highlight) pings the user.
         'user' → prnt_date_tags, tag prefix_nick_chat_nick_self (+ self_msg
                  like the IRC plugin's own echoes), the user's IRC nick as
                  prefix (chat_nick_self color). Empty nick ⇒ legacy
@@ -668,10 +726,17 @@ class Bridge(object):
         # for relay clients (the no-leading-tab rule of _print is untouched).
         if role == "pi":
             if self.alive and self.buffer:
-                weechat.prnt_date_tags(
-                    self.buffer, int(time.time()),
-                    "notify_none,prefix_nick_chat_nick",
-                    C_NICK + "pi" + R + "\t" + text)
+                if self.nicks_mode() == "auto":
+                    who = nick or "pi"
+                    weechat.prnt_date_tags(
+                        self.buffer, int(time.time()),
+                        "notify_none,nick_%s,prefix_nick_chat_nick" % who,
+                        _nick_color(who) + who + R + "\t" + text)
+                else:
+                    weechat.prnt_date_tags(
+                        self.buffer, int(time.time()),
+                        "notify_none,prefix_nick_chat_nick",
+                        C_NICK + "pi" + R + "\t" + text)
         elif role == "user":
             nick = _user_nick()
             if nick:
@@ -777,7 +842,7 @@ class Bridge(object):
                         "pi_bridge.token still contains a ${…} reference — it "
                         "was not expanded. Store the secret with "
                         "/secure set pi_weechat_token <token> and use "
-                        "/set pi_bridge.token \"${sec.data.pi_weechat_token}\""
+                        "/set plugins.var.python.pi_bridge.token \"${sec.data.pi_weechat_token}\""
                         + R)
         if self._opt("tcp_listen") and not token:
             self._print(C_ERR +
@@ -797,6 +862,25 @@ class Bridge(object):
         """pi_bridge.highlight option: on | off."""
         return self._plugin_option("highlight", HIGHLIGHT_MODES,
                                    DEFAULT_HIGHLIGHT) == "on"
+
+    def nicks_mode(self):
+        """pi_bridge.nicks option: auto (tool/think/pi nicks) | pi (legacy)."""
+        return self._plugin_option("nicks", NICK_MODES, DEFAULT_NICKS)
+
+    def _remember_tool(self, call_id, name):
+        """Learn toolCallId → nick so the result line can reuse it.
+
+        tool_end has no toolName on the wire, so the nick of a tool's ✔/✘
+        line and of its output body has to come from the tool_start that
+        opened the call. The map is capped: an id that never completes (an
+        aborted turn) must not grow it without bound.
+        """
+        nick = _nick_for(name)
+        if call_id is not None:
+            self.tool_nicks[call_id] = nick
+            while len(self.tool_nicks) > TOOL_NICK_MAP_MAX:
+                self.tool_nicks.pop(next(iter(self.tool_nicks)))
+        return nick
 
     # ------------------------------------------------ markdown code blocks
 
@@ -1167,8 +1251,10 @@ class Bridge(object):
             # state from the old connection must not leak into new messages
             self._md_msg = None
             self._md_fence = None
-            # no live peer left to answer a pending prompt
+            # no live peer left to answer a pending prompt, and tool calls
+            # from the old connection will never be completed on this one
             self.pending_ui = None
+            self.tool_nicks = {}
             # Drop the last timing snapshot while disconnected. The extension
             # will send a fresh Pi-owned snapshot after the next handshake.
             self.timing_snapshot = None
@@ -1312,23 +1398,38 @@ class Bridge(object):
         if t == "thinking_line":
             if not self.thinking_enabled():
                 return  # hidden; the line is dropped entirely
-            self._print_msg(C_DIM + "\U0001F4AD " + msg.get("text", "") + R, "pi")
+            self._print_msg(C_DIM + "\U0001F4AD " + msg.get("text", "") + R,
+                            "pi", THINK_NICK)
             return
         if t == "assistant_flush":
             return  # lines already complete; nothing to render
         if t == "tool_start":
-            name = msg.get("toolName", "?")
+            name = msg.get("toolName") or "tool"
+            nick = self._remember_tool(msg.get("toolCallId"), name)
             summary = format_tool_args(name, msg.get("args") or {})
-            self._print_msg(C_TOOL + "⚙ " + name + C_DIM +
-                            (" " + summary if summary else "") + R, "pi")
+            # auto: the nick column already names the tool, so the body is just
+            # glyph + args. pi mode: keep the name in the body (legacy look).
+            body = C_TOOL + "⚙"
+            if self.nicks_mode() != "auto":
+                body += " " + name
+            if summary:
+                body += C_DIM + " " + summary
+            self._print_msg(body + R, "pi", nick)
             return
         if t == "tool_end":
+            # tool_end carries no toolName on the wire: the nick comes back
+            # from the tool_start that opened this call (`tool` if that start
+            # was never seen — e.g. a reconnect in the middle of a tool).
+            # Legacy (`pi`) mode labels the line with that same nick, where
+            # before this option it always printed the literal "tool".
+            nick = self.tool_nicks.pop(msg.get("toolCallId"), None) or "tool"
             ok = not msg.get("isError")
             color = C_OK if ok else C_ERR
-            self._print_msg(color + ("✔ " if ok else "✘ ") +
-                            (msg.get("toolName", "tool") or "tool") + R, "pi")
+            glyph = "✔" if ok else "✘"
+            label = "" if self.nicks_mode() == "auto" else " " + nick
+            self._print_msg(color + glyph + label + R, "pi", nick)
             for line in self._tool_output_lines(msg.get("output")):
-                self._print_msg(C_TOOL_OUT + "  " + line + R, "pi")
+                self._print_msg(C_TOOL_OUT + "  " + line + R, "pi", nick)
             return
         if t == "ui_request":
             self._handle_ui_request(msg)
@@ -1511,6 +1612,19 @@ class Bridge(object):
                 self._print(C_STATUS + "tool output mode: %s%s" % (arg, R))
             else:
                 self._print(C_ERR + "unknown tool output mode: %s (full | summary | off)%s"
+                            % (arg, R))
+            return
+        if line == "!nick":
+            self._print(C_STATUS + "nick mode: %s (auto | pi)%s"
+                        % (self.nicks_mode(), R))
+            return
+        if line.startswith("!nick "):
+            arg = line[6:].strip().lower()
+            if arg in NICK_MODES:
+                self._set_plugin_option("nicks", arg)
+                self._print(C_STATUS + "nick mode: %s%s" % (arg, R))
+            else:
+                self._print(C_ERR + "unknown nick mode: %s (auto | pi)%s"
                             % (arg, R))
             return
         if line == "!think":
@@ -1762,10 +1876,10 @@ def main():
                      "mirror a pi coding agent session through a WeeChat buffer",
                      "pi_shutdown_cb", "")
     # plugin options: PLUGIN_OPTIONS = (name, default, description).
-    # Defaults are auto-created on first run (/set pi_bridge.<name> …).
+    # Defaults are auto-created on first run (/set plugins.var.python.pi_bridge.<name> …).
     # WeeChat options only — no env-var fallback on this side; ${sec.data.x}
     # references are expanded by WeeChat at read time. Descriptions feed
-    # /help set pi_bridge.<name> (config_set_desc_plugin, spotify.py pattern).
+    # /help set plugins.var.python.pi_bridge.<name> (config_set_desc_plugin, spotify.py pattern).
     for name, default, description in PLUGIN_OPTIONS:
         if not weechat.config_is_set_plugin(name):
             weechat.config_set_plugin(name, default)

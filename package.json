@@ -11,6 +11,7 @@
     "test": "node --experimental-strip-types --test \"test/*.test.mjs\" && python3 test/smoke_weechat.py",
     "test:js": "node --experimental-strip-types --test \"test/*.test.mjs\"",
     "test:py": "python3 test/smoke_weechat.py",
+    "test:real": "python3 test/real_weechat.py",
     "typecheck": "tsc -p tsconfig.json"
   },
   "pi": {

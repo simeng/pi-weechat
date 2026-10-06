@@ -4,6 +4,7 @@ Mirror a [pi](https://pi.dev) coding agent session into a WeeChat buffer — and
 
 - **WeeChat side**: Python script that creates a `pi` buffer and serves an NDJSON protocol (the _server_): always on a Unix socket, optionally also on TCP with shared-secret auth.
 - **pi side**: TypeScript extension installed as a pi package; dials as _client_, mirrors assistant output / tool calls / status into the buffer, and forwards lines you type back to pi as user input.
+- **Nick column**: every pi-side line is printed under the nick that names *who* spoke — tool calls under their own tool name (`read`, `bash`, `memory_search`), thinking under `think`, replies under `pi` — each colored by WeeChat's own per-nick color. `!nick pi` restores the single legacy `pi` nick.
 
 Architecture and wire protocol: [PLAN.md](./PLAN.md).
 
@@ -66,7 +67,7 @@ Open the `pi` buffer:
   blocks are syntax-highlighted inline (bash/sh, rust, css, html/xml/svg,
   php, python, json, yaml; unknown languages render plain but keep their
   indent), with dim fence markers; toggle via `!highlight` or
-  `/set pi_bridge.highlight off`. Tool calls show as
+  `/set plugins.var.python.pi_bridge.highlight off`. Tool calls show as
   `⚙ name` + the main content of the call (bash: command, read/write: path,
   edit: path + edit count, memory tools: target/query/content — long values
   are clipped at 300 chars with a `…(+N)` marker), with indented results
@@ -106,12 +107,18 @@ Open the `pi` buffer:
   - `!pick …` — answer a numbered list / prompt in the buffer: the `!cd` fuzzy match, decision questions from ask_user-style tools (below), or any other interactive prompt: `!pick <n>` (or `!pick 1,3` for multiple), or the exact option text; `!pick cancel` aborts
   - `!tools [full|summary|off]` — tool output verbosity in the buffer
     (`summary` is the default: first/last 3 lines, middle elided like a smart
-    filter; also settable via `/set pi_bridge.tool_output …`)
+    filter; also settable via `/set plugins.var.python.pi_bridge.tool_output …`)
   - `!think [on|off]` — show/hide the model's thinking lines (rendered dim,
     prefixed with 💭). Off by default; also settable via
-    `/set pi_bridge.thinking on`
+    `/set plugins.var.python.pi_bridge.thinking on`
   - `!highlight [on|off]` — syntax-highlight fenced code blocks in assistant
-    messages. On by default; also settable via `/set pi_bridge.highlight off`
+    messages. On by default; also settable via `/set plugins.var.python.pi_bridge.highlight off`
+  - `!nick [auto|pi]` — who owns the nick column. `auto` (default): tool lines
+    and their output under the tool name, thinking lines under `think`, replies
+    under `pi`. `pi`: everything pi-side under the single nick `pi`, tool name
+    back in the body (the pre-`!nick` look — except that its ✔/✘ line now
+    names the tool that ran instead of the literal `tool`). Also settable via
+    `/set plugins.var.python.pi_bridge.nicks auto|pi`
 - Prompts you type directly in pi's own terminal are echoed into the buffer too,
   so both surfaces stay in sync.
 
@@ -208,22 +215,22 @@ Inside WeeChat:
 ```
 /secure passphrase <passphrase>            # if not set yet
 /secure set pi_weechat_token <token>       # encrypted into sec.conf
-/set pi_bridge.token "${sec.data.pi_weechat_token}"   # reference, not the secret
-/set pi_bridge.tcp_listen 0.0.0.0:52311    # or a Tailscale IP: e.g. 100.x.y.z:52311
+/set plugins.var.python.pi_bridge.token "${sec.data.pi_weechat_token}"   # reference, not the secret
+/set plugins.var.python.pi_bridge.tcp_listen 0.0.0.0:52311    # or a Tailscale IP: e.g. 100.x.y.z:52311
 ```
 
 The buffer prints `listening on tcp 0.0.0.0:52311 (this host: …) (token required)`
-(address from the real bound socket). `/set pi_bridge.tcp_listen …` **re-binds
+(address from the real bound socket). `/set plugins.var.python.pi_bridge.tcp_listen …` **re-binds
 live** — no `/python reload`; setting it back to empty stops the listener.
 `pi_bridge.token` and `pi_bridge.allowed_ips` apply per connection — no
 restart needed. Optionally restrict who may connect (regex on the peer IP,
 scans are dropped silently):
 
 ```
-/set pi_bridge.allowed_ips "^(192\\.168\\.1\\.20|100\\.64\\..*)$"
+/set plugins.var.python.pi_bridge.allowed_ips "^(192\\.168\\.1\\.20|100\\.64\\..*)$"
 ```
 
-**Do not** set the token literally in the option (`/set pi_bridge.token sekret`)
+**Do not** set the token literally in the option (`/set plugins.var.python.pi_bridge.token sekret`)
 — it would sit in plaintext in `weechat.conf`. The `sec.data` reference keeps
 it in `sec.conf` (encrypted with the sec passphrase); if the reference doesn't
 expand, the buffer prints a loud red warning. An empty `pi_bridge.token` means
@@ -270,7 +277,7 @@ Then (re)start or `/reload` the pi session. The buffer on A shows
 - Assistant text is rendered in whole lines (WeeChat has no partial-line redraw);
   the extension batches token deltas and flushes completed lines.
 - Tool output is truncated to ~8 KiB per result (whole-line boundary, pi side)
-  and can be further filtered in the buffer: `/set pi_bridge.tool_output
+  and can be further filtered in the buffer: `/set plugins.var.python.pi_bridge.tool_output
 full|summary|off` (default `summary`) or `!tools <mode>` from the buffer.
 - Colors follow your **WeeChat theme**: the bridge uses color names from the
   `[color]` section of weechat.conf (`chat_nick_self`, `chat_value`,
@@ -278,7 +285,11 @@ full|summary|off` (default `summary`) or `!tools <mode>` from the buffer.
   restyles the buffer too. Each role has a palette fallback for WeeChat
   versions where a name is missing (mapping in `_theme()` in
   `weechat/pi_bridge.py`). Legacy text tags like `color:cyan` are NOT used —
-  WeeChat 4.x would print them literally.
+  WeeChat 4.x would print them literally. Nicks follow the same rule: each one
+  is colored with WeeChat's own nick color (`info_get("nick_color_name", …)`,
+  hashed out of `weechat.color.chat_nick_colors`, honoring
+  `weechat.look.nick_color_hash` and `nick_color_force`), so `bash`, `read`
+  and `think` get distinct colors the same way IRC nicks do.
 
 ### Debugging the wire
 
@@ -304,11 +315,15 @@ For **remote** setups the marker file only enables the side it sits on; use
 npm test          # node:test suite (codec + extension) + python smoke test
 npm run test:js   # JS tests only (needs Node ≥ 22.18)
 npm run test:py   # weechat script smoke test only (python3, stdlib only)
+npm run test:real # end-to-end nick rendering inside a real weechat-headless
 ```
 
 The integration test spawns the real Python bridge and drives it with the real
 TypeScript extension over a live socket — both transports (Unix and TCP with
-token auth), no mocks on the wire.
+token auth), no mocks on the wire. `test:real` boots an actual WeeChat, autoloads
+`pi_bridge.py`, and asserts on the lines WeeChat itself stored in the buffer
+(nick tags, nick column, per-nick colors) in both `nicks` modes; it skips when
+`weechat-headless` is not installed.
 
 ## Threat model (remote/TCP)
 

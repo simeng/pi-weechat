@@ -334,7 +334,7 @@ test("integration: real extension ↔ real weechat script", async (t) => {
   });
   await mock.fire("message_update", { assistantMessageEvent: { type: "text_end", contentIndex: 0 } });
   await mock.fire("message_end", { message: { role: "assistant" } });
-  await wc.waitFor((m) => m.type === "print" && m.tags === "notify_none,prefix_nick_chat_nick" && m.prefix.includes("pi") && m.text.includes("line one from pi"), "buffer: line one (pi nick prefix)");
+  await wc.waitFor((m) => m.type === "print" && m.tags === "notify_none,nick_pi,prefix_nick_chat_nick" && m.prefix.includes("pi") && m.text.includes("line one from pi"), "buffer: line one (pi nick prefix)");
   await wc.waitFor((m) => m.type === "print" && m.text.includes("line two"), "buffer: line two (tail flush)");
 
   // tool execution renders
@@ -343,8 +343,10 @@ test("integration: real extension ↔ real weechat script", async (t) => {
     toolCallId: "t1", isError: false,
     result: { content: [{ type: "text", text: "127.0.0.1 localhost" }] },
   });
-  await wc.waitFor((m) => m.type === "print" && m.text.includes("read_file"), "buffer: tool start");
-  await wc.waitFor((m) => m.type === "print" && m.text.includes("127.0.0.1 localhost"), "buffer: tool output");
+  await wc.waitFor((m) => m.type === "print" && (m.tags || "").includes("nick_read_file") && m.prefix.includes("read_file") && m.text.includes("/etc/hosts"), "buffer: tool start under the tool nick");
+  await wc.waitFor((m) => m.type === "print" && (m.tags || "").includes("nick_read_file") && m.text.includes("127.0.0.1 localhost"), "buffer: tool output under the tool nick");
+  assert.ok(!wc.lines.some((m) => m.type === "print" && (m.tags || "").includes("nick_read_file") && m.text.includes("read_file")),
+    "auto nick mode keeps the tool name in the nick column, not in the body");
 
   // buffer title tracks state
   await wc.waitFor((m) => m.type === "title" && /read_file/.test(m.text), "title: tool state");
@@ -418,9 +420,21 @@ test("integration: real extension ↔ real weechat script", async (t) => {
     assistantMessageEvent: { type: "thinking_end", contentIndex: 0 },
   });
   await wc.waitFor(
-    (m) => m.type === "print" && m.text.includes("visible pondering"),
-    "buffer: thinking line rendered"
+    (m) => m.type === "print" && (m.tags || "").includes("nick_think") && m.prefix.includes("think") && m.text.includes("visible pondering"),
+    "buffer: thinking line under the think nick"
   );
+
+  // !nick pi → the legacy single `pi` nick, tool name back in the body
+  wc.send({ op: "input", text: "!nick pi" });
+  await wc.waitFor((m) => m.type === "print" && m.text.includes("nick mode: pi"), "buffer: !nick pi confirmed");
+  await mock.fire("tool_execution_start", { toolCallId: "t9", toolName: "bash", args: { command: "uname -a" } });
+  await wc.waitFor(
+    (m) => m.type === "print" && m.tags === "notify_none,prefix_nick_chat_nick"
+      && m.prefix.includes("pi") && m.text.includes("bash") && m.text.includes("uname -a"),
+    "buffer: legacy pi nick with the tool name in the body"
+  );
+  wc.send({ op: "input", text: "!nick auto" });
+  await wc.waitFor((m) => m.type === "print" && m.text.includes("nick mode: auto"), "buffer: back to auto nicks");
 
   // stop the extension cleanly before the child is killed
   await mock.fire("session_shutdown");
@@ -480,7 +494,7 @@ test("integration: real extension ↔ real weechat script over TCP with token", 
   });
   await mock.fire("message_update", { assistantMessageEvent: { type: "text_end", contentIndex: 0 } });
   await mock.fire("message_end", { message: { role: "assistant" } });
-  await wc.waitFor((m) => m.type === "print" && m.tags === "notify_none,prefix_nick_chat_nick" && m.prefix.includes("pi") && m.text.includes("tcp line one"), "buffer: tcp line one (pi nick prefix)");
+  await wc.waitFor((m) => m.type === "print" && m.tags === "notify_none,nick_pi,prefix_nick_chat_nick" && m.prefix.includes("pi") && m.text.includes("tcp line one"), "buffer: tcp line one (pi nick prefix)");
   await wc.waitFor((m) => m.type === "print" && m.text.includes("tcp line two"), "buffer: tcp line two");
 
   // tool execution renders
@@ -489,7 +503,7 @@ test("integration: real extension ↔ real weechat script over TCP with token", 
     toolCallId: "t1", isError: false,
     result: { content: [{ type: "text", text: "Linux tcp-box 6.1" }] },
   });
-  await wc.waitFor((m) => m.type === "print" && m.text.includes("bash"), "buffer: tool start");
+  await wc.waitFor((m) => m.type === "print" && (m.tags || "").includes("nick_bash") && m.prefix.includes("bash") && m.text.includes("uname -a"), "buffer: tool start under the tool nick");
   await wc.waitFor((m) => m.type === "print" && m.text.includes("Linux tcp-box 6.1"), "buffer: tool output");
 
   // user_input round trip over TCP
