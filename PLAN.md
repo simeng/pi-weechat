@@ -103,6 +103,7 @@ the old id). On disconnect, all pending prompts resolve as cancelled.
 |------------------|----------------------------------|------------------------------------------------|
 | `hello`          | `{protocol, name}`               | handshake                                      |
 | `status`         | `{state, detail?}`               | state ∈ idle / thinking / tool:\<name\> / error; drives buffer title + status line |
+| `timing`         | `{runMs, turnMs, turn, turns, runActive, turnActive, runPaused, hasRun}` | Pi-owned elapsed-time snapshot in ms; emitted at run/turn/prompt boundaries and after each bridge handshake. Pi uses a monotonic clock; the WeeChat side advances the snapshot only for live title redraws. `turn` is the 1-based current/last Pi turn number, and `turns` is the count started in this agent run |
 | `assistant_line` | `{msgId, text}`                  | one **complete line** of assistant text. Pi accumulates the `message_update` deltas locally and flushes each line as soon as it is complete (WeeChat has no partial-line redraw, so raw token deltas are meaningless to it) |
 | `thinking_line`  | `{msgId, text}`                  | one **complete line** of assistant *thinking* (reasoning models). Assembled from `thinking_*` deltas exactly like `assistant_line`; the WeeChat side renders it only when `pi_bridge.thinking = on` (`!think`) and drops it otherwise |
 | `assistant_flush`| `{msgId}`                        | this assistant message is done; drop any partial tail state on the WeeChat side |
@@ -237,8 +238,12 @@ Design:
     `session_info` has reported it.
   - `session_info`: one cyan line with cwd + model + session name (cwd also
     stored for the buffer title).
-- **Connection state in the buffer title:** `(idle)`, `(thinking…)`,
-  `(tool: X)`, `(disconnected — waiting for pi)`.
+- **Connection state and timing in the buffer title:** `(idle)`, `(thinking…)`,
+  `(tool: X)`, `(disconnected — waiting for pi)`. Active runs also show
+  `run <elapsed> · <turn elapsed> · turn <N>`; idle shows the last run duration
+  and number of turns started. Pi's zero-based `turnIndex` resets at
+  `agent_start`; Pi UI prompt events pause both clocks on runtimes that emit them,
+  WeeChat `!pick` waits always pause, and tool execution counts as turn time.
 - **Cleanup:** on close callback / WeeChat quit, unhook fd, unlink socket file.
 
 ## 4. Pi side — `extensions/weechat-bridge.ts` (pi package)
@@ -273,7 +278,8 @@ Structure (single file is fine at this size; split if it grows):
   | `message_update`      | `assistant_line` (deltas assembled locally; each completed line flushed immediately) + `assistant_flush` at message end |
   | `message_end`         | `assistant_end` / tool result text       |
   | `tool_execution_*`    | `tool_start` / `tool_end` (output truncated at 8 KiB, whole-line boundary) |
-  | `agent_start`/`agent_settled` | `status{thinking}` / `status{idle}` |
+  | `agent_start`/`agent_settled` | `status{thinking}` / `status{idle}` + timing snapshots |
+  | `turn_start`/`turn_end`, UI prompt boundaries | timing snapshots (pause for UI prompts; turn index from Pi) |
   | `model_select`, `session_info_changed` | `session_info`          |
   | `input` (source ≠ "extension") | `user_echo` (mirror prompts typed in the pi terminal itself, so both surfaces stay in sync) |
 - **Input handling:** on `user_input`, call
@@ -314,8 +320,9 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 - Tool output > 8 KiB is truncated for display but chunked intact if the
   WeeChat side later requests it (`!tool <id>` → fetch full output; v2).
 - If pi reconnects mid-turn, WeeChat prints a `— reconnected —` separator and
-  pi sends a `session_info` + status snapshot; partial assistant text of the
-  in-flight turn is simply re-streamed on next `message_update`.
+  pi sends fresh `session_info`, status, and timing snapshots. The Pi-owned
+  elapsed counters continue from Pi's monotonic state and stop when Pi reports
+  the run inactive; WeeChat does not extrapolate a stale snapshot while disconnected.
 
 ## 6. Security
 

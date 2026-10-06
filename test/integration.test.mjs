@@ -203,13 +203,128 @@ test("integration: real extension ↔ real weechat script", async (t) => {
     "buffer: session line"
   );
 
-  // a prompt typed in pi's terminal (user_echo) marks a request; the 1s tick
-  // (driven by the stub pump) starts the title counter from the current
-  // idle state — real wire, both sides
+  // Echoing a prompt is only a mirror event; timers start with Pi's agent lifecycle,
+  // not from a typed line or a WeeChat control command.
+  const latestTitle = () => wc.lines.filter((m) => m.type === "title").at(-1)?.text ?? "";
+  const titleBeforeEcho = latestTitle();
   await mock.fire("input", { source: "interactive", text: "typed in pi terminal" });
   await wc.waitFor(
-    (m) => m.type === "title" && /\(idle \d+s\)/.test(m.text),
-    "title: idle counter after user_echo (tick-driven)"
+    (m) => m.type === "print" && m.text.includes("typed in pi terminal"),
+    "buffer: echoed pi-terminal prompt"
+  );
+  assert.equal(latestTitle(), titleBeforeEcho, "user_echo must not start the timer");
+
+  // Pi's turnIndex is zero-based, resets at agent_start, and advances across
+  // model turns in one run. Tool work is part of a turn; blocking UI time is not.
+  await mock.fire("agent_start");
+  await mock.fire("turn_start", { turnIndex: 0, timestamp: Date.now() });
+  await wc.waitFor(
+    (m) => m.type === "title" && m.text.includes("run ") && m.text.includes("turn 1"),
+    "title: first model turn started"
+  );
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  const liveTurnTitle = latestTitle();
+  assert.match(liveTurnTitle, / · run \d+s · \d+s · turn 1\)/, liveTurnTitle);
+
+  // Restart the WeeChat-side bridge while Pi remains mid-turn. The next
+  // handshake must repaint the Pi-owned snapshot, not restart the clocks.
+  const runBeforeReconnect = Number(liveTurnTitle.match(/ · run (\d+)s/)?.[1]);
+  const oldChild = wc.child;
+  const oldServerExit = new Promise((resolve) => oldChild.once("exit", resolve));
+  wc.send({ op: "quit" });
+  await oldServerExit;
+  Object.assign(wc, startWeechatSide(sockPath));
+  await wc.waitFor((m) => m.type === "ready", "replacement WeeChat driver ready");
+  await wc.waitFor(
+    (m) => m.type === "title" && m.text.includes("turn 1"),
+    "title: active timing restored after reconnect"
+  );
+  const reconnectedTitle = latestTitle();
+  const runAfterReconnect = Number(reconnectedTitle.match(/ · run (\d+)s/)?.[1]);
+  assert.ok(runAfterReconnect >= runBeforeReconnect, reconnectedTitle);
+
+  await mock.fire("ui_prompt_start", { kind: "select", reason: "ui_prompt" });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const pausedTitle = latestTitle();
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  assert.equal(latestTitle(), pausedTitle, "UI prompt time must pause both clocks");
+  const turnParts = (title) => {
+    const match = title.match(/ · run (\d+)s · (\d+)s · turn 1\)/);
+    return match ? [Number(match[1]), Number(match[2])] : null;
+  };
+  const pausedParts = turnParts(pausedTitle);
+  assert.ok(pausedParts, pausedTitle);
+  const linesBeforeResume = wc.lines.length;
+  await mock.fire("ui_prompt_end", { kind: "select", reason: "ui_prompt" });
+  await wc.waitFor(
+    (m) => {
+      if (m.type !== "title" || wc.lines.indexOf(m) < linesBeforeResume) return false;
+      const parts = turnParts(m.text);
+      return parts && parts[0] > pausedParts[0] && parts[1] > pausedParts[1];
+    },
+    "title: run and turn clocks resume after the prompt",
+    4000,
+  );
+  const resumedTitle = latestTitle();
+  assert.ok(turnParts(resumedTitle)[0] > pausedParts[0], resumedTitle);
+  assert.ok(turnParts(resumedTitle)[1] > pausedParts[1], resumedTitle);
+
+  const linesBeforeTurnEnd = wc.lines.length;
+  await mock.fire("turn_end", { turnIndex: 0 });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const completedParts = turnParts(latestTitle());
+  assert.ok(completedParts, latestTitle());
+  await wc.waitFor(
+    (m) => {
+      if (m.type !== "title" || wc.lines.indexOf(m) < linesBeforeTurnEnd) return false;
+      const parts = turnParts(m.text);
+      return parts && parts[0] > completedParts[0] && parts[1] === completedParts[1];
+    },
+    "title: run advances while completed turn stays frozen",
+    4000,
+  );
+  const betweenTurnsTitle = latestTitle();
+  const betweenParts = turnParts(betweenTurnsTitle);
+  assert.ok(betweenParts && betweenParts[0] > completedParts[0], betweenTurnsTitle);
+  assert.equal(betweenParts[1], completedParts[1], "completed turn clock remains frozen");
+  const linesBeforeSecondRunTick = wc.lines.length;
+  await wc.waitFor(
+    (m) => {
+      if (m.type !== "title" || wc.lines.indexOf(m) < linesBeforeSecondRunTick) return false;
+      const parts = turnParts(m.text);
+      return parts && parts[0] > betweenParts[0] && parts[1] === betweenParts[1];
+    },
+    "title: completed turn stays frozen across another run tick",
+    4000,
+  );
+  const laterBetweenParts = turnParts(latestTitle());
+  assert.ok(laterBetweenParts && laterBetweenParts[0] > betweenParts[0]);
+  assert.equal(laterBetweenParts[1], completedParts[1]);
+
+  await mock.fire("turn_start", { turnIndex: 1, timestamp: Date.now() });
+  await wc.waitFor(
+    (m) => m.type === "title" && m.text.includes("turn 2"),
+    "title: second model turn started"
+  );
+  assert.match(latestTitle(), / · \d+s · turn 2\)/, latestTitle());
+  await mock.fire("turn_end", { turnIndex: 1 });
+  await mock.fire("agent_settled");
+  await wc.waitFor(
+    (m) => m.type === "title" && /\(idle · last run \d+s · 2 turns\)/.test(m.text),
+    "title: settled run summary"
+  );
+  const settledTitle = latestTitle();
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  assert.equal(latestTitle(), settledTitle, "settled values remain frozen");
+
+  // A settled/aborted run can end without a turn_end event; agent_settled
+  // still freezes the live turn and the run clocks.
+  await mock.fire("agent_start");
+  await mock.fire("turn_start", { turnIndex: 0, timestamp: Date.now() });
+  await mock.fire("agent_settled");
+  await wc.waitFor(
+    (m) => m.type === "title" && /\(idle · last run \d+s · 1 turn\)/.test(m.text),
+    "title: aborted run settled without turn_end"
   );
 
   // streaming assistant text → whole lines in the buffer

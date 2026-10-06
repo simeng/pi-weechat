@@ -72,19 +72,25 @@ Open the `pi` buffer:
   are clipped at 300 chars with a `…(+N)` marker), with indented results
   (`✔` ok / `✘` error); the buffer title
   tracks state — `(idle)`, `(thinking…)`, `(tool: bash)` — and shows
-  `(disconnected — waiting for pi)` when pi is not connected. A turn-elapsed
-  counter sits inside the state parens — `π: ~/proj (thinking… 3s)`,
-  `(tool: bash 12s)`, `(idle 42s)`. It counts up **live** while a request is
-  in flight and **freezes** on settle, so the settled title keeps showing how
-  long the last request took. Format: `Ns` below 100 s, `Nm` below an hour,
-  `NhMm` beyond (the `Mm` drops when it is 0). A request is anything that
-  reaches pi as a new prompt — a line you type, `!new` / `!compact` /
-  `!abort` / `!status` / `!model` / `!cd`, or a prompt typed in pi's
-  terminal; `!pick` (an answer) and the local-only commands (`!help`,
-  `!tools`, `!think`, `!highlight`) do not restart it. After a mid-turn
-  reconnect the clock starts when the busy state is first seen (the original
-  request time is unknowable), and the frozen value survives `!new` until the
-  next request.
+  `(disconnected — waiting for pi)` when pi is not connected. The title shows
+  Pi's active run time, current/last model-turn time, and turn number, for example
+  `π: ~/proj (thinking… · run 17m · 42s · turn 10)` or
+  `(tool: bash · run 17m · 42s · turn 10)`. When the run settles it shows
+  `(idle · last run 17m · 10 turns)`.
+  `run` is active elapsed time across one Pi agent run, not the whole session;
+  `42s` is the current
+  model turn's elapsed time, and `turn 10` is Pi's 1-based turn index. Pi
+  resets the index for each agent run. Turn time includes provider wait and
+  tool execution. Blocking Pi UI prompts pause both clocks on runtimes that emit
+  the `ui_prompt_start`/`ui_prompt_end` events; WeeChat `!pick` prompts always
+  pause them. Older Pi runtimes without those events cannot exclude other native
+  UI waits. Neither clock includes idle time or starts from mirrored prompt echoes
+  or local/control commands. The title refreshes about once per second.
+  Format: `Ns` below 100 s, `Nm` below an hour, `NhMm` beyond
+  (minutes are omitted when zero).
+  After a bridge reconnect the Pi extension sends its current timing snapshot;
+  a restart of the Pi extension cannot recover active timing from before it
+  restarted.
 - **Input**: type a line and press enter to send it as a prompt to pi. Plain
   messages typed while a turn is running are queued as follow-ups (delivered
   when pi settles) instead of being dropped.
