@@ -37,13 +37,18 @@ class WeechatStub:
     def __init__(self):
         self.prints = []          # (kind, text)
         self.title = None
-        self.fd_hooks = {}        # callback name -> [fd, read, write, data]
+        self.fd_hooks = {}        # callback name -> [[fd, read, write, data], …]
+        self.fd_handles = {}      # hook handle -> [fd, read, write, data]
+        self._buf_seq = 0
+        self.buf_names = {}       # buffer pointer -> name
+        self.buf_prints = {}      # buffer pointer -> [lines printed to it]
         self.buffer_name = None
         self.registered = None
         self.plugin_opts = {}     # config_*_plugin storage
         self.plugin_descs = {}    # config_set_desc_plugin storage
         self.timers = {}          # handle -> {cb, data, deadline, timeout, max_calls}
         self._timer_seq = 0
+        self._fd_seq = 0
         self.config_hooks = []    # [(pattern, cb, data)]
         self.conf = {"irc.server_default.nicks": "alice,alice2"}  # global opts
         self.printf_tags = []     # [(tags, prefix, body)] from prnt_date_tags
@@ -112,12 +117,20 @@ class WeechatStub:
 
     # -- buffer ----------------------------------------------------------
     def buffer_new(self, name, input_cb, input_data, close_cb, close_data):
+        # like the real API: every buffer has its own pointer; the first
+        # keeps the historic "buffer" value the test phases pass around
+        self._buf_seq += 1
+        buf = "buffer" if self._buf_seq == 1 else "buffer%d" % self._buf_seq
         self.buffer_name = name
+        self.buf_names[buf] = name
+        self.buf_prints[buf] = []
         self.input_cb_name = input_cb
-        return "buffer"
+        return buf
 
     def buffer_set(self, buf, prop, value):
-        if prop == "title":
+        if prop in ("name", "short_name"):
+            self.buf_names[buf] = value
+        elif prop == "title":
             self.title = value
             self.prints.append(("TITLE", value))
         elif prop.startswith("localvar_set_"):
@@ -127,11 +140,13 @@ class WeechatStub:
         return 1
 
     def buffer_get_string(self, buf, prop):
+        if prop in ("name", "short_name"):
+            return self.buf_names.get(buf, "")
         return ""
 
     def prnt(self, buf, msg):
         self.prints.append(("PRINT", msg))
-        return 1
+        self.buf_prints.setdefault(buf, []).append(msg)
 
     def prnt_date_tags(self, buf, date, tags, message):
         # like the real API: the text before the first TAB is the line
@@ -141,13 +156,20 @@ class WeechatStub:
         else:
             prefix, body = "", message
         self.prints.append(("PRINTF", body))
+        self.buf_prints.setdefault(buf, []).append(message)
         self.printf_tags.append((tags, prefix, body))
         return 1
 
     # -- hooks -----------------------------------------------------------
     def hook_fd(self, fd, fr, fw, fe, cb, data):
-        self.fd_hooks[cb] = [fd, fr, fw, data]
-        return "hook:" + cb
+        # like the real API: every hook has its own handle, so several fds
+        # may be hooked under the same callback (multi-client support)
+        self._fd_seq += 1
+        handle = "hookfd:%s:%d" % (cb, self._fd_seq)
+        entry = [fd, fr, fw, data]
+        self.fd_handles[handle] = entry
+        self.fd_hooks.setdefault(cb, []).append(entry)
+        return handle
 
     def hook_timer(self, interval, align_second, max_calls, cb, data):
         self._timer_seq += 1
@@ -168,6 +190,15 @@ class WeechatStub:
     def unhook(self, hook):
         if hook in self.timers:
             del self.timers[hook]
+            return 1
+        if hook in self.fd_handles:
+            entry = self.fd_handles.pop(hook)
+            for entries in self.fd_hooks.values():
+                if entry in entries:
+                    entries.remove(entry)
+            for name in list(self.fd_hooks):
+                if not self.fd_hooks[name]:
+                    del self.fd_hooks[name]
             return 1
         cb = hook.split(":", 1)[1]
         self.fd_hooks.pop(cb, None)
@@ -205,27 +236,35 @@ class WeechatStub:
                     fired.append((t["cb"], t["data"]))
             for cb, data in fired:
                 ns[cb](data, 0)
-            live = {n: h for n, h in self.fd_hooks.items()
-                    if h[1] and h[0] >= 0 and self._fd_open(h[0])}
-            # a hooked fd that was closed underneath → weechat calls the cb
-            # once with fd == -1 (data carries the fd), then unhook
-            for name, hook in list(self.fd_hooks.items()):
-                if hook[1] and hook[0] >= 0 and not self._fd_open(hook[0]):
-                    ns[name](hook[3], -1)
-                    self.unhook("hook:" + name)
-            read_fds = [h[0] for h in live.values()]
+            # live read fds (several entries may share a callback name)
+            live = {}   # fd -> [(cb, entry)]
+            for cb, entries in self.fd_hooks.items():
+                for entry in entries:
+                    if entry[1] and entry[0] >= 0 and self._fd_open(entry[0]):
+                        live.setdefault(entry[0], []).append((cb, entry))
+            # a hooked fd closed underneath → weechat calls the cb once with
+            # fd == -1 (data carries the fd), then that entry is unhooked
+            for cb, entries in list(self.fd_hooks.items()):
+                for entry in list(entries):
+                    if entry[1] and entry[0] >= 0 and not self._fd_open(entry[0]):
+                        ns[cb](entry[3], -1)
+                        entries.remove(entry)
+                if not entries:
+                    del self.fd_hooks[cb]
+            read_fds = list(live)
             r, _, _ = select.select(read_fds, [], [], 0.02) if read_fds else ([], [], [])
             progressed = False
             for fd in r:
-                for name, hook in list(self.fd_hooks.items()):
-                    if hook[0] == fd and hook[1]:
-                        ns[name](hook[3], fd)
+                for cb, entry in live[fd]:
+                    ns[cb](entry[3], fd)
+                    progressed = True
+                    break
+            for cb, entries in list(self.fd_hooks.items()):
+                for entry in entries:
+                    if entry[2] and entry[0] >= 0:
+                        ns[cb](entry[3], entry[0])
                         progressed = True
                         break
-            for name, hook in list(self.fd_hooks.items()):
-                if hook[2] and hook[0] >= 0:
-                    ns[name](hook[3], hook[0])
-                    progressed = True
             if not progressed and not fired:
                 time.sleep(0.01)
 
@@ -327,7 +366,7 @@ def main():
     c.setblocking(False)
     stub.pump(0.8)
     assert c.recv(10) == b"", "silent client must be dropped after auth timeout"
-    assert BRIDGE.pending == [] and BRIDGE.client is None
+    assert BRIDGE.pending == [] and BRIDGE.clients == []
 
     # unauthenticated-connection cap: 3 pendings held, 4th closed silently
     pendings = []
@@ -1489,7 +1528,7 @@ def main():
     client.close()
     stub.pump(0.3)
     assert "waiting for pi" in (stub.title or ""), stub.title
-    assert BRIDGE.client is None
+    assert BRIDGE.clients == []
     assert any("stranded by disconnect" in t for k, t in stub.prints), \
         "disconnect flushes a half-built block instead of losing it"
     assert SESSION._md_block == [] and SESSION._md_block_type is None, \
@@ -1526,7 +1565,7 @@ def main():
         "anonymous hello accepted without a challenge"
     tc.close()
     stub.pump(0.3)
-    assert BRIDGE.client is None, "tcp client dropped on close"
+    assert BRIDGE.clients == [], "tcp client dropped on close"
 
     # --- challenge handshake with a token
     TOKEN = "test-token-123"
@@ -1614,7 +1653,7 @@ def main():
     assert json.loads(recv_lines[-1]) == {"type": "error", "code": "auth_failed"}
     assert "auth failed from" in buffer_text(stub), "red auth_failed line"
     stub.pump(0.3)
-    assert BRIDGE.client is None and BRIDGE.pending == []
+    assert BRIDGE.clients == [] and BRIDGE.pending == []
 
     # --- missing proof ⇒ auth_failed too
     tc = tcp_connect(port1)
@@ -1753,6 +1792,101 @@ def main():
     stub.pump(0.1)
     assert "tcp listener stopped" in buffer_text(stub)
     assert "pi_tcp_listen_cb" not in stub.fd_hooks, "tcp listen fd unhooked"
+    # ==================================================================
+    # Phase M — multi-session: one buffer per connected pi session
+    # ==================================================================
+    assert BRIDGE.clients == [], "clean slate before the multi-session phase"
+    # Phase D left a token configured; restore the tokenless handshake
+    stub.config_set_plugin("token", "")
+    stub.pump(0.1)
+    def unix_client():
+        cl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        cl.connect(sock_path)
+        cl.setblocking(False)
+        return cl
+    def client_hello(cl, session_id=None):
+        obj = {"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi"}
+        if session_id:
+            obj["sessionId"] = session_id
+        cl.sendall((json.dumps(obj) + "\n").encode())
+        stub.pump(0.3)
+        lines = []
+        drain(cl, lines)
+        for line in lines:
+            m = json.loads(line)
+            if m["type"] in ("hello", "error"):
+                return m
+        raise AssertionError("no hello reply")
+    m1 = unix_client()
+    assert client_hello(m1)["type"] == "hello"
+    m2 = unix_client()
+    assert client_hello(m2)["type"] == "hello"
+    stub.pump(0.2)
+    s1 = BRIDGE.load_session
+    assert len(BRIDGE.sessions) == 2, "second client opens a second session"
+    s2 = BRIDGE.sessions[1]
+    assert s1.buffer != s2.buffer, "each session gets its own buffer"
+    assert stub.buf_names[s1.buffer] == "pi", "load-time buffer keeps name 'pi'"
+    assert len(BRIDGE.clients) == 2
+    # session_info: cwd renames the (non-fixed) buffer to pi:<cwd>
+    m1.sendall((json.dumps({"type": "session_info", "cwd": "/home/x/proj-a"}) + "\n").encode())
+    m2.sendall((json.dumps({"type": "session_info", "cwd": "/home/x/proj-b"}) + "\n").encode())
+    stub.pump(0.2)
+    assert stub.buf_names[s2.buffer] == "pi:" + ns["_short_path"]("/home/x/proj-b"), stub.buf_names
+    # prints route to the owning buffer only
+    m1.sendall((json.dumps({"type": "assistant_line", "text": "from A"}) + "\n").encode())
+    m1.sendall((json.dumps({"type": "assistant_flush"}) + "\n").encode())
+    m2.sendall((json.dumps({"type": "assistant_line", "text": "from B"}) + "\n").encode())
+    m2.sendall((json.dumps({"type": "assistant_flush"}) + "\n").encode())
+    stub.pump(0.2)
+    t1 = "\n".join(stub.buf_prints[s1.buffer])
+    t2 = "\n".join(stub.buf_prints[s2.buffer])
+    assert "from A" in t1 and "from B" not in t1, (t1, t2)
+    assert "from B" in t2 and "from A" not in t2
+    # a duplicate live sessionId is rejected (the first connection owns it)
+    m1.sendall((json.dumps({"type": "session_info", "sessionId": "sid-a"}) + "\n").encode())
+    stub.pump(0.2)
+    assert BRIDGE.session_by_id.get("sid-a") is s1
+    m3 = unix_client()
+    assert client_hello(m3, session_id="sid-a")["code"] == "session_id_in_use"
+    stub.pump(0.2)
+    assert s1.conn is not None, "original session untouched by the rejection"
+    # disconnect + reconnect with the same id reattaches to the SAME buffer
+    buf1_before = s1.buffer
+    m1.close()
+    stub.pump(0.3)
+    assert s1.conn is None
+    m4 = unix_client()
+    assert client_hello(m4, session_id="sid-a")["type"] == "hello"
+    stub.pump(0.2)
+    assert s1.buffer == buf1_before, "reattach reuses the existing buffer"
+    assert len(BRIDGE.sessions) == 2, "reattach does not create a new session"
+    # a client without sessionId always gets a fresh buffer
+    m5 = unix_client()
+    assert client_hello(m5)["type"] == "hello"
+    stub.pump(0.2)
+    assert len(BRIDGE.sessions) == 3
+    s3 = BRIDGE.sessions[2]
+    assert s3.buffer not in (s1.buffer, s2.buffer)
+    # !pick answers the prompt of the OWNING session only
+    m2.sendall((json.dumps({"type": "ui_request", "id": 9, "method": "select",
+                             "title": "choice", "options": ["x", "y"]}) + "\n").encode())
+    stub.pump(0.2)
+    assert s2.pending_ui is not None
+    s3.on_input("!pick 1")
+    stub.pump(0.2)
+    assert any("nothing to pick" in l for l in stub.buf_prints[s3.buffer])
+    s2.on_input("!pick 2")
+    stub.pump(0.2)
+    lines = []
+    drain(m2, lines)
+    resp = [json.loads(l) for l in lines if json.loads(l)["type"] == "ui_response"]
+    assert resp and resp[0].get("value") == "y", resp
+    # tidy up the phase's clients
+    for cl in (m2, m4, m5):
+        cl.close()
+    stub.pump(0.3)
+    assert BRIDGE.clients == [], "all multi-session clients dropped"
 
     print("smoke weechat: OK (%d buffer lines rendered)" % len(stub.prints))
 

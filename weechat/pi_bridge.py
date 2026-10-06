@@ -1416,7 +1416,20 @@ class Session(object):
             cwd = msg.get("cwd")
             if isinstance(cwd, str) and cwd:
                 self.session_cwd = cwd
+                if not self.fixed_name:
+                    # rename the buffer to the project (unique per cwd)
+                    self.rename_buffer(self.bridge._new_buffer_name(
+                        "pi:" + _short_path(cwd)))
                 self.set_state(self.state)  # refresh the title with the path
+            # track session-id changes (a !cd / !new switch mints a new id)
+            sid = msg.get("sessionId")
+            if isinstance(sid, str) and sid and sid != self.session_id:
+                if self.session_id:
+                    # release the old mapping only if it still points here
+                    if self.bridge.session_by_id.get(self.session_id) is self:
+                        del self.bridge.session_by_id[self.session_id]
+                self.session_id = sid
+                self.bridge.session_by_id[sid] = self
             bits = []
             if cwd:
                 bits.append(_short_path(str(cwd)))
@@ -1741,10 +1754,10 @@ class Session(object):
         else:
             self._send_user_input(line, line, {})
 
-    def handle_disconnect(self):
-        """The connection went away: forget per-connection rendering state
-        (a reconnect starts fresh msgIds on the pi side, so stale fence
-        state must not leak into new messages); the buffer stays open."""
+    def _reset_transient(self):
+        """Forget per-connection rendering state: a (re)connect starts fresh
+        "msgIds on the pi side, so stale fence state must not leak into new
+        "messages."""
         self._md_msg = None
         self._md_fence = None
         self._flush_md_block()   # never strand a half-built block on screen
@@ -1758,8 +1771,29 @@ class Session(object):
         # will send a fresh Pi-owned snapshot after the next handshake.
         self.timing_snapshot = None
         self.timing_received_at = None
+    def handle_disconnect(self):
+        """The connection went away; the buffer stays open."""
+        self._reset_transient()
         self.set_state("waiting")
         self._print(C_DIM + "— pi disconnected —%s" % R)
+    def handle_reattach(self):
+        """A reconnecting session reattaches to this buffer (history kept).
+        "Stale per-connection state is flushed; if the user closed the
+        "buffer in the meantime, recreate it."""
+        self._reset_transient()
+        if not (self.alive and self.buffer):
+            self.make_buffer(self.bridge.session_name_for(self))
+    def rename_buffer(self, name):
+        if not (self.alive and self.buffer):
+            return
+        try:
+            current = weechat.buffer_get_string(self.buffer, "name")
+        except Exception:
+            current = None
+        if current == name:
+            return
+        weechat.buffer_set(self.buffer, "name", name)
+        weechat.buffer_set(self.buffer, "short_name", name)
 
 class Bridge(object):
     def __init__(self):
@@ -1773,13 +1807,15 @@ class Bridge(object):
         self.tcp_listen_value = ""
         self.config_hook = None
         self.nick_config_hook = None  # irc.server_default.nicks live re-apply
-        # connections: one AUTHED client + a few in-handshake pendings
+        # sessions: one per pi session (the load-time buffer's session takes
+        # the first client and keeps the name "pi"); connections: authed
+        # clients + a few in-handshake pendings
         self.sessions = []             # all Sessions (creation order)
         self.load_session = Session(self, fixed_name=True)  # takes the 1st client
         self.sessions.append(self.load_session)
         self.session_by_buffer = {}   # buffer pointer → Session
         self.session_by_id = {}       # session id → Session (reattach)
-        self.client = None            # the authenticated conn (dict, or None)
+        self.clients = []             # authenticated conns (list of dicts)
         self.pending = []             # accepted, not authed yet (list of dicts)
         # per-IP abuse state (TCP peers only)
         self.ip_failures = {}         # ip -> [timestamps of auth failures]
@@ -1805,12 +1841,38 @@ class Bridge(object):
         }
 
     def _conn_by_fd(self, fd):
-        if self.client is not None and self.client["fd"] == fd:
-            return self.client
+        for conn in self.clients:
+            if conn["fd"] == fd:
+                return conn
         for conn in self.pending:
             if conn["fd"] == fd:
                 return conn
         return None
+    def _new_buffer_name(self, base):
+        """A buffer name not currently taken: base, base-2, base-3, …"""
+        taken = set()
+        for s in self.sessions:
+            if s.buffer:
+                try:
+                    name = weechat.buffer_get_string(s.buffer, "name")
+                except Exception:
+                    name = None
+                if name:
+                    taken.add(name)
+        name = base
+        n = 2
+        while name in taken:
+            name = "%s-%d" % (base, n)
+            n += 1
+        return name
+    def session_name_for(self, session):
+        """Name for a session's (re)created buffer: fixed sessions keep
+        "pi"; the rest are named after the session cwd when known."""
+        if session.fixed_name:
+            return self._new_buffer_name("pi")
+        if session.session_cwd:
+            return self._new_buffer_name("pi:" + _short_path(session.session_cwd))
+        return self._new_buffer_name("pi")
 
     # ---------------------------------------------------------------- options
 
@@ -1918,8 +1980,8 @@ class Bridge(object):
         """Close + unhook the TCP listener.
 
         With keep_conns=False (live rebind / cleanup) also drops any
-        TCP-originated connections: the current client if it came over TCP,
-        and all in-handshake TCP pendings.
+        TCP-originated connections: authed clients that came over TCP, and
+        all in-handshake TCP pendings.
         """
         if self.tcp_listen_sock is not None:
             try:
@@ -1934,8 +1996,9 @@ class Bridge(object):
             for conn in list(self.pending):
                 if conn.get("ip") is not None:
                     self.drop_conn(conn)
-            if self.client is not None and self.client.get("ip") is not None:
-                self.drop_conn(self.client)
+            for conn in list(self.clients):
+                if conn.get("ip") is not None:
+                    self.drop_conn(conn)
 
     # --------------------------------------------------------------- accept
 
@@ -1981,13 +2044,6 @@ class Bridge(object):
                 dbg("accept: %s not in allowed_ips — closing" % ip)
                 self._close_sock(conn_sock)
                 return
-        # ---- one client at a time (across both transports)
-        if self.client is not None:
-            self._send_raw(conn_sock, {"type": "error",
-                                       "code": "client_already_connected"})
-            self._close_sock(conn_sock)
-            dbg("accept: rejected second client (%s)" % peer)
-            return
         # ---- unauthenticated-connection cap
         if len(self.pending) >= MAX_PENDING_UNAUTH:
             dbg("accept: %d pending unauthed connections — closing %s"
@@ -2107,6 +2163,11 @@ class Bridge(object):
                         sess = conn.get("session")
                         if sess:
                             sess._print(C_ERR + "pi bridge: dispatch error: %s%s" % (err, R))
+                # If handling the message closed this connection (a rejection
+                # during the handshake), the leftover bytes belong to a dead
+                # socket — stop processing them.
+                if self._conn_by_fd(conn["fd"]) is not conn:
+                    break
         if len(conn["rxbuff"]) > MAX_LINE:
             conn["rxbuff"] = b""
 
@@ -2150,23 +2211,43 @@ class Bridge(object):
                 self._send_to(conn, {"type": "error", "code": "auth_failed"})
                 self.drop_conn(conn)
                 return
-        # authenticated: promote to the single client slot
+        # authenticated: promote to a client slot (one per pi session)
         self._unhook_timer(conn)
         conn["authed"] = True
-        if self.client is not None:
-            # someone else won the slot in the meantime
-            self._send_to(conn, {"type": "error",
-                                 "code": "client_already_connected"})
-            self.drop_conn(conn)
-            return
-        for other in list(self.pending):
-            if other is not conn:
-                self.drop_conn(other)  # silently: they lost the race
         self.pending.remove(conn)
-        self.client = conn
-        session = self.load_session
+        session_id = msg.get("sessionId")
+        if not (isinstance(session_id, str) and session_id):
+            session_id = ""
+        session = None
+        reattach = False
+        if session_id:
+            candidate = self.session_by_id.get(session_id)
+            if candidate is not None and candidate.conn is not None:
+                # a live connection already owns this session id: reject
+                self._send_to(conn, {"type": "error",
+                                     "code": "session_id_in_use"})
+                self.drop_conn(conn)
+                dbg("hello: session id %s already connected — rejected %s"
+                    % (session_id, conn["peer"]))
+                return
+            if candidate is not None:
+                session = candidate     # its connection is gone → reattach
+                reattach = True
+        if session is None:
+            if self.load_session.conn is None:
+                session = self.load_session  # first client takes the load-time buffer
+            else:
+                session = Session(self)
+                self.sessions.append(session)
+                session.make_buffer(self.session_name_for(session))
         conn["session"] = session
         session.conn = conn
+        if session_id:
+            session.session_id = session_id
+            self.session_by_id[session_id] = session
+        self.clients.append(conn)
+        if reattach:
+            session.handle_reattach()
         self._send_to(conn, {"type": "hello", "protocol": PROTOCOL,
                              "name": "weechat-pi-bridge"})
         session.set_state("idle")
@@ -2174,7 +2255,8 @@ class Bridge(object):
             session._print(C_OK + "— pi connected from %s —%s" % (conn["ip"], R))
         else:
             session._print(C_OK + "— pi connected —%s" % R)
-        dbg("client authed: %s" % conn["peer"])
+        dbg("client authed: %s (session_id=%s, reattach=%s)"
+            % (conn["peer"], session_id or "-", reattach))
 
     def auth_timeout(self, fd):
         """hook_timer: no valid hello within AUTH_TIMEOUT_S → drop silently."""
@@ -2194,8 +2276,8 @@ class Bridge(object):
                 conn[key] = None
         if conn in self.pending:
             self.pending.remove(conn)
-        if self.client is conn:
-            self.client = None
+        if conn in self.clients:
+            self.clients.remove(conn)
         session = conn.get("session")
         if session is not None:
             session.conn = None
@@ -2218,13 +2300,6 @@ class Bridge(object):
             conn_sock.sendall((json.dumps(obj, separators=(",", ":")) + "\n").encode())
         except OSError:
             pass
-
-    def _send(self, obj):
-        """Send to the authenticated client (or drop, with a dbg note)."""
-        if self.client is None:
-            dbg("_send %s DROPPED (no client)" % obj.get("type"))
-            return
-        self._send_to(self.client, obj)
 
     def _send_to(self, conn, obj):
         line = (json.dumps(obj, separators=(",", ":")) + "\n").encode()
@@ -2270,8 +2345,8 @@ class Bridge(object):
         self.stop_tcp_server()
         for conn in list(self.pending):
             self.drop_conn(conn)
-        if self.client is not None:
-            self.drop_conn(self.client)
+        for conn in list(self.clients):
+            self.drop_conn(conn)
         if self.listen_sock is not None:
             try:
                 self.listen_sock.close()
