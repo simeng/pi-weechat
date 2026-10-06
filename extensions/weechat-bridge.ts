@@ -15,7 +15,6 @@
  * when a token is configured — the token is never sent). See PLAN.md §2.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { CURRENT_SESSION_VERSION, SessionManager } from "@earendil-works/pi-coding-agent";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
@@ -27,6 +26,13 @@ import { Type } from "@sinclair/typebox";
 import { LineDecoder, PROTOCOL_VERSION, parseEndpoint } from "../lib/codec.mjs";
 // @ts-ignore - plain ESM module, no types needed
 import { loadConfig } from "../lib/pi-config.mjs";
+import {
+  CD_CREATE_PREFIX,
+  expandTilde,
+  findSimilarDirs,
+  isExistingDirectory,
+  writeCdSessionHeader,
+} from "../lib/cd-search.mjs";
 
 const MAX_TOOL_OUTPUT = 8192;
 const DEBUG_LOG_MAX_BYTES = 1_000_000; // rotate above this
@@ -1355,10 +1361,11 @@ export default function weechatBridge(pi: ExtensionAPI) {
 
   /**
    * !cd <path>: switch pi to a different project directory (new session in
-   * that cwd). Ported from the standalone /cd extension so it works over
-   * the bridge: an exact existing directory switches immediately; otherwise
-   * similar directories are fuzzy-searched and picked in the WeeChat buffer
-   * (!pick), always including a "create as new project" option.
+   * that cwd). Shares lib/cd-search.mjs with the /cd TUI command
+   * (extensions/cd.ts): an exact existing directory switches immediately;
+   * otherwise similar directories are fuzzy-searched and picked in the
+   * WeeChat buffer (!pick), always including a "create as new project"
+   * option.
    */
   async function runCd(ctx: any, rawArg?: string): Promise<void> {
     await ctx.waitForIdle?.();
@@ -1440,15 +1447,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
    */
   async function switchSessionToDir(targetCwd: string, ctx: any): Promise<void> {
     const resolvedTarget = path.resolve(targetCwd);
-    const sessionDir = SessionManager.create(resolvedTarget).getSessionDir();
-    const id = crypto.randomUUID();
-    const timestamp = new Date().toISOString();
-    const fileTimestamp = timestamp.replace(/[:.]/g, "-");
-    const sessionFile = path.join(sessionDir, `${fileTimestamp}_${id}.jsonl`);
-    fs.writeFileSync(
-      sessionFile,
-      JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id, timestamp, cwd: resolvedTarget }) + "\n",
-    );
+    const sessionFile = writeCdSessionHeader(resolvedTarget);
     dbg(`cd: switching to ${resolvedTarget} (pre-wrote ${sessionFile})`);
     const result = await ctx.switchSession(sessionFile, {
       withSession: (next: any) => {
@@ -1493,131 +1492,4 @@ function truncate(text: string, max: number): string {
     out += (out ? "\n" : "") + line;
   }
   return out + `\n… (${text.length - out.length} more characters truncated)`;
-}
-
-// ------------------------------------------------------------------ !cd search
-// Fuzzy directory search ported from the standalone /cd extension (same
-// scoring, pruning and caps) so !cd behaves like /cd did in the TUI.
-
-const CD_CREATE_PREFIX = "➕ create ";
-const CD_MIN_SCORE = 55;
-const CD_MAX_CANDIDATES = 8;
-const CD_MAX_SCANNED_ENTRIES = 15_000;
-const CD_PRUNED_DIRS = new Set(["node_modules", ".git", ".cache", ".npm"]);
-
-function expandTilde(input: string): string {
-  if (input === "~") return os.homedir();
-  if (input.startsWith("~/")) return path.join(os.homedir(), input.slice(2));
-  return input;
-}
-
-function isExistingDirectory(p: string): boolean {
-  try {
-    return fs.statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-function levenshtein(a: string, b: string): number {
-  if (a === b) return 0;
-  if (a.length === 0) return b.length;
-  if (b.length === 0) return a.length;
-  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
-  for (let i = 1; i <= a.length; i++) {
-    const cur = [i];
-    for (let j = 1; j <= b.length; j++) {
-      cur[j] = Math.min(
-        prev[j] + 1, // deletion
-        cur[j - 1] + 1, // insertion
-        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1), // substitution
-      );
-    }
-    prev = cur;
-  }
-  return prev[b.length];
-}
-
-/** Case-insensitive similarity between a directory name and the requested one, 0-100. */
-function cdScoreName(name: string, targetName: string): number {
-  const n = name.toLowerCase();
-  const t = targetName.toLowerCase();
-  if (n === t) return 100;
-
-  let score = Math.round((1 - levenshtein(n, t) / Math.max(n.length, t.length)) * 100);
-
-  if (n.includes(t) || t.includes(n)) {
-    const coverage = Math.min(n.length, t.length) / Math.max(n.length, t.length);
-    score = Math.max(score, Math.round(60 + 40 * coverage));
-  }
-  return score;
-}
-
-/**
- * Search for directories whose names resemble the requested path's basename.
- * Scans the parent of the target (siblings) plus the home directory two
- * levels deep, with pruning and a hard cap on scanned entries.
- */
-function findSimilarDirs(target: string): string[] {
-  const targetName = path.basename(target);
-  const allowHidden = targetName.startsWith(".");
-  const parent = path.dirname(target);
-  const home = path.resolve(os.homedir());
-
-  interface Item {
-    dir: string;
-    depth: number;
-    maxDepth: number;
-  }
-
-  // parent and home can be the same directory — scan it once at the deeper depth.
-  const queue: Item[] = [];
-  const pushed = new Set<string>();
-  const pushRoot = (dir: string, maxDepth: number) => {
-    if (pushed.has(dir)) return;
-    pushed.add(dir);
-    queue.push({ dir, depth: 0, maxDepth });
-  };
-  if (isExistingDirectory(parent) && path.resolve(parent) !== home) pushRoot(path.resolve(parent), 1);
-  pushRoot(home, 2);
-
-  const visited = new Set<string>();
-  const found = new Map<string, number>(); // resolved path -> best score
-  let scanned = 0;
-
-  while (queue.length > 0 && scanned < CD_MAX_SCANNED_ENTRIES) {
-    const { dir, depth, maxDepth } = queue.shift()!;
-    if (visited.has(dir)) continue;
-    visited.add(dir);
-
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue; // unreadable — skip
-    }
-    scanned += entries.length;
-
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const name = entry.name.toLowerCase();
-      if (CD_PRUNED_DIRS.has(name)) continue;
-      if (name.startsWith(".") && !allowHidden) continue;
-
-      const full = path.resolve(path.join(dir, entry.name));
-      if (full === path.resolve(target)) continue;
-
-      const score = cdScoreName(entry.name, targetName);
-      if (score >= CD_MIN_SCORE) found.set(full, Math.max(found.get(full) ?? 0, score));
-
-      if (depth + 1 < maxDepth && scanned < CD_MAX_SCANNED_ENTRIES) {
-        queue.push({ dir: full, depth: depth + 1, maxDepth });
-      }
-    }
-  }
-
-  return [...found.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, CD_MAX_CANDIDATES)
-    .map(([p]) => p);
 }

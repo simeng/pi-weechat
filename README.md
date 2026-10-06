@@ -18,8 +18,10 @@ Architecture and wire protocol: [PLAN.md](./PLAN.md).
 
 ```
 extensions/weechat-bridge.ts   pi extension (client)
+extensions/cd.ts               pi extension: /cd <path> — TUI counterpart of !cd (switch project dir)
 weechat/pi_bridge.py           WeeChat script (socket server)
 lib/codec.mjs                  shared NDJSON codec constants (protocol version, limits)
+lib/cd-search.mjs              shared dir resolution + fuzzy search for !cd and /cd
 test/                          node:test suite + python smoke + cross-language integration
 ```
 
@@ -103,7 +105,7 @@ Open the `pi` buffer:
   - `!abort` — abort the current run
   - `!status` — resend session info (works even mid-turn)
   - `!model` — list available models (scoped models if model scoping is configured, otherwise the full catalogue — same as pi's `/model`); `!model <provider/model>` switches model
-  - `!cd <path>` — switch pi to a different project directory (new session in that cwd). An exact existing dir switches immediately; anything else is fuzzy-searched and shown as a numbered list in the buffer — always including a “➕ create <path> as new project” option
+  - `!cd <path>` — switch pi to a different project directory (new session in that cwd). An exact existing dir switches immediately; anything else is fuzzy-searched and shown as a numbered list in the buffer — always including a “➕ create <path> as new project” option. The pi terminal has the same command as `/cd` (local select dialog instead of `!pick`; see `extensions/cd.ts`)
   - `!pick …` — answer a numbered list / prompt in the buffer: the `!cd` fuzzy match, decision questions from ask_user-style tools (below), or any other interactive prompt: `!pick <n>` (or `!pick 1,3` for multiple), or the exact option text; `!pick cancel` aborts
   - `!tools [full|summary|off]` — tool output verbosity in the buffer
     (`summary` is the default: first/last 3 lines, middle elided like a smart
