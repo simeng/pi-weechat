@@ -15,7 +15,7 @@
 # nick — first entry of irc.server_default.nicks, re-applied live via
 # hook_config; system lines stay prefix-less (channel-notice style).
 #
-# Transports (one client at a time, across both):
+# Transports (multi-session: one buffer per connected pi session):
 #   * Unix socket — always on. Path: $PI_WEECHAT_SOCK, else
 #     $XDG_RUNTIME_DIR/pi-weechat.sock, else ~/.local/state/pi-weechat/.
 #   * TCP — opt-in via `/set plugins.var.python.pi_bridge.tcp_listen host:port` (live rebind,
@@ -2524,7 +2524,7 @@ def pi_shutdown_cb():
 
 def main():
     dbg("main(): loading (sock=%s, debug=%s)" % (default_socket_path(), bool(_DBG_PATH)))
-    weechat.register("pi_bridge", "simeng", "0.6.0", "MIT",
+    weechat.register("pi_bridge", "simeng", "0.7.0", "MIT",
                      "mirror a pi coding agent session through a WeeChat buffer",
                      "pi_shutdown_cb", "")
     # plugin options: PLUGIN_OPTIONS = (name, default, description).

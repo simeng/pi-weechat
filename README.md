@@ -293,18 +293,24 @@ Then (re)start or `/reload` the pi session. The buffer on A shows
   nonce-proof can't be replayed, but forwarding live works). For
   confidentiality run the connection inside **Tailscale or a VPN** — then the
   token mainly protects against other hosts on the shared network.
-- **One client at a time, across both transports.** A second dial (TCP or
-  Unix) is rejected with `client_already_connected` while a client is
-  connected; in-flight handshakes are capped (3) and time out (10 s).
+- **One connection per pi session — many sessions at once.** Every
+  connected client gets its own WeeChat buffer (one per pi session). A
+  client dialing with a `sessionId` that is already live is rejected with
+  `session_id_in_use`; in-flight handshakes are capped (3) and time out
+  (10 s).
 - Debug logging is per machine: `PI_BRIDGE_DEBUG=<path>` on each side (the
   shared `$XDG_RUNTIME_DIR/pi-weechat.debug` marker only makes sense when
   both sides run locally).
 
 ## Notes & limitations (v1)
 
-- **One pi session per WeeChat buffer.** A second connecting client (TCP or
-  Unix) is rejected (`client_already_connected`). Multi-session multiplexing
-  is on the roadmap (PLAN §10).
+- **Multi-session: one buffer per connected pi session.** The buffer
+  present at WeeChat load time keeps the name `pi`; each further session
+  gets a `pi:<short cwd>` buffer (numeric suffix on a name collision). A
+  reconnected pi process with the same session id reattaches to its buffer
+  with history intact; `!cd` / `!new` switches inside pi update the mapping
+  and rename the buffer. Disconnected buffers stay open until you close
+  them.
 - Remote traffic is **not encrypted** (token ≠ encryption) — use Tailscale/
   VPN for confidentiality (see [Remote setup](#remote-setup-tcp)).
 - Assistant text is rendered in whole lines (WeeChat has no partial-line redraw);

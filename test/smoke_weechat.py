@@ -42,6 +42,7 @@ class WeechatStub:
         self._buf_seq = 0
         self.buf_names = {}       # buffer pointer -> name
         self.buf_prints = {}      # buffer pointer -> [lines printed to it]
+        self.closed_bufs = set()  # closed: name released, like real WeeChat
         self.buffer_name = None
         self.registered = None
         self.plugin_opts = {}     # config_*_plugin storage
@@ -139,7 +140,15 @@ class WeechatStub:
             self.localvars.pop(prop[len("localvar_unset_"):], None)
         return 1
 
+    def buffer_close(self, buf):
+        self.closed_bufs.add(buf)
+        self.buf_names.pop(buf, None)
+        self.buf_prints.pop(buf, None)
+        return 1
+
     def buffer_get_string(self, buf, prop):
+        if buf in self.closed_bufs:
+            return ""
         if prop in ("name", "short_name"):
             return self.buf_names.get(buf, "")
         return ""
@@ -1887,6 +1896,89 @@ def main():
         cl.close()
     stub.pump(0.3)
     assert BRIDGE.clients == [], "all multi-session clients dropped"
+    # ==================================================================
+    # Phase M2 — multi-session edge cases
+    # ==================================================================
+    # (Phase M left the 3 sessions disconnected: buffers live, no conns)
+    # the first client of a quiet load_session takes the `pi` buffer back
+    # (fixed name — its cwd does NOT rename it)
+    m6 = unix_client()
+    assert client_hello(m6)["type"] == "hello"
+    stub.pump(0.2)
+    assert BRIDGE.load_session.conn is not None and len(BRIDGE.sessions) == 3
+    m6.sendall((json.dumps({"type": "session_info", "cwd": "/home/x/proj-b"}) + "\n").encode())
+    stub.pump(0.2)
+    assert stub.buf_names[BRIDGE.load_session.buffer] == "pi", stub.buf_names
+    # malformed sessionId (non-string) is ignored; a same-cwd buffer gets -2
+    m7 = unix_client()
+    m7.sendall((json.dumps({"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi",
+                           "sessionId": 123}) + "\n").encode())
+    stub.pump(0.3)
+    assert len(BRIDGE.clients) == 2
+    assert all(not isinstance(k, int) for k in BRIDGE.session_by_id), BRIDGE.session_by_id
+    m7.sendall((json.dumps({"type": "session_info", "cwd": "/home/x/proj-b"}) + "\n").encode())
+    stub.pump(0.2)
+    s4 = BRIDGE.sessions[-1]
+    assert stub.buf_names[s4.buffer] == "pi:" + ns["_short_path"]("/home/x/proj-b") + "-2", stub.buf_names
+    # repeated hello on an authed conn is ignored (no duplicate session)
+    m7.sendall((json.dumps({"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi"}) + "\n").encode())
+    stub.pump(0.2)
+    assert len(BRIDGE.sessions) == 4 and len(BRIDGE.clients) == 2, (BRIDGE.sessions, BRIDGE.clients)
+    # id change mid-connection: the reattach mapping follows the new id
+    m8 = unix_client()
+    assert client_hello(m8)["type"] == "hello"
+    stub.pump(0.2)
+    m8.sendall((json.dumps({"type": "session_info", "sessionId": "sid-old"}) + "\n").encode())
+    stub.pump(0.2)
+    s5 = BRIDGE.sessions[-1]
+    assert BRIDGE.session_by_id["sid-old"] is s5
+    m8.sendall((json.dumps({"type": "session_info", "sessionId": "sid-new"}) + "\n").encode())
+    stub.pump(0.2)
+    assert BRIDGE.session_by_id["sid-new"] is s5
+    assert "sid-old" not in BRIDGE.session_by_id
+    buf5_before = s5.buffer
+    m8.close()
+    stub.pump(0.3)
+    m8b = unix_client()
+    assert client_hello(m8b, session_id="sid-new")["type"] == "hello"
+    stub.pump(0.2)
+    assert s5.buffer == buf5_before, "reattach uses the CURRENT id"
+    m8c = unix_client()
+    assert client_hello(m8c, session_id="sid-old")["type"] == "hello"
+    stub.pump(0.2)
+    assert len(BRIDGE.sessions) == 6, "the released id no longer reattaches"
+    # user closes the buffer → reattach restores a NEW buffer (name from cwd)
+    m9 = unix_client()
+    assert client_hello(m9)["type"] == "hello"
+    stub.pump(0.2)
+    m9.sendall((json.dumps({"type": "session_info", "cwd": "/home/x/proj-c",
+                           "sessionId": "sid-c"}) + "\n").encode())
+    stub.pump(0.2)
+    s6 = BRIDGE.sessions[-1]
+    closed_buf = s6.buffer
+    ns["pi_close_cb"]("", closed_buf)
+    stub.buffer_close(closed_buf)  # UI: buffer gone, name released
+    stub.pump(0.1)
+    assert s6.alive is False
+    m9.close()
+    stub.pump(0.3)
+    m9b = unix_client()
+    assert client_hello(m9b, session_id="sid-c")["type"] == "hello"
+    stub.pump(0.2)
+    assert s6.buffer != closed_buf and s6.alive, "buffer restored on reattach"
+    assert stub.buf_names[s6.buffer] == "pi:" + ns["_short_path"]("/home/x/proj-c"), stub.buf_names
+    # closing one buffer leaves the other sessions live
+    other = [s for s in BRIDGE.sessions if s is not s6 and s.buffer and s.conn is None][0]
+    ns["pi_close_cb"]("", other.buffer)
+    stub.buffer_close(other.buffer)
+    stub.pump(0.1)
+    assert other.alive is False and s6.alive, "only the closed session's buffer dies"
+    assert any(c["session"] is s6 for c in BRIDGE.clients), "s6's connection keeps running"
+    # tidy up
+    for cl in (m6, m7, m8b, m8c, m9b):
+        cl.close()
+    stub.pump(0.3)
+    assert BRIDGE.clients == []
 
     print("smoke weechat: OK (%d buffer lines rendered)" % len(stub.prints))
 

@@ -172,11 +172,12 @@ Design:
   `hook_config` (live rebind — the `urlserver.py` pattern: blocking listen
   fd, one plain `accept()` per `hook_fd` event, `SO_REUSEADDR`, `listen(5)`,
   status line from `getsockname()`). Both funnels share one accept path:
-  peer-IP gates first (lockout, `allowed_ips`), then one client at a time —
-  an extra connected client gets one `error{code: "client_already_connected"}`;
-  up to 3 in-flight handshakes are held, then closed silently. Client fds are
-  non-blocking in both transports, with the shared `rxbuff` + write-hook
-  backpressure model.
+  peer-IP gates first (lockout, `allowed_ips`), then admission — one buffer
+  per connected pi session (the `sessionId` in the hello picks the session's
+  existing one, else a new buffer); a hello reusing a **live** session id is
+  rejected with `error{code: "session_id_in_use"}`. Up to 3 in-flight
+  handshakes are held, then closed silently. Client fds are non-blocking in
+  both transports, with the shared `rxbuff` + write-hook backpressure model.
 - **Reader:** accumulate in a buffer, split on `\n`, JSON-parse each line,
   dispatch on `type`. Partial reads wait for more data (return `RC_OK`).
 - **Writer:** `sendall()` is safe enough at these volumes; if the socket ever
@@ -450,9 +451,10 @@ pi-weechat/
 
 ## 10. Open questions
 
-- Multi-session: one pi process = one connection, still — now spanning both
-  transports (a TCP client and a Unix client are mutually exclusive). If two
-  pi instances run, the current build keeps "first authenticated client
-  wins"; a future version could multiplex by session id in the hello.
+- ~~Multi-session~~ **resolved**: one buffer per connected pi session — the
+  hello's optional `sessionId` reattaches a reconnecting session to its
+  existing buffer (history kept); a live session id is never shared (
+  `session_id_in_use`); the load-time buffer keeps the name `pi`, later
+  buffers are named `pi:<shortened cwd>`.
 - WeeChat colors: hardcode a small palette vs. read `weechat.color` settings —
   start hardcoded.
