@@ -257,11 +257,14 @@ test("integration: real extension ↔ real weechat script", async (t) => {
   const c2msgsBefore = c2msgs.length;
   wc.send({ op: "input", text: "ping one", buffer: "buffer" });
   await waitForMock(() => mock.sentUserMessages.some((m) => m.text === "ping one"), "extension: first-buffer input");
+  // bounded window: a misrouted copy would arrive on c2's socket promptly
+  await new Promise((r) => setTimeout(r, 250));
   assert.equal(c2msgs.length, c2msgsBefore, "first-buffer input never reaches the second client");
   // input in the SECOND buffer reaches the raw client, not the extension
   const echoesBefore = mock.sentUserMessages.length;
   wc.send({ op: "input", text: "ping two", buffer: c2connected.buffer });
   await waitForMock(() => c2msgs.some((m) => m.type === "user_input" && m.text === "ping two"), "second client: user_input");
+  await new Promise((r) => setTimeout(r, 250));
   assert.equal(mock.sentUserMessages.length, echoesBefore, "second-buffer input never reaches the extension");
   c2.end();
   await new Promise((res) => c2.once("close", res));
