@@ -4,10 +4,11 @@
 Loads the REAL weechat/pi_bridge.py against a stub weechat module, pumps its
 event loop, and talks to the node test over stdin/stdout:
 
-  stdin  lines:  {"op":"input","text":...}   simulate user typing in buffer
+  stdin  lines:  {"op":"input","text":...,"buffer":...}   simulate user typing (buffer defaults to "buffer")
                  {"op":"set","name":...,"value":...}  set a pi_bridge option
-                 {"op":"quit"}               shut down
-  stdout lines:  {"type":"print","text":...,"tags":...}  every line rendered in the buffer
+                 {"op":"dropclient"}       drop all authed clients (extension reconnects)
+                 {"op":"quit"}             shut down
+  stdout lines:  {"type":"print","buffer":...,"text":...,"tags":...}  every line rendered in a buffer
                  {"type":"title","text":...} buffer title changes
                  {"type":"ready","socket":...}
 """
@@ -31,7 +32,7 @@ def main():
     real_prnt = stub.prnt
     def prnt(buf, msg):
         real_prnt(buf, msg)
-        sys.stdout.write(json.dumps({"type": "print", "text": msg}) + "\n")
+        sys.stdout.write(json.dumps({"type": "print", "buffer": buf, "text": msg}) + "\n")
         sys.stdout.flush()
         return 1
     stub.prnt = prnt
@@ -40,7 +41,7 @@ def main():
     def prnt_date_tags(buf, date, tags, message):
         r = real_pdt(buf, date, tags, message)
         _, prefix, body = stub.printf_tags[-1]
-        sys.stdout.write(json.dumps({"type": "print", "text": body,
+        sys.stdout.write(json.dumps({"type": "print", "buffer": buf, "text": body,
                                      "tags": tags, "prefix": prefix}) + "\n")
         sys.stdout.flush()
         return r
@@ -50,7 +51,7 @@ def main():
     def buffer_set(b, prop, value):
         r = real_set(b, prop, value)
         if prop == "title":
-            sys.stdout.write(json.dumps({"type": "title", "text": value}) + "\n")
+            sys.stdout.write(json.dumps({"type": "title", "buffer": b, "text": value}) + "\n")
             sys.stdout.flush()
         return r
     stub.buffer_set = buffer_set
@@ -89,7 +90,7 @@ def main():
                 except ValueError:
                     continue
                 if op.get("op") == "input":
-                    ns["pi_input_cb"]("", "buffer", op.get("text", ""))
+                    ns["pi_input_cb"]("", op.get("buffer", "buffer"), op.get("text", ""))
                 elif op.get("op") == "set":
                     # config_set_plugin fires the hook_config callbacks, as
                     # in real WeeChat (this is how tests start the TCP listener)

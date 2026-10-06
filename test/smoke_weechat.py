@@ -1974,8 +1974,34 @@ def main():
     stub.pump(0.1)
     assert other.alive is False and s6.alive, "only the closed session's buffer dies"
     assert any(c["session"] is s6 for c in BRIDGE.clients), "s6's connection keeps running"
+    # stale !pick after reconnect: the pending prompt is dropped with the
+    # connection, so a !pick on the new connection answers nothing and sends
+    # no ui_response to the (new) peer
+    ma = unix_client()
+    assert client_hello(ma)["type"] == "hello"
+    stub.pump(0.2)
+    ma.sendall((json.dumps({"type": "session_info", "sessionId": "sid-p"}) + "\n").encode())
+    stub.pump(0.2)
+    sa = BRIDGE.sessions[-1]
+    ma.sendall((json.dumps({"type": "ui_request", "id": 42,
+                            "method": "select", "title": "stale?",
+                            "options": [{"label": "a"}, {"label": "b"}]}) + "\n").encode())
+    stub.pump(0.2)
+    assert sa.pending_ui is not None, "prompt is pending on the live conn"
+    ma.close()
+    stub.pump(0.3)
+    assert sa.pending_ui is None, "prompt is dropped with the connection"
+    ma2 = unix_client()
+    assert client_hello(ma2, session_id="sid-p")["type"] == "hello"
+    stub.pump(0.2)
+    ns["pi_input_cb"]("", sa.buffer, "!pick 1")
+    stub.pump(0.2)
+    out = []
+    drain(ma2, out)
+    assert not any(b"ui_response" in l for l in out), out
+    assert any("nothing to pick" in m for m in stub.buf_prints.get(sa.buffer, [])), stub.buf_names
     # tidy up
-    for cl in (m6, m7, m8b, m8c, m9b):
+    for cl in (m6, m7, m8b, m8c, m9b, ma2):
         cl.close()
     stub.pump(0.3)
     assert BRIDGE.clients == []
