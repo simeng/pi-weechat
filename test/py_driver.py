@@ -94,6 +94,10 @@ def main():
                     # config_set_plugin fires the hook_config callbacks, as
                     # in real WeeChat (this is how tests start the TCP listener)
                     stub.config_set_plugin(op["name"], op.get("value", ""))
+                elif op.get("op") == "dropclient":
+                    # drop every authed client (the extension reconnects)
+                    for conn in list(ns["BRIDGE"].clients):
+                        ns["BRIDGE"].drop_conn(conn)
                 elif op.get("op") == "quit":
                     quit = True
                     break

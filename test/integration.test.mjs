@@ -44,8 +44,8 @@ function startWeechatSide(sockPath) {
   return {
     child,
     lines,
-    waitFor(pred, what, ms = 5000) {
-      const hit = lines.find(pred);
+    waitFor(pred, what, ms = 5000, from = 0) {
+      const hit = lines.slice(from).find(pred);
       if (hit) return Promise.resolve(hit);
       return new Promise((resolve, reject) => {
         const timer = setTimeout(
@@ -127,6 +127,8 @@ const MOCK_CTX = {
   // No ask_user among the tools → the bridge registers its built-in fallback
   // (exercises the registerTool path); real pi lists pi-ask-user's tool here.
   getAllTools: () => [],
+  // session id for the multi-session reattach path (hello + session_info)
+  sessionManager: { getSessionId: () => "itg-session-id" },
 };
 
 // The extension module is a singleton (registered once); all scenarios
@@ -201,7 +203,23 @@ test("integration: real extension ↔ real weechat script", async (t) => {
   await wc.waitFor(
     (m) => m.type === "print" && m.text.includes("/tmp/itg") && m.text.includes("prov/model-itg"),
     "buffer: session line"
-  );
+    );
+    // reattach: the bridge drops the connection; the extension reconnects
+    // with the same sessionId and reattaches to the SAME buffer
+    const atDrop = wc.lines.length;
+    wc.send({ op: "dropclient" });
+    await wc.waitFor(
+      (m) => m.type === "print" && m.text.includes("pi disconnected"),
+      "buffer: pi disconnected",
+      5000,
+      atDrop
+    );
+    await wc.waitFor(
+      (m) => m.type === "print" && m.text.includes("pi connected"),
+      "buffer: pi reconnected (reattach by sessionId)",
+      5000,
+      atDrop
+    );
 
   // Echoing a prompt is only a mirror event; timers start with Pi's agent lifecycle,
   // not from a typed line or a WeeChat control command.
