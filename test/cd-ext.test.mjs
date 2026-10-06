@@ -22,21 +22,36 @@ mod.default({
 assert.deepEqual(apiCalls, ["cd"], "registers exactly the /cd command");
 
 function makeCtx(cwd) {
-  const calls = { switch: [], notify: [] };
+  const calls = { switch: [], notify: [], freshNotify: [] };
   let selectResponder;
+  let stale = false;
+  // Fresh ctx passed to the withSession callback (mimics pi's
+  // ReplacedSessionContext): only the UI bits the extension uses.
+  const fresh = { ui: { notify: (msg, type) => calls.freshNotify.push({ msg, type }) } };
   const ctx = {
     cwd,
     waitForIdle: async () => {},
     ui: {
-      notify: (msg, type) => calls.notify.push({ msg, type }),
+      notify: (msg, type) => {
+        if (stale) throw new Error("stale ctx used after session replacement");
+        calls.notify.push({ msg, type });
+      },
       select: async (title, options) => {
         calls.select = { title, options };
         return selectResponder ? selectResponder(title, options) : undefined;
       },
     },
-    switchSession: async (file) => {
+    // Mimics pi: withSession runs BEFORE switchSession resolves, and a
+    // successful replacement invalidates the old ctx. A cancelled switch
+    // invalidates nothing.
+    switchSession: async (file, options) => {
       calls.switch.push(file);
-      return { cancelled: false };
+      const cancelled = options?.forceCancel === true;
+      if (!cancelled) {
+        if (options?.withSession) await options.withSession(fresh);
+        stale = true;
+      }
+      return { cancelled };
     },
     calls,
     setSelect: (fn) => (selectResponder = fn),
@@ -74,7 +89,34 @@ test("handler: exact existing dir switches immediately (no select)", async (t) =
   assert.equal(ctx.calls.switch.length, 1, "one session switch");
   const header = JSON.parse(fs.readFileSync(ctx.calls.switch[0], "utf8"));
   assert.equal(header.cwd, proj);
-  assert.ok(ctx.calls.notify.some((n) => n.msg.includes(`switched to ${proj}`)));
+  // Success notification must go through the fresh withSession ctx; the mock
+  // throws if the handler touches the stale old ctx after the switch.
+  assert.ok(ctx.calls.freshNotify.some((n) => n.msg.includes(`switched to ${proj}`)));
+});
+
+test("handler: cancelled switchSession keeps using the old ctx safely", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cd-ext-swatch-cancel-"));
+  const proj = path.join(dir, "proj-scancel");
+  fs.mkdirSync(proj);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  t.after(() => {
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+  });
+  process.env.PI_CODING_AGENT_DIR = dir;
+
+  const ctx = makeCtx(dir);
+  ctx.switchSession = async (file, options) => {
+    // A cancelled switch replaces nothing: no withSession, old ctx stays valid.
+    ctx.calls.switch.push(file);
+    return { cancelled: true };
+  };
+  await handler("proj-scancel", ctx);
+
+  assert.equal(ctx.calls.switch.length, 1);
+  assert.ok(ctx.calls.notify.some((n) => n.msg === "(cd cancelled)"));
 });
 
 test("handler: typo fuzzy-selects 'create as new project'", async (t) => {

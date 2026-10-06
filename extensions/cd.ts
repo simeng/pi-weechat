@@ -93,11 +93,17 @@ export default function (pi: ExtensionAPI) {
   async function switchSessionToDir(targetCwd: string, ctx: any): Promise<void> {
     const resolvedTarget = path.resolve(targetCwd);
     const sessionFile = writeCdSessionHeader(resolvedTarget);
-    const result = await ctx.switchSession(sessionFile);
+    // A successful replacement invalidates this command's ctx, so the
+    // post-switch notification must run inside withSession with the fresh
+    // ctx. A cancelled switch replaces nothing, so the old ctx is still
+    // valid in the cancelled branch.
+    const result = await ctx.switchSession(sessionFile, {
+      withSession: async (fresh: any) => {
+        fresh.ui.notify(`switched to ${resolvedTarget}`, "info");
+      },
+    });
     if (result?.cancelled) {
       ctx.ui.notify("(cd cancelled)", "info");
-    } else {
-      ctx.ui.notify(`switched to ${resolvedTarget}`, "info");
     }
   }
 }
