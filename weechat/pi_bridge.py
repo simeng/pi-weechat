@@ -939,14 +939,19 @@ class Session(object):
     def make_buffer(self, name="pi"):
         self.buffer = weechat.buffer_new(name, "pi_input_cb", "",
                                          "pi_close_cb", "")
+        if self.buffer is None:
+            # name collision / buffer limit: stay bufferless (output paths
+            # tolerate that); a later reattach retries the creation
+            self.alive = False
+            return
         weechat.buffer_set(self.buffer, "title", "π: (waiting for pi)")
         weechat.buffer_set(self.buffer, "localvar_set_no_log", "1")
         weechat.buffer_set(self.buffer, "localvar_set_type", "private")
         weechat.buffer_set(self.buffer, "localvar_set_server", "pi")
         weechat.buffer_set(self.buffer, "short_name", name)
         self.bridge.session_by_buffer[self.buffer] = self
-        self.apply_user_nick()
         self.alive = True
+        self.apply_user_nick()
         self._print(C_STATUS + "pi bridge ready — socket %s%s" % (self.bridge.sock_path, R))
         self._print(C_DIM + "type a line to send it to pi; !help lists commands%s" % R)
 
@@ -978,7 +983,7 @@ class Session(object):
         localvar when the nick is empty — user lines then fall back to the
         '> ' marker.
         """
-        if self.buffer is None:
+        if not (self.alive and self.buffer):
             return
         nick = _user_nick()
         if nick:
@@ -1852,7 +1857,7 @@ class Bridge(object):
         """A buffer name not currently taken: base, base-2, base-3, …"""
         taken = set()
         for s in self.sessions:
-            if s.buffer:
+            if s.alive and s.buffer:
                 try:
                     name = weechat.buffer_get_string(s.buffer, "name")
                 except Exception:
@@ -2434,6 +2439,10 @@ def pi_close_cb(data, buffer):
     session = BRIDGE.session_by_buffer.pop(buffer, None)
     if session is not None:
         session.alive = False
+        # drop the native buffer pointer: WeeChat frees the buffer once
+        # this callback returns, so any later buffer_* call with it is a
+        # use-after-free (native crash, not catchable in Python).
+        session.buffer = None
     return weechat.WEECHAT_RC_OK
 
 

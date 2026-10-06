@@ -43,6 +43,7 @@ class WeechatStub:
         self.buf_names = {}       # buffer pointer -> name
         self.buf_prints = {}      # buffer pointer -> [lines printed to it]
         self.closed_bufs = set()  # closed: name released, like real WeeChat
+        self.stale_calls = []    # (func, buf, prop) API calls on closed bufs
         self.buffer_name = None
         self.registered = None
         self.plugin_opts = {}     # config_*_plugin storage
@@ -129,6 +130,7 @@ class WeechatStub:
         return buf
 
     def buffer_set(self, buf, prop, value):
+        self._note_stale("buffer_set", buf, prop)
         if prop in ("name", "short_name"):
             self.buf_names[buf] = value
         elif prop == "title":
@@ -146,7 +148,17 @@ class WeechatStub:
         self.buf_prints.pop(buf, None)
         return 1
 
+    def _note_stale(self, func, buf, prop):
+        """Record an API call aimed at a closed buffer pointer.
+        Real WeeChat dereferences these pointers natively (use-after-free
+        crash, e.g. in strlen) — the stub can't crash, so it records the
+        call and the test phases assert none happened (stale_calls == []).
+        """
+        if buf in self.closed_bufs:
+            self.stale_calls.append((func, buf, prop))
+
     def buffer_get_string(self, buf, prop):
+        self._note_stale("buffer_get_string", buf, prop)
         if buf in self.closed_bufs:
             return ""
         if prop in ("name", "short_name"):
@@ -154,10 +166,12 @@ class WeechatStub:
         return ""
 
     def prnt(self, buf, msg):
+        self._note_stale("prnt", buf, None)
         self.prints.append(("PRINT", msg))
         self.buf_prints.setdefault(buf, []).append(msg)
 
     def prnt_date_tags(self, buf, date, tags, message):
+        self._note_stale("prnt_date_tags", buf, None)
         # like the real API: the text before the first TAB is the line
         # prefix (prefix column); everything after it is the message body
         if "\t" in message:
@@ -2005,6 +2019,52 @@ def main():
         cl.close()
     stub.pump(0.3)
     assert BRIDGE.clients == []
+    # ==================================================================
+    # Phase M3 — stale buffer pointer (use-after-close) regression
+    # ==================================================================
+    # M2 ended with `other`'s buffer CLOSED (alive=False). Any buffer_*
+    # call passing that freed pointer would crash real WeeChat (use-
+    # after-free, e.g. in strlen); the stub records such calls in
+    # stub.stale_calls and asserts none happened.
+    assert other.alive is False
+    # mb is the first client of the quiet load_session: it takes the
+    # load-time `pi` buffer back (no new session is created)
+    mb = unix_client()
+    assert client_hello(mb)["type"] == "hello"
+    stub.pump(0.2)
+    sb = BRIDGE.load_session
+    assert sb.conn is not None and sb.alive
+    # mc: a genuinely new session → _new_buffer_name must skip the dead
+    # session's freed pointer (old code read it here → native crash)
+    mc = unix_client()
+    assert client_hello(mc)["type"] == "hello"
+    stub.pump(0.2)
+    sc = BRIDGE.sessions[-1]
+    # the new buffer's name must be unique among LIVE buffers (the dead
+    # session's pointer is never read, and its name is not counted)
+    live_names = {stub.buf_names[s.buffer] for s in BRIDGE.sessions
+                  if s.alive and s.buffer and s is not sc}
+    assert stub.buf_names[sc.buffer] not in live_names, stub.buf_names
+    # a nick config change re-applies the nick localvar to every LIVE
+    # session and must skip the dead one
+    stub.set_config("irc.server_default.nicks", "bob,bob2")
+    stub.pump(0.2)
+    # BOTH surviving sessions keep rendering
+    mb.sendall((json.dumps({"type": "assistant_line", "msgId": 1,
+                            "text": "still alive"}) + "\n").encode())
+    mc.sendall((json.dumps({"type": "assistant_line", "msgId": 1,
+                            "text": "so is mc"}) + "\n").encode())
+    # a lone paragraph line stays buffered (markdown block) until flushed
+    mb.sendall((json.dumps({"type": "assistant_flush"}) + "\n").encode())
+    mc.sendall((json.dumps({"type": "assistant_flush"}) + "\n").encode())
+    stub.pump(0.2)
+    assert any("still alive" in m for m in stub.buf_prints[sb.buffer])
+    assert any("so is mc" in m for m in stub.buf_prints[sc.buffer])
+    for cl in (mb, mc):
+        cl.close()
+    stub.pump(0.3)
+    assert BRIDGE.clients == []
+    assert stub.stale_calls == [], "stale (closed-buffer) API calls: %s" % stub.stale_calls
 
     print("smoke weechat: OK (%d buffer lines rendered)" % len(stub.prints))
 
