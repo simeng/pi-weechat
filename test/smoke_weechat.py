@@ -290,6 +290,7 @@ def main():
         code = f.read()
     exec(compile(code, SCRIPT, "exec"), ns)
     BRIDGE = ns["BRIDGE"]
+    SESSION = BRIDGE.load_session  # per-session state lives here
     # expected cwd rendering for title/session assertions (respects ~)
     proj = ns["_short_path"]("/home/x/proj")
 
@@ -430,7 +431,7 @@ def main():
     assert fmt_elapsed(3600) == "1h", fmt_elapsed(3600)
     assert fmt_elapsed(3665) == "1h1m", fmt_elapsed(3665)
 
-    BRIDGE.state = "thinking"
+    SESSION.state = "thinking"
     timing = {
         "type": "timing", "runMs": 12_000, "turnMs": 42_000,
         "turn": 10, "turns": 10, "runActive": True, "turnActive": True,
@@ -442,10 +443,10 @@ def main():
 
     # The local WeeChat tick advances a received active snapshot, not state
     # reconstructed from inputs. Turn elapsed includes tool time.
-    BRIDGE.timing_received_at = time.monotonic() - 90
+    SESSION.timing_received_at = time.monotonic() - 90
     ns["pi_tick_cb"]("", 0)
     assert stub.title == "π: %s (thinking… · run 1m · 2m · turn 10)" % proj, stub.title
-    BRIDGE.state = "tool:bash"
+    SESSION.state = "tool:bash"
     ns["pi_tick_cb"]("", 0)
     assert stub.title == "π: %s (tool: bash · run 1m · 2m · turn 10)" % proj, stub.title
 
@@ -454,7 +455,7 @@ def main():
     send(paused)
     pump_and_drain(client, 0.2)
     paused_title = stub.title
-    BRIDGE.timing_received_at = time.monotonic() - 90
+    SESSION.timing_received_at = time.monotonic() - 90
     ns["pi_tick_cb"]("", 0)
     assert stub.title == paused_title
     assert "run 15s · 9s · turn 10" in stub.title, stub.title
@@ -463,7 +464,7 @@ def main():
     between_turns = dict(timing, runMs=35_000, turnMs=42_000, turnActive=False)
     send(between_turns)
     pump_and_drain(client, 0.2)
-    BRIDGE.timing_received_at = time.monotonic() - 10
+    SESSION.timing_received_at = time.monotonic() - 10
     ns["pi_tick_cb"]("", 0)
     assert "run 45s · 42s · turn 10" in stub.title, stub.title
 
@@ -473,12 +474,12 @@ def main():
         turnActive=False, runPaused=False,
     )
     send(settled)
-    BRIDGE.state = "idle"  # the settle banner is covered in the previous phase
+    SESSION.state = "idle"  # the settle banner is covered in the previous phase
     send({"type": "status", "state": "idle"})
     pump_and_drain(client, 0.2)
     assert stub.title == "π: %s (idle · last run 17m · 10 turns)" % proj, stub.title
     frozen_title = stub.title
-    BRIDGE.timing_received_at = time.monotonic() - 90
+    SESSION.timing_received_at = time.monotonic() - 90
     ns["pi_tick_cb"]("", 0)
     assert stub.title == frozen_title, "settled timing summary must remain frozen"
 
@@ -595,7 +596,7 @@ def main():
     assert "1. /opt/alpha" in text and "2. /opt/beta" in text
     assert "the beta one" in text, "option description must render"
     assert "!pick cancel" in text, "hint line must mention !pick"
-    assert BRIDGE.pending_ui is not None and BRIDGE.pending_ui["id"] == 7
+    assert SESSION.pending_ui is not None and SESSION.pending_ui["id"] == 7
     assert stub.title == "π: %s (idle · last run 17m · 10 turns) — awaiting !pick" % proj, stub.title
 
     # !pick by number → ui_response with the option text; title hint clears
@@ -604,7 +605,7 @@ def main():
     msg = json.loads(recv_lines.pop(0))
     assert msg == {"type": "ui_response", "id": 7,
                    "value": "/opt/beta"}, msg
-    assert BRIDGE.pending_ui is None
+    assert SESSION.pending_ui is None
     assert stub.title == "π: %s (idle · last run 17m · 10 turns)" % proj, stub.title
 
     # multi-select: comma list → array value; out-of-range number rejected
@@ -639,12 +640,12 @@ def main():
     pump_and_drain(client, 0.3)
     msg = json.loads(recv_lines.pop(0))
     assert msg == {"type": "ui_response", "id": 10, "cancelled": True}, msg
-    assert BRIDGE.pending_ui["id"] == 11
+    assert SESSION.pending_ui["id"] == 11
     ns["pi_input_cb"]("", "buffer", "!pick cancel")
     pump_and_drain(client, 0.4)
     msg = json.loads(recv_lines.pop(0))
     assert msg == {"type": "ui_response", "id": 11, "cancelled": True}, msg
-    assert BRIDGE.pending_ui is None
+    assert SESSION.pending_ui is None
 
     # input prompt: free-form answer via !pick <text> (incl. spaces)
     send({"type": "ui_request", "id": 12, "method": "input",
@@ -661,7 +662,7 @@ def main():
     # a malformed ui_request is ignored (no pending state, nothing sent)
     send({"type": "ui_request", "method": "select"})
     pump_and_drain(client, 0.3)
-    assert recv_lines == [] and BRIDGE.pending_ui is None
+    assert recv_lines == [] and SESSION.pending_ui is None
     assert "bad ui_request" in buffer_text(stub)
 
     # the !cd / !pick lines typed above were echoed under the user's IRC nick
@@ -850,7 +851,7 @@ def main():
     ns["pi_input_cb"]("", "buffer", "!nick bogus")
     pump_and_drain(client, 0.2)
     assert "unknown nick mode" in buffer_text(stub), "!nick rejects bad modes"
-    assert BRIDGE.nicks_mode() == "auto", "a rejected mode must not stick"
+    assert SESSION.nicks_mode() == "auto", "a rejected mode must not stick"
 
     # !nick pi restores the single-nick rendering, tool name back in the body
     ns["pi_input_cb"]("", "buffer", "!nick pi")
@@ -904,7 +905,7 @@ def main():
                for tags, _, body in rows), "grep end keeps the grep nick"
     assert any("nick_read" in tags and "permission denied" in body
                for tags, _, body in rows), "read end keeps the read nick"
-    assert "t9" not in BRIDGE.tool_nicks and "t10" not in BRIDGE.tool_nicks, \
+    assert "t9" not in SESSION.tool_nicks and "t10" not in SESSION.tool_nicks, \
         "completed calls are dropped from the id map"
 
     # an end whose start was never seen (reconnect mid-call) still renders,
@@ -1163,7 +1164,7 @@ def main():
         "line 2 closes it and restores the base style"
 
     # --- headings (unit level): tiered attributes, markers stripped
-    rmb = BRIDGE._render_md_block
+    rmb = SESSION._render_md_block
     HEAD, UNDER, DIMA = ns["C_HEADING"], ns["A_UNDERLINE"], ns["A_DIM"]
     assert rmb(["# Title"], "heading", True) == [HEAD + BOLD + UNDER + "Title" + RS]
     assert rmb(["## Second"], "heading", True) == [HEAD + BOLD + "Second" + RS]
@@ -1478,7 +1479,7 @@ def main():
     send({"type": "tool_start", "toolCallId": "t12", "toolName": "bash",
           "args": {"command": "sleep 60"}})
     pump_and_drain(client, 0.2)
-    assert BRIDGE.tool_nicks.get("t12") == "bash", "open call remembered by id"
+    assert SESSION.tool_nicks.get("t12") == "bash", "open call remembered by id"
 
     send({"type": "assistant_line", "msgId": 67, "text": "stranded by disconnect"})
     pump_and_drain(client, 0.2)
@@ -1491,10 +1492,10 @@ def main():
     assert BRIDGE.client is None
     assert any("stranded by disconnect" in t for k, t in stub.prints), \
         "disconnect flushes a half-built block instead of losing it"
-    assert BRIDGE._md_block == [] and BRIDGE._md_block_type is None, \
+    assert SESSION._md_block == [] and SESSION._md_block_type is None, \
         "disconnect resets the block accumulator"
-    assert BRIDGE.tool_nicks == {}, "disconnect must clear the toolCallId→nick map"
-    assert BRIDGE.timing_snapshot is None, "disconnect must discard the stale snapshot"
+    assert SESSION.tool_nicks == {}, "disconnect must clear the toolCallId→nick map"
+    assert SESSION.timing_snapshot is None, "disconnect must discard the stale snapshot"
 
     # ==================================================================
     # Phase D — TCP listener

@@ -889,30 +889,31 @@ def _fmt_elapsed(secs):
     h, m = s // 3600, (s % 3600) // 60
     return ("%dh%dm" % (h, m)) if m else ("%dh" % h)
 
-class Bridge(object):
-    def __init__(self):
+class Session(object):
+    """One pi session: a persistent buffer/controller with a replaceable
+    connection.
+
+    All per-session rendering and input state (buffer, markdown block state,
+    pending prompts, tool nicks, timing, rate-limit window) lives here; the
+    Bridge owns the listeners and the connection/transport mechanics. The
+    load-time buffer's session takes the first client and keeps the name
+    `pi`; each further connection gets its own Session + buffer. A Session
+    survives disconnects so a reconnect can reattach to the same buffer.
+    """
+
+    def __init__(self, bridge, fixed_name=False):
+        self.bridge = bridge
+        self.conn = None              # current authed conn dict, or None
+        self.fixed_name = fixed_name  # load-time session keeps the name "pi"
         self.buffer = None
         self.alive = False            # buffer still open?
-        self.sock_path = default_socket_path()
-        # unix listener (always on)
-        self.listen_sock = None
-        self.listen_hook = None
-        # tcp listener (opt-in, live rebind via pi_config_cb)
-        self.tcp_listen_sock = None
-        self.tcp_listen_hook = None
-        self.tcp_listen_value = ""
-        self.config_hook = None
-        self.nick_config_hook = None  # irc.server_default.nicks live re-apply
-        # connections: one AUTHED client + a few in-handshake pendings
-        self.client = None            # the authenticated conn (dict, or None)
-        self.pending = []             # accepted, not authed yet (list of dicts)
-        # per-IP abuse state (TCP peers only)
-        self.ip_failures = {}         # ip -> [timestamps of auth failures]
-        self.ip_lockouts = {}         # ip -> lockout-until (epoch)
+        self.session_id = ""          # pi session id ("" = unknown/absent)
+        self.session_cwd = ""         # last cwd from session_info (buffer title)
+        self.state = "waiting"        # waiting | idle | thinking | tool:<name>
+        self._detail = None           # current title detail hint, kept across ticks
+        self._last_title = None       # last title pushed (churn avoidance)
         # user_input (buffer → pi) rate-limit window
         self.ui_times = []
-        self.state = "waiting"        # waiting | idle | thinking | tool:<name>
-        self.session_cwd = ""         # last cwd from session_info (buffer title)
         # markdown fence tracking for streamed assistant lines (per message)
         self._md_msg = None           # msgId of the last assistant_line seen
         self._md_fence = None         # open fence dict (see _fence_open), or None
@@ -934,48 +935,19 @@ class Bridge(object):
         # active snapshot between lifecycle updates for title redraws.
         self.timing_snapshot = None
         self.timing_received_at = None
-        self._last_title = None       # last title pushed (churn avoidance)
-        self.tick_hook = None         # 1s hook_timer handle (live counter)
-        self._detail = None           # current title detail hint, kept across ticks
-
-    # ------------------------------------------------------- connection state
-
-    def _new_conn(self, conn_sock, ip, peer):
-        return {
-            "sock": conn_sock,
-            "fd": conn_sock.fileno(),
-            "ip": ip,                 # None for unix
-            "peer": peer,             # human label for logs/prints
-            "rxbuff": b"",
-            "outq": b"",
-            "read_hook": None,
-            "write_hook": None,
-            "timer": None,            # auth-deadline hook_timer handle
-            "authed": False,
-            "token": None,            # token we challenged with (None = anon)
-            "nonce": None,
-        }
-
-    def _conn_by_fd(self, fd):
-        if self.client is not None and self.client["fd"] == fd:
-            return self.client
-        for conn in self.pending:
-            if conn["fd"] == fd:
-                return conn
-        return None
-
     # ---------------------------------------------------------------- buffer
-
-    def make_buffer(self):
-        self.buffer = weechat.buffer_new("pi", "pi_input_cb", "", "pi_close_cb", "")
+    def make_buffer(self, name="pi"):
+        self.buffer = weechat.buffer_new(name, "pi_input_cb", "",
+                                         "pi_close_cb", "")
         weechat.buffer_set(self.buffer, "title", "π: (waiting for pi)")
         weechat.buffer_set(self.buffer, "localvar_set_no_log", "1")
         weechat.buffer_set(self.buffer, "localvar_set_type", "private")
         weechat.buffer_set(self.buffer, "localvar_set_server", "pi")
-        weechat.buffer_set(self.buffer, "short_name", "pi")
+        weechat.buffer_set(self.buffer, "short_name", name)
+        self.bridge.session_by_buffer[self.buffer] = self
         self.apply_user_nick()
         self.alive = True
-        self._print(C_STATUS + "pi bridge ready — socket %s%s" % (self.sock_path, R))
+        self._print(C_STATUS + "pi bridge ready — socket %s%s" % (self.bridge.sock_path, R))
         self._print(C_DIM + "type a line to send it to pi; !help lists commands%s" % R)
 
     def _print(self, text):
@@ -991,6 +963,13 @@ class Bridge(object):
         if self.alive and self.buffer:
             weechat.prnt(self.buffer, text)
 
+    def _send(self, obj):
+        """Send to this session's connection (drop, with a dbg note, if it
+        is gone — the line would reach no one)."""
+        if self.conn is None:
+            dbg("_send %s DROPPED (no conn)" % obj.get("type"))
+            return
+        self.bridge._send_to(self.conn, obj)
 
     def apply_user_nick(self):
         """(Re)apply the user-nick buffer localvar from
@@ -1006,7 +985,6 @@ class Bridge(object):
             weechat.buffer_set(self.buffer, "localvar_set_nick", nick)
         else:
             weechat.buffer_set(self.buffer, "localvar_unset_nick", "")
-
 
     def _print_msg(self, text, role, nick=None):
         """Render one line for a role (message body colors unchanged).
@@ -1121,47 +1099,6 @@ class Bridge(object):
         self.set_state(self.state, self._detail)
 
     # ---------------------------------------------------------------- options
-
-    def _opt(self, name):
-        """Read a pi_bridge.* plugin option (WeeChat expands ${sec.data.…})."""
-        if weechat is None:
-            return ""
-        try:
-            return (weechat.config_get_plugin(name) or "").strip()
-        except Exception:
-            return ""
-
-    def _token(self):
-        return self._opt("token")
-
-    def _allowed_ips_re(self):
-        """Compiled allowed_ips regex, or None (empty = allow all)."""
-        raw = self._opt("allowed_ips")
-        if not raw:
-            return None
-        try:
-            return re.compile(raw)
-        except re.error as err:
-            dbg("allowed_ips: invalid regex %r: %s (treating as allow-all)"
-                % (raw, err))
-            return None
-
-    def config_warnings(self):
-        """Loud buffer warnings for common misconfigurations."""
-        token = self._token()
-        if "${" in token:
-            self._print(C_REJECT +
-                        "pi_bridge.token still contains a ${…} reference — it "
-                        "was not expanded. Store the secret with "
-                        "/secure set pi_weechat_token <token> and use "
-                        "/set plugins.var.python.pi_bridge.token \"${sec.data.pi_weechat_token}\""
-                        + R)
-        if self._opt("tcp_listen") and not token:
-            self._print(C_ERR +
-                        "pi_bridge.tcp_listen is set but pi_bridge.token is "
-                        "empty — TCP clients are accepted WITHOUT "
-                        "authentication" + R)
-
     def tool_output_mode(self):
         """pi_bridge.tool_output option: full | summary | off."""
         return self._plugin_option("tool_output", TOOL_OUTPUT_MODES, DEFAULT_TOOL_OUTPUT)
@@ -1183,6 +1120,24 @@ class Bridge(object):
         """pi_bridge.markdown option: on | off."""
         return self._plugin_option("markdown", MARKDOWN_MODES, DEFAULT_MARKDOWN) == "on"
 
+    def _plugin_option(self, name, modes, default):
+        if weechat is None:
+            return default
+        try:
+            v = (weechat.config_get_plugin(name) or "").strip().lower()
+        except Exception:
+            v = ""
+        return v if v in modes else default
+
+    @staticmethod
+    def _set_plugin_option(name, value):
+        if weechat is None:
+            return
+        try:
+            weechat.config_set_plugin(name, value)
+        except Exception:
+            pass
+
     def _remember_tool(self, call_id, name):
         """Learn toolCallId → nick so the result line can reuse it.
 
@@ -1199,7 +1154,6 @@ class Bridge(object):
         return nick
 
     # ------------------------------------------------ markdown code blocks
-
     def _print_assistant(self, text, msg_id):
         """Print one streamed assistant line (markdown aware).
 
@@ -1409,14 +1363,505 @@ class Bridge(object):
             rendered, pending = _md_inline(line, base, pending, rest)
             out.append(base + rendered + R)
         return out
-    def _plugin_option(self, name, modes, default):
+
+    # ------------------------------------------------------------ dispatching
+    def dispatch(self, msg):
+        t = msg.get("type")
+        if t == "hello":
+            return  # already handled (and gated) in _handle
+        if t == "ping":
+            self._send({"type": "pong", "ts": msg.get("ts")})
+            return
+        if t == "timing":
+            run_ms = msg.get("runMs")
+            turn_ms = msg.get("turnMs")
+            turn = msg.get("turn")
+            turns = msg.get("turns")
+            run_active = msg.get("runActive")
+            turn_active = msg.get("turnActive")
+            run_paused = msg.get("runPaused")
+            has_run = msg.get("hasRun")
+            numbers = (run_ms, turn_ms, turns)
+            if any(type(v) is not int or v < 0 or v > 2**53 - 1
+                   for v in numbers):
+                return
+            if ((turn is not None and (type(turn) is not int or turn < 1))
+                    or any(type(v) is not bool for v in
+                           (run_active, turn_active, run_paused, has_run))):
+                return
+            self.timing_snapshot = {
+                "runMs": run_ms,
+                "turnMs": turn_ms,
+                "turn": turn,
+                "turns": max(turns, turn or 0),
+                "runActive": run_active,
+                "turnActive": turn_active,
+                "runPaused": run_paused,
+                "hasRun": has_run,
+            }
+            self.timing_received_at = time.monotonic()
+            self.set_state(self.state, self._detail)
+            return
+        if t == "status":
+            state = msg.get("state", "idle")
+            was_busy = self.state == "thinking" or self.state.startswith("tool:")
+            self.set_state(state, msg.get("detail"))
+            if state == "idle" and was_busy and self.alive and self.buffer:
+                # turn settled: one extra highlight line below the last
+                # message line (left untouched); date 0 ⇒ now
+                weechat.prnt_date_tags(self.buffer, 0, "notify_highlight",
+                                       C_OK + "✔ ready!" + R)
+            return
+        if t == "session_info":
+            cwd = msg.get("cwd")
+            if isinstance(cwd, str) and cwd:
+                self.session_cwd = cwd
+                self.set_state(self.state)  # refresh the title with the path
+            bits = []
+            if cwd:
+                bits.append(_short_path(str(cwd)))
+            if msg.get("model"):
+                bits.append(msg["model"])
+            if msg.get("name"):
+                bits.append("“%s”" % msg["name"])
+            self._print(C_STATUS + "session: %s%s" % (" ".join(bits) or "(unnamed)", R))
+            return
+        if t == "user_echo":
+            text = msg.get("text", "")
+            for line in str(text).splitlines() or [""]:
+                self._print_msg(line, "user")
+            return
+        if t == "assistant_line":
+            self._print_assistant(msg.get("text", ""), msg.get("msgId"))
+            return
+        if t == "thinking_line":
+            if not self.thinking_enabled():
+                return  # hidden; the line is dropped entirely
+            self._print_msg(C_DIM + "\U0001F4AD " + msg.get("text", "") + R,
+                            "pi", THINK_NICK)
+            return
+        if t == "assistant_flush":
+            self._flush_md_block()   # the message is over: print what is pending
+            return
+        if t == "tool_start":
+            name = msg.get("toolName") or "tool"
+            nick = self._remember_tool(msg.get("toolCallId"), name)
+            summary = format_tool_args(name, msg.get("args") or {})
+            # auto: the nick column already names the tool, so the body is just
+            # glyph + args. pi mode: keep the name in the body (legacy look).
+            body = C_TOOL + "⚙"
+            if self.nicks_mode() != "auto":
+                body += " " + name
+            if summary:
+                body += C_DIM + " " + summary
+            self._print_msg(body + R, "pi", nick)
+            return
+        if t == "tool_end":
+            # tool_end carries no toolName on the wire: the nick comes back
+            # from the tool_start that opened this call (`tool` if that start
+            # was never seen — e.g. a reconnect in the middle of a tool).
+            # Legacy (`pi`) mode labels the line with that same nick, where
+            # before this option it always printed the literal "tool".
+            nick = self.tool_nicks.pop(msg.get("toolCallId"), None) or "tool"
+            ok = not msg.get("isError")
+            color = C_OK if ok else C_ERR
+            glyph = "✔" if ok else "✘"
+            label = "" if self.nicks_mode() == "auto" else " " + nick
+            self._print_msg(color + glyph + label + R, "pi", nick)
+            for line in self._tool_output_lines(msg.get("output")):
+                self._print_msg(C_TOOL_OUT + "  " + line + R, "pi", nick)
+            return
+        if t == "ui_request":
+            self._handle_ui_request(msg)
+            return
+        if t == "error":
+            self._print(C_ERR + "pi bridge: %s: %s%s" % (
+                msg.get("code", "?"), msg.get("message", ""), R))
+            return
+        # unknown type: ignore (forward-compat)
+
+    def _tool_output_lines(self, output):
+        """Apply the pi_bridge.tool_output mode to a tool result."""
+        mode = self.tool_output_mode()
+        lines = str(output or "").splitlines()
+        if mode == "off":
+            return []
+        if mode == "full":
+            return lines
+        # summary: first 3 + last 3 lines, elide the middle (smart-filter style)
+        if len(lines) > 6:
+            return (lines[:3]
+                    + ["… (%d more lines)" % (len(lines) - 6)]
+                    + lines[-3:])
+        return lines
+
+    # ------------------------------------------------- interactive prompts
+    def _handle_ui_request(self, msg):
+        """Render a select/input prompt from pi; the user answers with !pick.
+
+        `select` shows numbered options (comma list when multiple);
+        `input` asks for free-form text. Only one prompt is tracked at a
+        time — a new request supersedes the old one, which is released on
+        the pi side with a cancelled ui_response so it doesn't wait forever.
+        """
+        req_id = msg.get("id")
+        method = msg.get("method")
+        title = str(msg.get("title") or "").strip() or "(untitled)"
+        if not isinstance(req_id, int) or method not in ("select", "input"):
+            self._print(C_ERR + "pi bridge: bad ui_request ignored" + R)
+            return
+        if self.pending_ui is not None and self.pending_ui["id"] != req_id:
+            self._send({"type": "ui_response", "id": self.pending_ui["id"],
+                        "cancelled": True})
+        if method == "select":
+            options = []
+            for opt in (msg.get("options") or [])[:24]:  # sanity cap
+                if isinstance(opt, dict) and isinstance(opt.get("label"), str):
+                    options.append((opt["label"],
+                                    str(opt.get("description") or "").strip()))
+                elif isinstance(opt, str) and opt:
+                    options.append((opt, ""))
+            if not options:
+                self._print(C_ERR + "pi bridge: select with no options ignored" + R)
+                return
+            multiple = bool(msg.get("multiple"))
+            self.pending_ui = {"id": req_id, "method": "select",
+                               "options": options, "multiple": multiple}
+            self._print(C_STATUS + "? " + title + R)
+            for i, (label, desc) in enumerate(options, 1):
+                self._print("%2d. %s" % (i, label))
+                if desc:
+                    self._print("    " + C_DIM + desc.replace("\n", " ") + R)
+            hint = "reply !pick <n>" + (", e.g. !pick 1,3 (multiple)" if multiple else "") \
+                   + " · !pick cancel"
+            self._print(C_DIM + hint + R)
+        else:  # input
+            self.pending_ui = {"id": req_id, "method": "input"}
+            self._print(C_STATUS + "? " + title + R)
+            placeholder = msg.get("placeholder")
+            ph = (" (%s)" % str(placeholder).replace("\n", " ")) if placeholder else ""
+            self._print(C_DIM + "reply !pick <your answer>%s · !pick cancel" % ph + R)
+        self.set_state(self.state, "awaiting !pick")
+
+    def handle_pick(self, arg, raw_line):
+        """Answer the pending ui_request with one buffer line.
+
+        select:  !pick <n> (comma list when multiple), or exact option text
+        input:   !pick <free-form text>
+        any:     !pick cancel
+        """
+        pending = self.pending_ui
+        if pending is None:
+            self._print(C_ERR +
+                        "nothing to pick — !pick answers a “?” prompt from pi" + R)
+            return
+        if arg == "" or arg in ("cancel", "c"):
+            self._respond_ui(pending, cancelled=True)
+            self._print_msg(raw_line, "user")
+            return
+        if pending["method"] == "input":
+            self._respond_ui(pending, value=arg)
+            self._print_msg(raw_line, "user")
+            return
+        # select: try numbers first ("3", or "1,3"), then exact option text
+        parts = [p.strip() for p in arg.split(",")]
+        if (all(p.isdigit() for p in parts)
+                and all(1 <= int(p) <= len(pending["options"]) for p in parts)):
+            chosen = [pending["options"][int(p) - 1][0] for p in parts]
+            if not pending["multiple"] and len(chosen) > 1:
+                self._print(C_ERR + "single choice only — pick one number" + R)
+                return
+            value = chosen if pending["multiple"] else chosen[0]
+        else:
+            value = None
+            for label, _desc in pending["options"]:
+                if label == arg:
+                    value = [label] if pending["multiple"] else label
+                    break
+            if value is None:
+                self._print(C_ERR + "no such option: %s (numbers 1-%d, or “cancel”)"
+                            % (arg, len(pending["options"])) + R)
+                return
+        self._respond_ui(pending, value=value)
+        self._print_msg(raw_line, "user")
+
+    def _respond_ui(self, pending, value=None, cancelled=False):
+        """Send the ui_response for `pending` (rate-limited like input: it
+        unblocks a pi command, so a flooded buffer must not unblock many)."""
+        now = time.time()
+        self.ui_times = [t for t in self.ui_times if now - t < 1.0]
+        if len(self.ui_times) >= USER_INPUT_MAX_PER_S:
+            self._print(C_REJECT + "input rate limited (max %d/s)%s"
+                        % (USER_INPUT_MAX_PER_S, R))
+            return
+        self.ui_times.append(now)
+        msg = {"type": "ui_response", "id": pending["id"]}
+        if cancelled:
+            msg["cancelled"] = True
+        else:
+            msg["value"] = value
+        self._send(msg)
+        self.pending_ui = None
+        self.set_state(self.state)  # drop the “awaiting !pick” title hint
+
+    # ---------------------------------------------------------- user input
+    def _send_user_input(self, text, echo, msg):
+        """Forward one buffer line to pi as user_input (rate-limited).
+
+        `text` is what goes on the wire (prefixes like "!s " stripped),
+        `echo` is what gets echoed into the buffer (the line as typed).
+
+        This is the only path that spends the remote pi's LLM budget, so it
+        is the only message type rate-limited (a flooded buffer — relay
+        input, a bot, a compromised local host — must not translate 1:1
+        into prompts). The line is still echoed into the buffer either way.
+        """
+        now = time.time()
+        self.ui_times = [t for t in self.ui_times if now - t < 1.0]
+        if len(self.ui_times) >= USER_INPUT_MAX_PER_S:
+            self._print(C_REJECT + "input rate limited (max %d/s)%s"
+                        % (USER_INPUT_MAX_PER_S, R))
+            self._send({"type": "error", "code": "rate_limited"})
+        else:
+            self.ui_times.append(now)
+            self._send(dict(msg, type="user_input", text=text))
+        self._print_msg(echo, "user")
+
+    def on_input(self, line):
+        if self.conn is None or not self.conn.get("authed"):
+            self._print(C_ERR + "not connected to pi (see buffer title)" + R)
+            return
+        line = line.strip()
+        if not line:
+            return
+        # buffer-local commands (handled here, never reach pi)
+        if line in ("!help", "?"):
+            for h in HELP_TEXT.splitlines():
+                self._print(C_STATUS + h + R)
+            return
+        if line == "!tools":
+            self._print(C_STATUS + "tool output mode: %s (full | summary | off)%s"
+                        % (self.tool_output_mode(), R))
+            return
+        if line.startswith("!tools "):
+            arg = line[7:].strip().lower()
+            if arg in TOOL_OUTPUT_MODES:
+                self._set_plugin_option("tool_output", arg)
+                self._print(C_STATUS + "tool output mode: %s%s" % (arg, R))
+            else:
+                self._print(C_ERR + "unknown tool output mode: %s (full | summary | off)%s"
+                            % (arg, R))
+            return
+        if line == "!nick":
+            self._print(C_STATUS + "nick mode: %s (auto | pi)%s"
+                        % (self.nicks_mode(), R))
+            return
+        if line.startswith("!nick "):
+            arg = line[6:].strip().lower()
+            if arg in NICK_MODES:
+                self._set_plugin_option("nicks", arg)
+                self._print(C_STATUS + "nick mode: %s%s" % (arg, R))
+            else:
+                self._print(C_ERR + "unknown nick mode: %s (auto | pi)%s"
+                            % (arg, R))
+            return
+        if line == "!think":
+            self._print(C_STATUS + "thinking: %s (!think on|off)%s" % (
+                "on" if self.thinking_enabled() else "off", R))
+            return
+        if line.startswith("!think "):
+            arg = line[7:].strip().lower()
+            if arg in THINKING_MODES:
+                self._set_plugin_option("thinking", arg)
+                self._print(C_STATUS + "thinking: %s%s" % (arg, R))
+            else:
+                self._print(C_ERR + "unknown thinking mode: %s (on | off)%s"
+                            % (arg, R))
+            return
+        if line == "!highlight":
+            self._print(C_STATUS + "code highlighting: %s (!highlight on|off)%s" % (
+                "on" if self.highlight_enabled() else "off", R))
+            return
+        if line.startswith("!highlight "):
+            arg = line[11:].strip().lower()
+            if arg in HIGHLIGHT_MODES:
+                self._set_plugin_option("highlight", arg)
+                self._print(C_STATUS + "code highlighting: %s%s" % (arg, R))
+            else:
+                self._print(C_ERR + "unknown highlight mode: %s (on | off)%s"
+                            % (arg, R))
+            return
+        if line == "!markdown":
+            self._print(C_STATUS + "markdown rendering: %s (!markdown on|off)%s" % (
+                "on" if self.markdown_enabled() else "off", R))
+            return
+        if line.startswith("!markdown "):
+            arg = line[10:].strip().lower()
+            if arg in MARKDOWN_MODES:
+                self._flush_md_block()  # pending text keeps the mode it started in
+                self._set_plugin_option("markdown", arg)
+                self._print(C_STATUS + "markdown rendering: %s%s" % (arg, R))
+            else:
+                self._print(C_ERR + "unknown markdown mode: %s (on | off)%s"
+                            % (arg, R))
+            return
+        # buffer-local control commands → protocol 'command' messages
+        command_map = {
+            "!new": "new_session",
+            "!compact": "compact",
+            "!abort": "abort",
+            "!status": "status",
+        }
+        if line in command_map:
+            self._send({"type": "command", "name": command_map[line]})
+            self._print_msg(line, "user")
+        elif line == "!model":
+            self._send({"type": "command", "name": "model"})
+            self._print_msg(line, "user")
+        elif line.startswith("!model "):
+            # pi's setModel via the weechat-ctl extension command
+            self._send({"type": "command", "name": "model",
+                        "arg": line[7:].strip()})
+            self._print_msg(line, "user")
+        elif line == "!cd" or (line.startswith("!cd ") and not line[4:].strip()):
+            self._print(C_ERR + "usage: !cd <path> — e.g. !cd ~/my-project" + R)
+            return
+        elif line.startswith("!cd "):
+            # switch pi to a project dir; fuzzy matches (and the "create as
+            # new project" option) come back as a ? prompt answered with !pick
+            self._send({"type": "command", "name": "cd", "arg": line[4:].strip()})
+            self._print_msg(line, "user")
+        elif line == "!pick" or line.startswith("!pick "):
+            self.handle_pick(line[5:].strip(), line)
+            return
+        elif line.startswith("!s "):
+            self._send_user_input(line[3:], line, {"deliverAs": "steer"})
+        elif line.startswith("!q "):
+            self._send_user_input(line[3:], line, {"deliverAs": "followUp"})
+        else:
+            self._send_user_input(line, line, {})
+
+    def handle_disconnect(self):
+        """The connection went away: forget per-connection rendering state
+        (a reconnect starts fresh msgIds on the pi side, so stale fence
+        state must not leak into new messages); the buffer stays open."""
+        self._md_msg = None
+        self._md_fence = None
+        self._flush_md_block()   # never strand a half-built block on screen
+        self._md_block_done()
+        self._md_blank_owed = False
+        # no live peer left to answer a pending prompt, and tool calls
+        # from the old connection will never be completed on this one
+        self.pending_ui = None
+        self.tool_nicks = {}
+        # Drop the last timing snapshot while disconnected. The extension
+        # will send a fresh Pi-owned snapshot after the next handshake.
+        self.timing_snapshot = None
+        self.timing_received_at = None
+        self.set_state("waiting")
+        self._print(C_DIM + "— pi disconnected —%s" % R)
+
+class Bridge(object):
+    def __init__(self):
+        self.sock_path = default_socket_path()
+        # unix listener (always on)
+        self.listen_sock = None
+        self.listen_hook = None
+        # tcp listener (opt-in, live rebind via pi_config_cb)
+        self.tcp_listen_sock = None
+        self.tcp_listen_hook = None
+        self.tcp_listen_value = ""
+        self.config_hook = None
+        self.nick_config_hook = None  # irc.server_default.nicks live re-apply
+        # connections: one AUTHED client + a few in-handshake pendings
+        self.sessions = []             # all Sessions (creation order)
+        self.load_session = Session(self, fixed_name=True)  # takes the 1st client
+        self.sessions.append(self.load_session)
+        self.session_by_buffer = {}   # buffer pointer → Session
+        self.session_by_id = {}       # session id → Session (reattach)
+        self.client = None            # the authenticated conn (dict, or None)
+        self.pending = []             # accepted, not authed yet (list of dicts)
+        # per-IP abuse state (TCP peers only)
+        self.ip_failures = {}         # ip -> [timestamps of auth failures]
+        self.ip_lockouts = {}         # ip -> lockout-until (epoch)
+        self.tick_hook = None         # 1s hook_timer handle (live counters)
+
+    # ------------------------------------------------------- connection state
+
+    def _new_conn(self, conn_sock, ip, peer):
+        return {
+            "sock": conn_sock,
+            "fd": conn_sock.fileno(),
+            "ip": ip,                 # None for unix
+            "peer": peer,             # human label for logs/prints
+            "rxbuff": b"",
+            "outq": b"",
+            "read_hook": None,
+            "write_hook": None,
+            "timer": None,            # auth-deadline hook_timer handle
+            "authed": False,
+            "token": None,            # token we challenged with (None = anon)
+            "nonce": None,
+        }
+
+    def _conn_by_fd(self, fd):
+        if self.client is not None and self.client["fd"] == fd:
+            return self.client
+        for conn in self.pending:
+            if conn["fd"] == fd:
+                return conn
+        return None
+
+    # ---------------------------------------------------------------- options
+
+    def _opt(self, name):
+        """Read a pi_bridge.* plugin option (WeeChat expands ${sec.data.…})."""
         if weechat is None:
-            return default
+            return ""
         try:
-            v = (weechat.config_get_plugin(name) or "").strip().lower()
+            return (weechat.config_get_plugin(name) or "").strip()
         except Exception:
-            v = ""
-        return v if v in modes else default
+            return ""
+
+    def _token(self):
+        return self._opt("token")
+
+    def _allowed_ips_re(self):
+        """Compiled allowed_ips regex, or None (empty = allow all)."""
+        raw = self._opt("allowed_ips")
+        if not raw:
+            return None
+        try:
+            return re.compile(raw)
+        except re.error as err:
+            dbg("allowed_ips: invalid regex %r: %s (treating as allow-all)"
+                % (raw, err))
+            return None
+
+    def config_warnings(self):
+        """Loud buffer warnings for common misconfigurations."""
+        token = self._token()
+        if "${" in token:
+            self._print_all(C_REJECT +
+                        "pi_bridge.token still contains a ${…} reference — it "
+                        "was not expanded. Store the secret with "
+                        "/secure set pi_weechat_token <token> and use "
+                        "/set plugins.var.python.pi_bridge.token \"${sec.data.pi_weechat_token}\""
+                        + R)
+        if self._opt("tcp_listen") and not token:
+            self._print_all(C_ERR +
+                        "pi_bridge.tcp_listen is set but pi_bridge.token is "
+                        "empty — TCP clients are accepted WITHOUT "
+                        "authentication" + R)
+
+    def make_buffer(self):
+        """Create the load-time buffer (its session keeps the name `pi`)."""
+        return self.load_session.make_buffer()
+
+    def _print_all(self, text):
+        """Print into every live session buffer (listener-level news)."""
+        for session in self.sessions:
+            session._print(text)
 
     # ------------------------------------------------------------ listeners
 
@@ -1448,8 +1893,8 @@ class Bridge(object):
         raw = self._opt("tcp_listen")
         host, port = _parse_tcp_listen(raw) if raw else (None, 0)
         if raw and host is None:
-            self._print(C_ERR + "pi bridge: bad tcp_listen value %r (want "
-                        "host:port, e.g. 0.0.0.0:52311)%s" % (raw, R))
+            self._print_all(C_ERR + "pi bridge: bad tcp_listen value %r (want "
+                                   "host:port, e.g. 0.0.0.0:52311)%s" % (raw, R))
             return False
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1465,7 +1910,7 @@ class Bridge(object):
             line += " (this host: %s)" % _local_ip()
         if self._token():
             line += " (token required)"
-        self._print(C_STATUS + line + R)
+        self._print_all(C_STATUS + line + R)
         dbg("tcp listener started on %s:%d" % (bound_host, bound_port))
         return True
 
@@ -1502,7 +1947,7 @@ class Bridge(object):
             except BlockingIOError:
                 return
             except OSError:
-                self._print(C_ERR + "pi bridge: accept error" + R)
+                self._print_all(C_ERR + "pi bridge: accept error" + R)
                 return
             self.on_accept(conn_sock, None, "unix")
 
@@ -1642,20 +2087,26 @@ class Bridge(object):
             line, conn["rxbuff"] = conn["rxbuff"].split(b"\n", 1)
             if len(line) > MAX_LINE:
                 if conn["authed"]:
-                    self._print(C_ERR + "pi bridge: dropped oversized message" + R)
+                    sess = conn.get("session")
+                    if sess:
+                        sess._print(C_ERR + "pi bridge: dropped oversized message" + R)
                 continue
             try:
                 msg = json.loads(line.decode("utf-8", "replace"))
             except ValueError:
                 if conn["authed"]:
-                    self._print(C_ERR + "pi bridge: bad JSON line ignored" + R)
+                    sess = conn.get("session")
+                    if sess:
+                        sess._print(C_ERR + "pi bridge: bad JSON line ignored" + R)
                 continue
             if isinstance(msg, dict):
                 try:
                     self._handle(conn, msg)
                 except Exception as err:  # never let one bad message kill the loop
                     if conn["authed"]:
-                        self._print(C_ERR + "pi bridge: dispatch error: %s%s" % (err, R))
+                        sess = conn.get("session")
+                        if sess:
+                            sess._print(C_ERR + "pi bridge: dispatch error: %s%s" % (err, R))
         if len(conn["rxbuff"]) > MAX_LINE:
             conn["rxbuff"] = b""
 
@@ -1670,7 +2121,7 @@ class Bridge(object):
             # handshake gating: everything before a valid hello is ignored
             dbg("pre-auth %r from %s — ignored" % (t, conn["peer"]))
             return
-        self.dispatch(msg)
+        conn["session"].dispatch(msg)
 
     def _handle_hello(self, conn, msg):
         if conn["authed"]:
@@ -1681,7 +2132,7 @@ class Bridge(object):
             proto = 0
         if proto != PROTOCOL:
             self._send_to(conn, {"type": "error", "code": "protocol_mismatch"})
-            self._print(C_ERR + "pi bridge: protocol mismatch" + R)
+            self._print_all(C_ERR + "pi bridge: protocol mismatch" + R)
             self.drop_conn(conn)
             return
         token = conn["token"]
@@ -1694,8 +2145,8 @@ class Bridge(object):
                 ok = False
             if not ok:
                 self._record_failure(conn)
-                self._print(C_REJECT + "pi bridge: auth failed from %s%s"
-                            % (conn["peer"], R))
+                self._print_all(C_REJECT + "pi bridge: auth failed from %s%s"
+                                % (conn["peer"], R))
                 self._send_to(conn, {"type": "error", "code": "auth_failed"})
                 self.drop_conn(conn)
                 return
@@ -1713,13 +2164,16 @@ class Bridge(object):
                 self.drop_conn(other)  # silently: they lost the race
         self.pending.remove(conn)
         self.client = conn
+        session = self.load_session
+        conn["session"] = session
+        session.conn = conn
         self._send_to(conn, {"type": "hello", "protocol": PROTOCOL,
                              "name": "weechat-pi-bridge"})
-        self.set_state("idle")
+        session.set_state("idle")
         if conn["ip"] is not None:
-            self._print(C_OK + "— pi connected from %s —%s" % (conn["ip"], R))
+            session._print(C_OK + "— pi connected from %s —%s" % (conn["ip"], R))
         else:
-            self._print(C_OK + "— pi connected —%s" % R)
+            session._print(C_OK + "— pi connected —%s" % R)
         dbg("client authed: %s" % conn["peer"])
 
     def auth_timeout(self, fd):
@@ -1742,23 +2196,11 @@ class Bridge(object):
             self.pending.remove(conn)
         if self.client is conn:
             self.client = None
-            # a reconnect starts fresh msgIds on the pi side — stale fence
-            # state from the old connection must not leak into new messages
-            self._md_msg = None
-            self._md_fence = None
-            self._flush_md_block()   # never strand a half-built block on screen
-            self._md_block_done()
-            self._md_blank_owed = False
-            # no live peer left to answer a pending prompt, and tool calls
-            # from the old connection will never be completed on this one
-            self.pending_ui = None
-            self.tool_nicks = {}
-            # Drop the last timing snapshot while disconnected. The extension
-            # will send a fresh Pi-owned snapshot after the next handshake.
-            self.timing_snapshot = None
-            self.timing_received_at = None
-            self.set_state("waiting")
-            self._print(C_DIM + "— pi disconnected —%s" % R)
+        session = conn.get("session")
+        if session is not None:
+            session.conn = None
+            conn["session"] = None
+            session.handle_disconnect()
 
     def _unhook_timer(self, conn):
         if conn.get("timer"):
@@ -1821,395 +2263,6 @@ class Bridge(object):
         if conn is not None:
             dbg("write_cb fired (outq=%d)" % len(conn["outq"]))
             self._try_flush(conn)
-
-    # ---------------------------------------------------------- dispatching
-
-    def dispatch(self, msg):
-        t = msg.get("type")
-        if t == "hello":
-            return  # already handled (and gated) in _handle
-        if t == "ping":
-            self._send({"type": "pong", "ts": msg.get("ts")})
-            return
-        if t == "timing":
-            run_ms = msg.get("runMs")
-            turn_ms = msg.get("turnMs")
-            turn = msg.get("turn")
-            turns = msg.get("turns")
-            run_active = msg.get("runActive")
-            turn_active = msg.get("turnActive")
-            run_paused = msg.get("runPaused")
-            has_run = msg.get("hasRun")
-            numbers = (run_ms, turn_ms, turns)
-            if any(type(v) is not int or v < 0 or v > 2**53 - 1
-                   for v in numbers):
-                return
-            if ((turn is not None and (type(turn) is not int or turn < 1))
-                    or any(type(v) is not bool for v in
-                           (run_active, turn_active, run_paused, has_run))):
-                return
-            self.timing_snapshot = {
-                "runMs": run_ms,
-                "turnMs": turn_ms,
-                "turn": turn,
-                "turns": max(turns, turn or 0),
-                "runActive": run_active,
-                "turnActive": turn_active,
-                "runPaused": run_paused,
-                "hasRun": has_run,
-            }
-            self.timing_received_at = time.monotonic()
-            self.set_state(self.state, self._detail)
-            return
-        if t == "status":
-            state = msg.get("state", "idle")
-            was_busy = self.state == "thinking" or self.state.startswith("tool:")
-            self.set_state(state, msg.get("detail"))
-            if state == "idle" and was_busy and self.alive and self.buffer:
-                # turn settled: one extra highlight line below the last
-                # message line (left untouched); date 0 ⇒ now
-                weechat.prnt_date_tags(self.buffer, 0, "notify_highlight",
-                                       C_OK + "✔ ready!" + R)
-            return
-        if t == "session_info":
-            cwd = msg.get("cwd")
-            if isinstance(cwd, str) and cwd:
-                self.session_cwd = cwd
-                self.set_state(self.state)  # refresh the title with the path
-            bits = []
-            if cwd:
-                bits.append(_short_path(str(cwd)))
-            if msg.get("model"):
-                bits.append(msg["model"])
-            if msg.get("name"):
-                bits.append("“%s”" % msg["name"])
-            self._print(C_STATUS + "session: %s%s" % (" ".join(bits) or "(unnamed)", R))
-            return
-        if t == "user_echo":
-            text = msg.get("text", "")
-            for line in str(text).splitlines() or [""]:
-                self._print_msg(line, "user")
-            return
-        if t == "assistant_line":
-            self._print_assistant(msg.get("text", ""), msg.get("msgId"))
-            return
-        if t == "thinking_line":
-            if not self.thinking_enabled():
-                return  # hidden; the line is dropped entirely
-            self._print_msg(C_DIM + "\U0001F4AD " + msg.get("text", "") + R,
-                            "pi", THINK_NICK)
-            return
-        if t == "assistant_flush":
-            self._flush_md_block()   # the message is over: print what is pending
-            return
-        if t == "tool_start":
-            name = msg.get("toolName") or "tool"
-            nick = self._remember_tool(msg.get("toolCallId"), name)
-            summary = format_tool_args(name, msg.get("args") or {})
-            # auto: the nick column already names the tool, so the body is just
-            # glyph + args. pi mode: keep the name in the body (legacy look).
-            body = C_TOOL + "⚙"
-            if self.nicks_mode() != "auto":
-                body += " " + name
-            if summary:
-                body += C_DIM + " " + summary
-            self._print_msg(body + R, "pi", nick)
-            return
-        if t == "tool_end":
-            # tool_end carries no toolName on the wire: the nick comes back
-            # from the tool_start that opened this call (`tool` if that start
-            # was never seen — e.g. a reconnect in the middle of a tool).
-            # Legacy (`pi`) mode labels the line with that same nick, where
-            # before this option it always printed the literal "tool".
-            nick = self.tool_nicks.pop(msg.get("toolCallId"), None) or "tool"
-            ok = not msg.get("isError")
-            color = C_OK if ok else C_ERR
-            glyph = "✔" if ok else "✘"
-            label = "" if self.nicks_mode() == "auto" else " " + nick
-            self._print_msg(color + glyph + label + R, "pi", nick)
-            for line in self._tool_output_lines(msg.get("output")):
-                self._print_msg(C_TOOL_OUT + "  " + line + R, "pi", nick)
-            return
-        if t == "ui_request":
-            self._handle_ui_request(msg)
-            return
-        if t == "error":
-            self._print(C_ERR + "pi bridge: %s: %s%s" % (
-                msg.get("code", "?"), msg.get("message", ""), R))
-            return
-        # unknown type: ignore (forward-compat)
-
-    def _tool_output_lines(self, output):
-        """Apply the pi_bridge.tool_output mode to a tool result."""
-        mode = self.tool_output_mode()
-        lines = str(output or "").splitlines()
-        if mode == "off":
-            return []
-        if mode == "full":
-            return lines
-        # summary: first 3 + last 3 lines, elide the middle (smart-filter style)
-        if len(lines) > 6:
-            return (lines[:3]
-                    + ["… (%d more lines)" % (len(lines) - 6)]
-                    + lines[-3:])
-        return lines
-
-    # ------------------------------------------------- interactive prompts
-
-    def _handle_ui_request(self, msg):
-        """Render a select/input prompt from pi; the user answers with !pick.
-
-        `select` shows numbered options (comma list when multiple);
-        `input` asks for free-form text. Only one prompt is tracked at a
-        time — a new request supersedes the old one, which is released on
-        the pi side with a cancelled ui_response so it doesn't wait forever.
-        """
-        req_id = msg.get("id")
-        method = msg.get("method")
-        title = str(msg.get("title") or "").strip() or "(untitled)"
-        if not isinstance(req_id, int) or method not in ("select", "input"):
-            self._print(C_ERR + "pi bridge: bad ui_request ignored" + R)
-            return
-        if self.pending_ui is not None and self.pending_ui["id"] != req_id:
-            self._send({"type": "ui_response", "id": self.pending_ui["id"],
-                        "cancelled": True})
-        if method == "select":
-            options = []
-            for opt in (msg.get("options") or [])[:24]:  # sanity cap
-                if isinstance(opt, dict) and isinstance(opt.get("label"), str):
-                    options.append((opt["label"],
-                                    str(opt.get("description") or "").strip()))
-                elif isinstance(opt, str) and opt:
-                    options.append((opt, ""))
-            if not options:
-                self._print(C_ERR + "pi bridge: select with no options ignored" + R)
-                return
-            multiple = bool(msg.get("multiple"))
-            self.pending_ui = {"id": req_id, "method": "select",
-                               "options": options, "multiple": multiple}
-            self._print(C_STATUS + "? " + title + R)
-            for i, (label, desc) in enumerate(options, 1):
-                self._print("%2d. %s" % (i, label))
-                if desc:
-                    self._print("    " + C_DIM + desc.replace("\n", " ") + R)
-            hint = "reply !pick <n>" + (", e.g. !pick 1,3 (multiple)" if multiple else "") \
-                   + " · !pick cancel"
-            self._print(C_DIM + hint + R)
-        else:  # input
-            self.pending_ui = {"id": req_id, "method": "input"}
-            self._print(C_STATUS + "? " + title + R)
-            placeholder = msg.get("placeholder")
-            ph = (" (%s)" % str(placeholder).replace("\n", " ")) if placeholder else ""
-            self._print(C_DIM + "reply !pick <your answer>%s · !pick cancel" % ph + R)
-        self.set_state(self.state, "awaiting !pick")
-
-    def handle_pick(self, arg, raw_line):
-        """Answer the pending ui_request with one buffer line.
-
-        select:  !pick <n> (comma list when multiple), or exact option text
-        input:   !pick <free-form text>
-        any:     !pick cancel
-        """
-        pending = self.pending_ui
-        if pending is None:
-            self._print(C_ERR +
-                        "nothing to pick — !pick answers a “?” prompt from pi" + R)
-            return
-        if arg == "" or arg in ("cancel", "c"):
-            self._respond_ui(pending, cancelled=True)
-            self._print_msg(raw_line, "user")
-            return
-        if pending["method"] == "input":
-            self._respond_ui(pending, value=arg)
-            self._print_msg(raw_line, "user")
-            return
-        # select: try numbers first ("3", or "1,3"), then exact option text
-        parts = [p.strip() for p in arg.split(",")]
-        if (all(p.isdigit() for p in parts)
-                and all(1 <= int(p) <= len(pending["options"]) for p in parts)):
-            chosen = [pending["options"][int(p) - 1][0] for p in parts]
-            if not pending["multiple"] and len(chosen) > 1:
-                self._print(C_ERR + "single choice only — pick one number" + R)
-                return
-            value = chosen if pending["multiple"] else chosen[0]
-        else:
-            value = None
-            for label, _desc in pending["options"]:
-                if label == arg:
-                    value = [label] if pending["multiple"] else label
-                    break
-            if value is None:
-                self._print(C_ERR + "no such option: %s (numbers 1-%d, or “cancel”)"
-                            % (arg, len(pending["options"])) + R)
-                return
-        self._respond_ui(pending, value=value)
-        self._print_msg(raw_line, "user")
-
-    def _respond_ui(self, pending, value=None, cancelled=False):
-        """Send the ui_response for `pending` (rate-limited like input: it
-        unblocks a pi command, so a flooded buffer must not unblock many)."""
-        now = time.time()
-        self.ui_times = [t for t in self.ui_times if now - t < 1.0]
-        if len(self.ui_times) >= USER_INPUT_MAX_PER_S:
-            self._print(C_REJECT + "input rate limited (max %d/s)%s"
-                        % (USER_INPUT_MAX_PER_S, R))
-            return
-        self.ui_times.append(now)
-        msg = {"type": "ui_response", "id": pending["id"]}
-        if cancelled:
-            msg["cancelled"] = True
-        else:
-            msg["value"] = value
-        self._send(msg)
-        self.pending_ui = None
-        self.set_state(self.state)  # drop the “awaiting !pick” title hint
-
-    # ---------------------------------------------------------- user input
-
-    def _send_user_input(self, text, echo, msg):
-        """Forward one buffer line to pi as user_input (rate-limited).
-
-        `text` is what goes on the wire (prefixes like "!s " stripped),
-        `echo` is what gets echoed into the buffer (the line as typed).
-
-        This is the only path that spends the remote pi's LLM budget, so it
-        is the only message type rate-limited (a flooded buffer — relay
-        input, a bot, a compromised local host — must not translate 1:1
-        into prompts). The line is still echoed into the buffer either way.
-        """
-        now = time.time()
-        self.ui_times = [t for t in self.ui_times if now - t < 1.0]
-        if len(self.ui_times) >= USER_INPUT_MAX_PER_S:
-            self._print(C_REJECT + "input rate limited (max %d/s)%s"
-                        % (USER_INPUT_MAX_PER_S, R))
-            self._send({"type": "error", "code": "rate_limited"})
-        else:
-            self.ui_times.append(now)
-            self._send(dict(msg, type="user_input", text=text))
-        self._print_msg(echo, "user")
-
-    def on_input(self, line):
-        if self.client is None or not self.client.get("authed"):
-            self._print(C_ERR + "not connected to pi (see buffer title)" + R)
-            return
-        line = line.strip()
-        if not line:
-            return
-        # buffer-local commands (handled here, never reach pi)
-        if line in ("!help", "?"):
-            for h in HELP_TEXT.splitlines():
-                self._print(C_STATUS + h + R)
-            return
-        if line == "!tools":
-            self._print(C_STATUS + "tool output mode: %s (full | summary | off)%s"
-                        % (self.tool_output_mode(), R))
-            return
-        if line.startswith("!tools "):
-            arg = line[7:].strip().lower()
-            if arg in TOOL_OUTPUT_MODES:
-                self._set_plugin_option("tool_output", arg)
-                self._print(C_STATUS + "tool output mode: %s%s" % (arg, R))
-            else:
-                self._print(C_ERR + "unknown tool output mode: %s (full | summary | off)%s"
-                            % (arg, R))
-            return
-        if line == "!nick":
-            self._print(C_STATUS + "nick mode: %s (auto | pi)%s"
-                        % (self.nicks_mode(), R))
-            return
-        if line.startswith("!nick "):
-            arg = line[6:].strip().lower()
-            if arg in NICK_MODES:
-                self._set_plugin_option("nicks", arg)
-                self._print(C_STATUS + "nick mode: %s%s" % (arg, R))
-            else:
-                self._print(C_ERR + "unknown nick mode: %s (auto | pi)%s"
-                            % (arg, R))
-            return
-        if line == "!think":
-            self._print(C_STATUS + "thinking: %s (!think on|off)%s" % (
-                "on" if self.thinking_enabled() else "off", R))
-            return
-        if line.startswith("!think "):
-            arg = line[7:].strip().lower()
-            if arg in THINKING_MODES:
-                self._set_plugin_option("thinking", arg)
-                self._print(C_STATUS + "thinking: %s%s" % (arg, R))
-            else:
-                self._print(C_ERR + "unknown thinking mode: %s (on | off)%s"
-                            % (arg, R))
-            return
-        if line == "!highlight":
-            self._print(C_STATUS + "code highlighting: %s (!highlight on|off)%s" % (
-                "on" if self.highlight_enabled() else "off", R))
-            return
-        if line.startswith("!highlight "):
-            arg = line[11:].strip().lower()
-            if arg in HIGHLIGHT_MODES:
-                self._set_plugin_option("highlight", arg)
-                self._print(C_STATUS + "code highlighting: %s%s" % (arg, R))
-            else:
-                self._print(C_ERR + "unknown highlight mode: %s (on | off)%s"
-                            % (arg, R))
-            return
-        if line == "!markdown":
-            self._print(C_STATUS + "markdown rendering: %s (!markdown on|off)%s" % (
-                "on" if self.markdown_enabled() else "off", R))
-            return
-        if line.startswith("!markdown "):
-            arg = line[10:].strip().lower()
-            if arg in MARKDOWN_MODES:
-                self._flush_md_block()  # pending text keeps the mode it started in
-                self._set_plugin_option("markdown", arg)
-                self._print(C_STATUS + "markdown rendering: %s%s" % (arg, R))
-            else:
-                self._print(C_ERR + "unknown markdown mode: %s (on | off)%s"
-                            % (arg, R))
-            return
-        # buffer-local control commands → protocol 'command' messages
-        command_map = {
-            "!new": "new_session",
-            "!compact": "compact",
-            "!abort": "abort",
-            "!status": "status",
-        }
-        if line in command_map:
-            self._send({"type": "command", "name": command_map[line]})
-            self._print_msg(line, "user")
-        elif line == "!model":
-            self._send({"type": "command", "name": "model"})
-            self._print_msg(line, "user")
-        elif line.startswith("!model "):
-            # pi's setModel via the weechat-ctl extension command
-            self._send({"type": "command", "name": "model",
-                        "arg": line[7:].strip()})
-            self._print_msg(line, "user")
-        elif line == "!cd" or (line.startswith("!cd ") and not line[4:].strip()):
-            self._print(C_ERR + "usage: !cd <path> — e.g. !cd ~/my-project" + R)
-            return
-        elif line.startswith("!cd "):
-            # switch pi to a project dir; fuzzy matches (and the "create as
-            # new project" option) come back as a ? prompt answered with !pick
-            self._send({"type": "command", "name": "cd", "arg": line[4:].strip()})
-            self._print_msg(line, "user")
-        elif line == "!pick" or line.startswith("!pick "):
-            self.handle_pick(line[5:].strip(), line)
-            return
-        elif line.startswith("!s "):
-            self._send_user_input(line[3:], line, {"deliverAs": "steer"})
-        elif line.startswith("!q "):
-            self._send_user_input(line[3:], line, {"deliverAs": "followUp"})
-        else:
-            self._send_user_input(line, line, {})
-
-    @staticmethod
-    def _set_plugin_option(name, value):
-        if weechat is None:
-            return
-        try:
-            weechat.config_set_plugin(name, value)
-        except Exception:
-            pass
 
     # -------------------------------------------------------------- cleanup
 
@@ -2296,12 +2349,16 @@ BRIDGE = Bridge()
 # ------------------------------------------------------- weechat callbacks
 
 def pi_input_cb(data, buffer, line):
-    BRIDGE.on_input(line)
+    session = BRIDGE.session_by_buffer.get(buffer)
+    if session is not None:
+        session.on_input(line)
     return weechat.WEECHAT_RC_OK
 
 
 def pi_close_cb(data, buffer):
-    BRIDGE.alive = False
+    session = BRIDGE.session_by_buffer.pop(buffer, None)
+    if session is not None:
+        session.alive = False
     return weechat.WEECHAT_RC_OK
 
 
@@ -2331,7 +2388,8 @@ def pi_auth_timeout_cb(data, *args):
 
 def pi_tick_cb(data, *args):
     """1s timer: refresh the buffer-title turn counter while a request runs."""
-    BRIDGE.tick()
+    for session in BRIDGE.sessions:
+        session.tick()
     return weechat.WEECHAT_RC_OK
 
 
@@ -2351,14 +2409,15 @@ def pi_config_cb(data, option, *args):
                 try:
                     BRIDGE.make_tcp_server()
                 except OSError as err:
-                    BRIDGE._print(C_ERR + "pi bridge: cannot listen on tcp "
-                                    "%s (%s)%s" % (new, err, R))
+                    BRIDGE._print_all(C_ERR + "pi bridge: cannot listen on tcp "
+                                             "%s (%s)%s" % (new, err, R))
             else:
-                BRIDGE._print(C_STATUS + "tcp listener stopped%s" % R)
+                BRIDGE._print_all(C_STATUS + "tcp listener stopped%s" % R)
     if name == "markdown":
         # /set changed the mode under WeeChat's hands; whatever is buffered was
         # built under the old one, so print it before the switch takes effect
-        BRIDGE._flush_md_block()
+        for session in BRIDGE.sessions:
+            session._flush_md_block()
     if name in ("tcp_listen", "token"):
         BRIDGE.config_warnings()
     return weechat.WEECHAT_RC_OK
@@ -2369,7 +2428,8 @@ def pi_nick_cb(data, option, *args):
 
     Re-applies (or clears) the buffer nick localvar live — no reload.
     """
-    BRIDGE.apply_user_nick()
+    for session in BRIDGE.sessions:
+        session.apply_user_nick()
     return weechat.WEECHAT_RC_OK
 
 
