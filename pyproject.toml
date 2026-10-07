@@ -1,0 +1,41 @@
+[project]
+name = "pi-weechat"
+version = "0.1.0"
+description = "Mirror pi agent output/input through a WeeChat buffer via a local Unix socket"
+requires-python = ">=3.9"
+
+[tool.ruff]
+# Python >= 3.9: weechat/pi_bridge.py runs inside WeeChat's bundled
+# interpreter (4.x requires Python 3; keep it 3.9-compatible and
+# conservative — no f-strings in that file on purpose). Tests may use
+# anything the local python3 supports.
+target-version = "py39"
+line-length = 100
+exclude = ["node_modules", "__pycache__"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort (import ordering)
+    "B",   # flake8-bugbear (real bugs, not taste)
+    "C4",  # comprehensions
+    "UP",  # pyupgrade (targeted at py39)
+]
+ignore = [
+    "E203",  # whitespace before ':' — black-compatible slicing
+    "UP031", # house style: %-formatting (the WeeChat plugin is written
+             # conservatively; f-strings are not used there on purpose)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Plugin runs inside WeeChat's bundled interpreter: keep it
+# py2-era-conservative. E501: syntax-highlighter regex patterns must
+# stay single-line; UP004/UP009: `class X(object)` and the utf-8 coding
+# header are deliberate portability markers.
+"weechat/pi_bridge.py" = ["E501", "UP004", "UP009"]
+# Test files deliberately build long wire strings / regex fixtures /
+# long assertion messages.
+"test/smoke_weechat.py" = ["E501"]
+"test/real_weechat.py" = ["E501"]

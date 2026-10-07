@@ -13,10 +13,8 @@ Run: python3 test/smoke_weechat.py   (no dependencies beyond stdlib)
 """
 import hashlib
 import hmac
-import importlib.util
 import json
 import os
-import re
 import select
 import socket
 import sys
@@ -323,7 +321,7 @@ def drain(sock, acc):
             data = sock.recv(65536)
             if not data:
                 return False  # peer closed
-            acc.extend(l for l in data.decode().split("\n") if l.strip())
+            acc.extend(line for line in data.decode().split("\n") if line.strip())
     except BlockingIOError:
         pass
     return True
@@ -393,7 +391,7 @@ def main():
 
     # unauthenticated-connection cap: 3 pendings held, 4th closed silently
     pendings = []
-    for i in range(4):
+    for _ in range(4):
         cc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         cc.connect(sock_path)
         cc.setblocking(False)
@@ -416,7 +414,8 @@ def main():
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.connect(sock_path)
     client.setblocking(False)
-    send = lambda obj: client.sendall((json.dumps(obj) + "\n").encode())
+    def send(obj):
+        client.sendall((json.dumps(obj) + "\n").encode())
 
     # protocol 2 handshake gating: the CLIENT sends its hello first (no
     # challenge when no token is configured); the server answers after
@@ -1384,7 +1383,7 @@ def main():
     for i in range(6):
         ns["pi_input_cb"]("", "buffer", "rl line %d" % i)
     pump_and_drain(client, 0.5)
-    wire = [json.loads(l) for l in recv_lines]
+    wire = [json.loads(line) for line in recv_lines]
     inputs = [m for m in wire if m.get("type") == "user_input"]
     assert len(inputs) == 5, "max 5 user_input per second, got %d" % len(inputs)
     assert any(m.get("type") == "error" and m.get("code") == "rate_limited"
@@ -1783,12 +1782,12 @@ def main():
     ns["FAIL_MAX"] = 2
     BRIDGE.ip_failures.clear()  # the negative tests above already logged some
     BRIDGE.ip_lockouts.clear()
-    failed_line_count = lambda: sum(
-        1 for k, t in stub.prints if "auth failed from" in t)
+    def failed_line_count():
+        return sum(1 for k, t in stub.prints if "auth failed from" in t)
     failed_before = failed_line_count()
     stub.config_set_plugin("token", "tok-3")
     stub.pump(0.1)
-    for i in range(3):  # FAIL_MAX + 1 failures from 127.0.0.1
+    for _ in range(3):  # FAIL_MAX + 1 failures from 127.0.0.1
         tc = tcp_connect(port2)
         stub.pump(0.3)
         lines = []

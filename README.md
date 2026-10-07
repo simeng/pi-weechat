@@ -4,15 +4,14 @@ Mirror a [pi](https://pi.dev) coding agent session into a WeeChat buffer — and
 
 - **WeeChat side**: Python script that creates a `pi` buffer and serves an NDJSON protocol (the _server_): always on a Unix socket, optionally also on TCP with shared-secret auth.
 - **pi side**: TypeScript extension installed as a pi package; dials as _client_, mirrors assistant output / tool calls / status into the buffer, and forwards lines you type back to pi as user input.
-- **Nick column**: every pi-side line is printed under the nick that names *who* spoke — tool calls under their own tool name (`read`, `bash`, `memory_search`), thinking under `think`, replies under `pi` — each colored by WeeChat's own per-nick color. `!nick pi` restores the single legacy `pi` nick.
+- **Nick column**: every pi-side line is printed under the nick that names _who_ spoke — tool calls under their own tool name (`read`, `bash`, `memory_search`), thinking under `think`, replies under `pi` — each colored by WeeChat's own per-nick color. `!nick pi` restores the single legacy `pi` nick.
 
 Architecture and wire protocol: [PLAN.md](./PLAN.md).
 
 ## Screenshots
 
-![Used in Glowing Bear](./pi-weechat1.jpg)
-![View from weechat with commands](./pi-weechat2.png)
-![View from weechat with tool output and thinking](./pi-weechat3.png)
+![Used in Glowing Bear](./pi-weechat5.png)
+![View from weechat with tool output and thinking](./pi-weechat4.png)
 
 ## Layout
 
@@ -124,6 +123,7 @@ Open the `pi` buffer:
   - `!markdown [on|off]` — render assistant markdown in the buffer (below). On by default; also settable via `/set plugins.var.python.pi_bridge.markdown on|off`
 - Prompts you type directly in pi's own terminal are echoed into the buffer too,
   so both surfaces stay in sync.
+
 ### Markdown rendering
 
 Assistant text is rendered as markdown, block by block (on by default; see
@@ -163,16 +163,16 @@ pi's own settings (the agent dir follows `$PI_CODING_AGENT_DIR`, default
 
 ```json
 {
-  "url": "tcp://box:52311",    // endpoint — same syntax as PI_WEECHAT_URL
-  "token": "…",                // shared secret — same as PI_WEECHAT_TOKEN
-  "debugLog": "/path/to/log"   // optional — same as PI_BRIDGE_DEBUG
+  "url": "tcp://box:52311", // endpoint — same syntax as PI_WEECHAT_URL
+  "token": "…", // shared secret — same as PI_WEECHAT_TOKEN
+  "debugLog": "/path/to/log" // optional — same as PI_BRIDGE_DEBUG
 }
 ```
 
 **Environment variables always win over the file** when both are set, so a
 per-session export still overrides your standing config. Unknown keys are
 ignored (forward-compat); an absent or empty value means "unset"; a missing
-file is fine. A *broken* file (invalid JSON, wrong types) never breaks the
+file is fine. A _broken_ file (invalid JSON, wrong types) never breaks the
 bridge — it degrades to env/default behavior, notes the problem in the debug
 log, and prints a red `config_error` line in the buffer. The file is re-read
 on every `/reload`, so edits apply without restarting pi.
@@ -185,18 +185,18 @@ the question and context appear as a `?` prompt with numbered options (plus a
 “✏️ Type custom response…” option when freeform answers are allowed), answered
 with `!pick`. The choice is returned to the LLM as the tool's result — no
 modification to the ask extension itself: pi-weechat intercepts the call in
-pi's `tool_call` hook *before* execution and blocks it with your selection.
+pi's `tool_call` hook _before_ execution and blocks it with your selection.
 
 - **No ask extension installed?** If nothing else provides an `ask_user`
-tool, pi-weechat registers a minimal built-in one (same parameter shape,
-single/multi-select + freeform), so decision questions are still structured
-and answerable from the buffer. When another provider is present the fallback
-is never registered. The local path of the fallback mirrors pi-ask-user's
-dialog fallback, so it also works in the pi terminal when the bridge is down.
+  tool, pi-weechat registers a minimal built-in one (same parameter shape,
+  single/multi-select + freeform), so decision questions are still structured
+  and answerable from the buffer. When another provider is present the fallback
+  is never registered. The local path of the fallback mirrors pi-ask-user's
+  dialog fallback, so it also works in the pi terminal when the bridge is down.
 - **Graceful degradation**: if the bridge disconnects mid-question, or the
-tool's own timeout expires, or the run is aborted, the question falls back to
-the tool's normal terminal UI; `!pick cancel` gives the LLM an explicit
-“user cancelled” result instead.
+  tool's own timeout expires, or the run is aborted, the question falls back to
+  the tool's normal terminal UI; `!pick cancel` gives the LLM an explicit
+  “user cancelled” result instead.
 - **Opt-out / tuning** (env vars win over the config file):
   - `$PI_WEECHAT_PICK=off` or `"pick": "off"` — never intercept; questions
     always use the tools' own terminal UI.
@@ -368,12 +368,12 @@ token auth), no mocks on the wire. `test:real` boots an actual WeeChat, autoload
 
 What the server-side hardening defends against, and what it doesn't:
 
-| threat | covered? |
-|---|---|
-| Port scanners / opportunistic LAN attackers | ✅ no service fingerprint (server's first message is a random nonce, never protocol data), IP allowlist gate, silent drops |
-| Weak-token brute force | ✅ constant-time proof compare, per-IP failure lockout (5 failures/60 s ⇒ 10 min silence), unauthenticated-connection cap (3), 10 s auth deadline |
-| A leaked token | ⚠️ the holder can connect and impersonate pi — rotate the token (`/secure set` again). Rate limiting bounds the damage: buffer→pi input is capped at 5 lines/s (`rate_limited` beyond) |
-| Active MITM on the path | ❌ **not covered** — traffic is cleartext; use Tailscale/VPN. A MITM can relay the session (but cannot replay captured handshakes or read the token) |
+| threat                                      | covered?                                                                                                                                                                               |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Port scanners / opportunistic LAN attackers | ✅ no service fingerprint (server's first message is a random nonce, never protocol data), IP allowlist gate, silent drops                                                             |
+| Weak-token brute force                      | ✅ constant-time proof compare, per-IP failure lockout (5 failures/60 s ⇒ 10 min silence), unauthenticated-connection cap (3), 10 s auth deadline                                      |
+| A leaked token                              | ⚠️ the holder can connect and impersonate pi — rotate the token (`/secure set` again). Rate limiting bounds the damage: buffer→pi input is capped at 5 lines/s (`rate_limited` beyond) |
+| Active MITM on the path                     | ❌ **not covered** — traffic is cleartext; use Tailscale/VPN. A MITM can relay the session (but cannot replay captured handshakes or read the token)                                   |
 
 Hardening measures and defaults (module constants in `weechat/pi_bridge.py`):
 auth deadline `10 s` · pending-unauthed cap `3` · failure lockout `5` in
