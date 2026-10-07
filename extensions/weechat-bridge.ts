@@ -420,6 +420,16 @@ export default function weechatBridge(pi: ExtensionAPI) {
       protocol: PROTOCOL_VERSION,
       name: "pi-weechat-bridge",
     };
+    // Reattach support: with a known session id the bridge maps this
+    // connection to the session's existing buffer (history kept) on
+    // reconnect; the id changes with !cd/!new and the bridge follows via
+    // session_info.
+    try {
+      const sid = ctxRef?.sessionManager?.getSessionId?.();
+      if (sid) hello.sessionId = sid;
+    } catch {
+      /* ignore */
+    }
     if (proof) hello.proof = proof;
     send(hello);
     flushPending();
@@ -706,9 +716,16 @@ export default function weechatBridge(pi: ExtensionAPI) {
 
   function sendSessionInfo(ctx: any): void {
     const model = ctx?.model;
+    let sessionId: string | undefined;
+    try {
+      sessionId = ctx?.sessionManager?.getSessionId?.();
+    } catch {
+      /* ignore */
+    }
     send({
       type: "session_info",
       cwd: ctx?.cwd,
+      sessionId,
       model: model ? `${model.provider ?? ""}/${model.id ?? "?"}`.replace(/^\//, "") : undefined,
       name: (() => {
         try {

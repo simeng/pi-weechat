@@ -44,8 +44,8 @@ function startWeechatSide(sockPath) {
   return {
     child,
     lines,
-    waitFor(pred, what, ms = 5000) {
-      const hit = lines.find(pred);
+    waitFor(pred, what, ms = 5000, from = 0) {
+      const hit = lines.slice(from).find(pred);
       if (hit) return Promise.resolve(hit);
       return new Promise((resolve, reject) => {
         const timer = setTimeout(
@@ -127,6 +127,8 @@ const MOCK_CTX = {
   // No ask_user among the tools → the bridge registers its built-in fallback
   // (exercises the registerTool path); real pi lists pi-ask-user's tool here.
   getAllTools: () => [],
+  // session id for the multi-session reattach path (hello + session_info)
+  sessionManager: { getSessionId: () => "itg-session-id" },
 };
 
 // The extension module is a singleton (registered once); all scenarios
@@ -201,11 +203,75 @@ test("integration: real extension ↔ real weechat script", async (t) => {
   await wc.waitFor(
     (m) => m.type === "print" && m.text.includes("/tmp/itg") && m.text.includes("prov/model-itg"),
     "buffer: session line"
+    );
+    // reattach: the bridge drops the connection; the extension reconnects
+    // with the same sessionId and reattaches to the SAME buffer
+    const atDrop = wc.lines.length;
+    wc.send({ op: "dropclient" });
+    await wc.waitFor(
+      (m) => m.type === "print" && m.text.includes("pi disconnected"),
+      "buffer: pi disconnected",
+      5000,
+      atDrop
+    );
+    await wc.waitFor(
+      (m) => m.type === "print" && m.text.includes("pi connected"),
+      "buffer: pi reconnected (reattach by sessionId)",
+      5000,
+      atDrop
+    );
+  // a second, CONCURRENT client (raw NDJSON peer) gets its own buffer;
+  // input/output of one session never reach the other
+  const c2 = net.connect(sockPath);
+  const c2msgs = [];
+  let c2buf = "";
+  c2.on("data", (d) => {
+    c2buf += d.toString();
+    while (c2buf.includes("\n")) {
+      const l = c2buf.slice(0, c2buf.indexOf("\n"));
+      c2buf = c2buf.slice(c2buf.indexOf("\n") + 1);
+      if (l.trim()) c2msgs.push(JSON.parse(l));
+    }
+  });
+  await new Promise((res, rej) => { c2.once("error", rej); c2.once("connect", res); });
+  const atC2 = wc.lines.length;
+  c2.write(JSON.stringify({ type: "hello", protocol: 3, name: "pi" }) + "\n");
+  await waitForMock(() => c2msgs.some((m) => m.type === "hello"), "second client: hello accepted");
+  c2.write(JSON.stringify({ type: "session_info", cwd: "/tmp/itg2" }) + "\n");
+  const c2connected = await wc.waitFor(
+    (m) => m.type === "print" && m.buffer && m.buffer !== "buffer" && m.text.includes("pi connected"),
+    "second client: connected in its own buffer",
+    5000,
+    atC2
   );
+  c2.write(JSON.stringify({ type: "assistant_line", msgId: "m-c2", text: "hello from client two" }) + "\n");
+  c2.write(JSON.stringify({ type: "assistant_flush", msgId: "m-c2" }) + "\n");
+  const c2line = await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("hello from client two"),
+    "second client: assistant line",
+    5000,
+    atC2
+  );
+  assert.equal(c2line.buffer, c2connected.buffer, "output lands in the second client's buffer");
+  // input in the FIRST buffer reaches the extension, not the raw client
+  const c2msgsBefore = c2msgs.length;
+  wc.send({ op: "input", text: "ping one", buffer: "buffer" });
+  await waitForMock(() => mock.sentUserMessages.some((m) => m.text === "ping one"), "extension: first-buffer input");
+  // bounded window: a misrouted copy would arrive on c2's socket promptly
+  await new Promise((r) => setTimeout(r, 250));
+  assert.equal(c2msgs.length, c2msgsBefore, "first-buffer input never reaches the second client");
+  // input in the SECOND buffer reaches the raw client, not the extension
+  const echoesBefore = mock.sentUserMessages.length;
+  wc.send({ op: "input", text: "ping two", buffer: c2connected.buffer });
+  await waitForMock(() => c2msgs.some((m) => m.type === "user_input" && m.text === "ping two"), "second client: user_input");
+  await new Promise((r) => setTimeout(r, 250));
+  assert.equal(mock.sentUserMessages.length, echoesBefore, "second-buffer input never reaches the extension");
+  c2.end();
+  await new Promise((res) => c2.once("close", res));
 
   // Echoing a prompt is only a mirror event; timers start with Pi's agent lifecycle,
   // not from a typed line or a WeeChat control command.
-  const latestTitle = () => wc.lines.filter((m) => m.type === "title").at(-1)?.text ?? "";
+  const latestTitle = () => wc.lines.filter((m) => m.type === "title" && m.buffer === "buffer").at(-1)?.text ?? "";
   const titleBeforeEcho = latestTitle();
   await mock.fire("input", { source: "interactive", text: "typed in pi terminal" });
   await wc.waitFor(

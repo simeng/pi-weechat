@@ -101,7 +101,7 @@ the old id). On disconnect, all pending prompts resolve as cancelled.
 
 | type             | payload                          | meaning                                        |
 |------------------|----------------------------------|------------------------------------------------|
-| `hello`          | `{protocol, name}`               | handshake                                      |
+| `hello`          | `{protocol, name, sessionId?}`   | handshake; `sessionId` is the pi session id (optional, see below) |
 | `status`         | `{state, detail?}`               | state ∈ idle / thinking / tool:\<name\> / error; drives buffer title + status line |
 | `timing`         | `{runMs, turnMs, turn, turns, runActive, turnActive, runPaused, hasRun}` | Pi-owned elapsed-time snapshot in ms; emitted at run/turn/prompt boundaries and after each bridge handshake. Pi uses a monotonic clock; the WeeChat side advances the snapshot only for live title redraws. `turn` is the 1-based current/last Pi turn number, and `turns` is the count started in this agent run |
 | `assistant_line` | `{msgId, text}`                  | one **complete line** of assistant text. Pi accumulates the `message_update` deltas locally and flushes each line as soon as it is complete (WeeChat has no partial-line redraw, so raw token deltas are meaningless to it) |
@@ -110,9 +110,11 @@ the old id). On disconnect, all pending prompts resolve as cancelled.
 | `user_echo`      | `{text}`                         | user prompt as accepted by pi (mirror back if input originated in the pi terminal) |
 | `tool_start`     | `{toolCallId, toolName, args}`   | from `tool_execution_start`                    |
 | `tool_end`       | `{toolCallId, isError, output}`  | from `tool_execution_end`; `output` truncated at a whole-line boundary if > 8 KiB (… \\"N more characters truncated\\") |
-| `session_info`   | `{name?, model?, cwd}`           | on `session_start` / `model_select` / `session_info_changed` |
+| `session_info`   | `{name?, model?, cwd, sessionId?}` | on `session_start` / `model_select` / `session_info_changed`; `sessionId` tracks id changes after `!cd` / `!new` |
 | `error`          | `{code, message}`                | protocol or runtime error                      |
 | `ping`           | `{ts}`                           | keepalive every 30 s (WeeChat answers with pong) |
+
+**`sessionId` (optional, multi-session).** The pi session id, as reported by the pi session manager. It is stable across pi restarts that *resume* the same session (e.g. `/reload`) and changes when the session switches (`!cd`, `!new`). The WeeChat side uses it only to reattach a reconnecting session to its existing buffer; absence is tolerated (no reattach), so peers without the field keep working — no protocol version bump. A hello claiming a `sessionId` that is **already connected** is rejected with `{"type":"error","code":"session_id_in_use"}` and dropped; a live connection's id is never replaced, and a mid-connection id change (via `session_info`) updates the reattach mapping only while it unambiguously refers to the same session. Multiple sessions are supported: one WeeChat buffer per connected pi session (first buffer created at load keeps the name `pi`; later ones are named `pi:<shortened cwd>`).
 
 ### Message types (WeeChat → pi extension)
 
@@ -170,11 +172,12 @@ Design:
   `hook_config` (live rebind — the `urlserver.py` pattern: blocking listen
   fd, one plain `accept()` per `hook_fd` event, `SO_REUSEADDR`, `listen(5)`,
   status line from `getsockname()`). Both funnels share one accept path:
-  peer-IP gates first (lockout, `allowed_ips`), then one client at a time —
-  an extra connected client gets one `error{code: "client_already_connected"}`;
-  up to 3 in-flight handshakes are held, then closed silently. Client fds are
-  non-blocking in both transports, with the shared `rxbuff` + write-hook
-  backpressure model.
+  peer-IP gates first (lockout, `allowed_ips`), then admission — one buffer
+  per connected pi session (the `sessionId` in the hello picks the session's
+  existing one, else a new buffer); a hello reusing a **live** session id is
+  rejected with `error{code: "session_id_in_use"}`. Up to 3 in-flight
+  handshakes are held, then closed silently. Client fds are non-blocking in
+  both transports, with the shared `rxbuff` + write-hook backpressure model.
 - **Reader:** accumulate in a buffer, split on `\n`, JSON-parse each line,
   dispatch on `type`. Partial reads wait for more data (return `RC_OK`).
 - **Writer:** `sendall()` is safe enough at these volumes; if the socket ever
@@ -448,9 +451,10 @@ pi-weechat/
 
 ## 10. Open questions
 
-- Multi-session: one pi process = one connection, still — now spanning both
-  transports (a TCP client and a Unix client are mutually exclusive). If two
-  pi instances run, the current build keeps "first authenticated client
-  wins"; a future version could multiplex by session id in the hello.
+- ~~Multi-session~~ **resolved**: one buffer per connected pi session — the
+  hello's optional `sessionId` reattaches a reconnecting session to its
+  existing buffer (history kept); a live session id is never shared (
+  `session_id_in_use`); the load-time buffer keeps the name `pi`, later
+  buffers are named `pi:<shortened cwd>`.
 - WeeChat colors: hardcode a small palette vs. read `weechat.color` settings —
   start hardcoded.

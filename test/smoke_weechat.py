@@ -37,13 +37,20 @@ class WeechatStub:
     def __init__(self):
         self.prints = []          # (kind, text)
         self.title = None
-        self.fd_hooks = {}        # callback name -> [fd, read, write, data]
+        self.fd_hooks = {}        # callback name -> [[fd, read, write, data], …]
+        self.fd_handles = {}      # hook handle -> [fd, read, write, data]
+        self._buf_seq = 0
+        self.buf_names = {}       # buffer pointer -> name
+        self.buf_prints = {}      # buffer pointer -> [lines printed to it]
+        self.closed_bufs = set()  # closed: name released, like real WeeChat
+        self.stale_calls = []    # (func, buf, prop) API calls on closed bufs
         self.buffer_name = None
         self.registered = None
         self.plugin_opts = {}     # config_*_plugin storage
         self.plugin_descs = {}    # config_set_desc_plugin storage
         self.timers = {}          # handle -> {cb, data, deadline, timeout, max_calls}
         self._timer_seq = 0
+        self._fd_seq = 0
         self.config_hooks = []    # [(pattern, cb, data)]
         self.conf = {"irc.server_default.nicks": "alice,alice2"}  # global opts
         self.printf_tags = []     # [(tags, prefix, body)] from prnt_date_tags
@@ -112,12 +119,21 @@ class WeechatStub:
 
     # -- buffer ----------------------------------------------------------
     def buffer_new(self, name, input_cb, input_data, close_cb, close_data):
+        # like the real API: every buffer has its own pointer; the first
+        # keeps the historic "buffer" value the test phases pass around
+        self._buf_seq += 1
+        buf = "buffer" if self._buf_seq == 1 else "buffer%d" % self._buf_seq
         self.buffer_name = name
+        self.buf_names[buf] = name
+        self.buf_prints[buf] = []
         self.input_cb_name = input_cb
-        return "buffer"
+        return buf
 
     def buffer_set(self, buf, prop, value):
-        if prop == "title":
+        self._note_stale("buffer_set", buf, prop)
+        if prop in ("name", "short_name"):
+            self.buf_names[buf] = value
+        elif prop == "title":
             self.title = value
             self.prints.append(("TITLE", value))
         elif prop.startswith("localvar_set_"):
@@ -126,14 +142,36 @@ class WeechatStub:
             self.localvars.pop(prop[len("localvar_unset_"):], None)
         return 1
 
+    def buffer_close(self, buf):
+        self.closed_bufs.add(buf)
+        self.buf_names.pop(buf, None)
+        self.buf_prints.pop(buf, None)
+        return 1
+
+    def _note_stale(self, func, buf, prop):
+        """Record an API call aimed at a closed buffer pointer.
+        Real WeeChat dereferences these pointers natively (use-after-free
+        crash, e.g. in strlen) — the stub can't crash, so it records the
+        call and the test phases assert none happened (stale_calls == []).
+        """
+        if buf in self.closed_bufs:
+            self.stale_calls.append((func, buf, prop))
+
     def buffer_get_string(self, buf, prop):
+        self._note_stale("buffer_get_string", buf, prop)
+        if buf in self.closed_bufs:
+            return ""
+        if prop in ("name", "short_name"):
+            return self.buf_names.get(buf, "")
         return ""
 
     def prnt(self, buf, msg):
+        self._note_stale("prnt", buf, None)
         self.prints.append(("PRINT", msg))
-        return 1
+        self.buf_prints.setdefault(buf, []).append(msg)
 
     def prnt_date_tags(self, buf, date, tags, message):
+        self._note_stale("prnt_date_tags", buf, None)
         # like the real API: the text before the first TAB is the line
         # prefix (prefix column); everything after it is the message body
         if "\t" in message:
@@ -141,13 +179,20 @@ class WeechatStub:
         else:
             prefix, body = "", message
         self.prints.append(("PRINTF", body))
+        self.buf_prints.setdefault(buf, []).append(message)
         self.printf_tags.append((tags, prefix, body))
         return 1
 
     # -- hooks -----------------------------------------------------------
     def hook_fd(self, fd, fr, fw, fe, cb, data):
-        self.fd_hooks[cb] = [fd, fr, fw, data]
-        return "hook:" + cb
+        # like the real API: every hook has its own handle, so several fds
+        # may be hooked under the same callback (multi-client support)
+        self._fd_seq += 1
+        handle = "hookfd:%s:%d" % (cb, self._fd_seq)
+        entry = [fd, fr, fw, data]
+        self.fd_handles[handle] = entry
+        self.fd_hooks.setdefault(cb, []).append(entry)
+        return handle
 
     def hook_timer(self, interval, align_second, max_calls, cb, data):
         self._timer_seq += 1
@@ -168,6 +213,15 @@ class WeechatStub:
     def unhook(self, hook):
         if hook in self.timers:
             del self.timers[hook]
+            return 1
+        if hook in self.fd_handles:
+            entry = self.fd_handles.pop(hook)
+            for entries in self.fd_hooks.values():
+                if entry in entries:
+                    entries.remove(entry)
+            for name in list(self.fd_hooks):
+                if not self.fd_hooks[name]:
+                    del self.fd_hooks[name]
             return 1
         cb = hook.split(":", 1)[1]
         self.fd_hooks.pop(cb, None)
@@ -205,27 +259,35 @@ class WeechatStub:
                     fired.append((t["cb"], t["data"]))
             for cb, data in fired:
                 ns[cb](data, 0)
-            live = {n: h for n, h in self.fd_hooks.items()
-                    if h[1] and h[0] >= 0 and self._fd_open(h[0])}
-            # a hooked fd that was closed underneath → weechat calls the cb
-            # once with fd == -1 (data carries the fd), then unhook
-            for name, hook in list(self.fd_hooks.items()):
-                if hook[1] and hook[0] >= 0 and not self._fd_open(hook[0]):
-                    ns[name](hook[3], -1)
-                    self.unhook("hook:" + name)
-            read_fds = [h[0] for h in live.values()]
+            # live read fds (several entries may share a callback name)
+            live = {}   # fd -> [(cb, entry)]
+            for cb, entries in self.fd_hooks.items():
+                for entry in entries:
+                    if entry[1] and entry[0] >= 0 and self._fd_open(entry[0]):
+                        live.setdefault(entry[0], []).append((cb, entry))
+            # a hooked fd closed underneath → weechat calls the cb once with
+            # fd == -1 (data carries the fd), then that entry is unhooked
+            for cb, entries in list(self.fd_hooks.items()):
+                for entry in list(entries):
+                    if entry[1] and entry[0] >= 0 and not self._fd_open(entry[0]):
+                        ns[cb](entry[3], -1)
+                        entries.remove(entry)
+                if not entries:
+                    del self.fd_hooks[cb]
+            read_fds = list(live)
             r, _, _ = select.select(read_fds, [], [], 0.02) if read_fds else ([], [], [])
             progressed = False
             for fd in r:
-                for name, hook in list(self.fd_hooks.items()):
-                    if hook[0] == fd and hook[1]:
-                        ns[name](hook[3], fd)
+                for cb, entry in live[fd]:
+                    ns[cb](entry[3], fd)
+                    progressed = True
+                    break
+            for cb, entries in list(self.fd_hooks.items()):
+                for entry in entries:
+                    if entry[2] and entry[0] >= 0:
+                        ns[cb](entry[3], entry[0])
                         progressed = True
                         break
-            for name, hook in list(self.fd_hooks.items()):
-                if hook[2] and hook[0] >= 0:
-                    ns[name](hook[3], hook[0])
-                    progressed = True
             if not progressed and not fired:
                 time.sleep(0.01)
 
@@ -290,6 +352,7 @@ def main():
         code = f.read()
     exec(compile(code, SCRIPT, "exec"), ns)
     BRIDGE = ns["BRIDGE"]
+    SESSION = BRIDGE.load_session  # per-session state lives here
     # expected cwd rendering for title/session assertions (respects ~)
     proj = ns["_short_path"]("/home/x/proj")
 
@@ -326,7 +389,7 @@ def main():
     c.setblocking(False)
     stub.pump(0.8)
     assert c.recv(10) == b"", "silent client must be dropped after auth timeout"
-    assert BRIDGE.pending == [] and BRIDGE.client is None
+    assert BRIDGE.pending == [] and BRIDGE.clients == []
 
     # unauthenticated-connection cap: 3 pendings held, 4th closed silently
     pendings = []
@@ -430,7 +493,7 @@ def main():
     assert fmt_elapsed(3600) == "1h", fmt_elapsed(3600)
     assert fmt_elapsed(3665) == "1h1m", fmt_elapsed(3665)
 
-    BRIDGE.state = "thinking"
+    SESSION.state = "thinking"
     timing = {
         "type": "timing", "runMs": 12_000, "turnMs": 42_000,
         "turn": 10, "turns": 10, "runActive": True, "turnActive": True,
@@ -442,10 +505,10 @@ def main():
 
     # The local WeeChat tick advances a received active snapshot, not state
     # reconstructed from inputs. Turn elapsed includes tool time.
-    BRIDGE.timing_received_at = time.monotonic() - 90
+    SESSION.timing_received_at = time.monotonic() - 90
     ns["pi_tick_cb"]("", 0)
     assert stub.title == "π: %s (thinking… · run 1m · 2m · turn 10)" % proj, stub.title
-    BRIDGE.state = "tool:bash"
+    SESSION.state = "tool:bash"
     ns["pi_tick_cb"]("", 0)
     assert stub.title == "π: %s (tool: bash · run 1m · 2m · turn 10)" % proj, stub.title
 
@@ -454,7 +517,7 @@ def main():
     send(paused)
     pump_and_drain(client, 0.2)
     paused_title = stub.title
-    BRIDGE.timing_received_at = time.monotonic() - 90
+    SESSION.timing_received_at = time.monotonic() - 90
     ns["pi_tick_cb"]("", 0)
     assert stub.title == paused_title
     assert "run 15s · 9s · turn 10" in stub.title, stub.title
@@ -463,7 +526,7 @@ def main():
     between_turns = dict(timing, runMs=35_000, turnMs=42_000, turnActive=False)
     send(between_turns)
     pump_and_drain(client, 0.2)
-    BRIDGE.timing_received_at = time.monotonic() - 10
+    SESSION.timing_received_at = time.monotonic() - 10
     ns["pi_tick_cb"]("", 0)
     assert "run 45s · 42s · turn 10" in stub.title, stub.title
 
@@ -473,12 +536,12 @@ def main():
         turnActive=False, runPaused=False,
     )
     send(settled)
-    BRIDGE.state = "idle"  # the settle banner is covered in the previous phase
+    SESSION.state = "idle"  # the settle banner is covered in the previous phase
     send({"type": "status", "state": "idle"})
     pump_and_drain(client, 0.2)
     assert stub.title == "π: %s (idle · last run 17m · 10 turns)" % proj, stub.title
     frozen_title = stub.title
-    BRIDGE.timing_received_at = time.monotonic() - 90
+    SESSION.timing_received_at = time.monotonic() - 90
     ns["pi_tick_cb"]("", 0)
     assert stub.title == frozen_title, "settled timing summary must remain frozen"
 
@@ -595,7 +658,7 @@ def main():
     assert "1. /opt/alpha" in text and "2. /opt/beta" in text
     assert "the beta one" in text, "option description must render"
     assert "!pick cancel" in text, "hint line must mention !pick"
-    assert BRIDGE.pending_ui is not None and BRIDGE.pending_ui["id"] == 7
+    assert SESSION.pending_ui is not None and SESSION.pending_ui["id"] == 7
     assert stub.title == "π: %s (idle · last run 17m · 10 turns) — awaiting !pick" % proj, stub.title
 
     # !pick by number → ui_response with the option text; title hint clears
@@ -604,7 +667,7 @@ def main():
     msg = json.loads(recv_lines.pop(0))
     assert msg == {"type": "ui_response", "id": 7,
                    "value": "/opt/beta"}, msg
-    assert BRIDGE.pending_ui is None
+    assert SESSION.pending_ui is None
     assert stub.title == "π: %s (idle · last run 17m · 10 turns)" % proj, stub.title
 
     # multi-select: comma list → array value; out-of-range number rejected
@@ -639,12 +702,12 @@ def main():
     pump_and_drain(client, 0.3)
     msg = json.loads(recv_lines.pop(0))
     assert msg == {"type": "ui_response", "id": 10, "cancelled": True}, msg
-    assert BRIDGE.pending_ui["id"] == 11
+    assert SESSION.pending_ui["id"] == 11
     ns["pi_input_cb"]("", "buffer", "!pick cancel")
     pump_and_drain(client, 0.4)
     msg = json.loads(recv_lines.pop(0))
     assert msg == {"type": "ui_response", "id": 11, "cancelled": True}, msg
-    assert BRIDGE.pending_ui is None
+    assert SESSION.pending_ui is None
 
     # input prompt: free-form answer via !pick <text> (incl. spaces)
     send({"type": "ui_request", "id": 12, "method": "input",
@@ -661,7 +724,7 @@ def main():
     # a malformed ui_request is ignored (no pending state, nothing sent)
     send({"type": "ui_request", "method": "select"})
     pump_and_drain(client, 0.3)
-    assert recv_lines == [] and BRIDGE.pending_ui is None
+    assert recv_lines == [] and SESSION.pending_ui is None
     assert "bad ui_request" in buffer_text(stub)
 
     # the !cd / !pick lines typed above were echoed under the user's IRC nick
@@ -850,7 +913,7 @@ def main():
     ns["pi_input_cb"]("", "buffer", "!nick bogus")
     pump_and_drain(client, 0.2)
     assert "unknown nick mode" in buffer_text(stub), "!nick rejects bad modes"
-    assert BRIDGE.nicks_mode() == "auto", "a rejected mode must not stick"
+    assert SESSION.nicks_mode() == "auto", "a rejected mode must not stick"
 
     # !nick pi restores the single-nick rendering, tool name back in the body
     ns["pi_input_cb"]("", "buffer", "!nick pi")
@@ -904,7 +967,7 @@ def main():
                for tags, _, body in rows), "grep end keeps the grep nick"
     assert any("nick_read" in tags and "permission denied" in body
                for tags, _, body in rows), "read end keeps the read nick"
-    assert "t9" not in BRIDGE.tool_nicks and "t10" not in BRIDGE.tool_nicks, \
+    assert "t9" not in SESSION.tool_nicks and "t10" not in SESSION.tool_nicks, \
         "completed calls are dropped from the id map"
 
     # an end whose start was never seen (reconnect mid-call) still renders,
@@ -1163,7 +1226,7 @@ def main():
         "line 2 closes it and restores the base style"
 
     # --- headings (unit level): tiered attributes, markers stripped
-    rmb = BRIDGE._render_md_block
+    rmb = SESSION._render_md_block
     HEAD, UNDER, DIMA = ns["C_HEADING"], ns["A_UNDERLINE"], ns["A_DIM"]
     assert rmb(["# Title"], "heading", True) == [HEAD + BOLD + UNDER + "Title" + RS]
     assert rmb(["## Second"], "heading", True) == [HEAD + BOLD + "Second" + RS]
@@ -1478,7 +1541,7 @@ def main():
     send({"type": "tool_start", "toolCallId": "t12", "toolName": "bash",
           "args": {"command": "sleep 60"}})
     pump_and_drain(client, 0.2)
-    assert BRIDGE.tool_nicks.get("t12") == "bash", "open call remembered by id"
+    assert SESSION.tool_nicks.get("t12") == "bash", "open call remembered by id"
 
     send({"type": "assistant_line", "msgId": 67, "text": "stranded by disconnect"})
     pump_and_drain(client, 0.2)
@@ -1488,13 +1551,13 @@ def main():
     client.close()
     stub.pump(0.3)
     assert "waiting for pi" in (stub.title or ""), stub.title
-    assert BRIDGE.client is None
+    assert BRIDGE.clients == []
     assert any("stranded by disconnect" in t for k, t in stub.prints), \
         "disconnect flushes a half-built block instead of losing it"
-    assert BRIDGE._md_block == [] and BRIDGE._md_block_type is None, \
+    assert SESSION._md_block == [] and SESSION._md_block_type is None, \
         "disconnect resets the block accumulator"
-    assert BRIDGE.tool_nicks == {}, "disconnect must clear the toolCallId→nick map"
-    assert BRIDGE.timing_snapshot is None, "disconnect must discard the stale snapshot"
+    assert SESSION.tool_nicks == {}, "disconnect must clear the toolCallId→nick map"
+    assert SESSION.timing_snapshot is None, "disconnect must discard the stale snapshot"
 
     # ==================================================================
     # Phase D — TCP listener
@@ -1525,7 +1588,7 @@ def main():
         "anonymous hello accepted without a challenge"
     tc.close()
     stub.pump(0.3)
-    assert BRIDGE.client is None, "tcp client dropped on close"
+    assert BRIDGE.clients == [], "tcp client dropped on close"
 
     # --- challenge handshake with a token
     TOKEN = "test-token-123"
@@ -1613,7 +1676,7 @@ def main():
     assert json.loads(recv_lines[-1]) == {"type": "error", "code": "auth_failed"}
     assert "auth failed from" in buffer_text(stub), "red auth_failed line"
     stub.pump(0.3)
-    assert BRIDGE.client is None and BRIDGE.pending == []
+    assert BRIDGE.clients == [] and BRIDGE.pending == []
 
     # --- missing proof ⇒ auth_failed too
     tc = tcp_connect(port1)
@@ -1752,6 +1815,256 @@ def main():
     stub.pump(0.1)
     assert "tcp listener stopped" in buffer_text(stub)
     assert "pi_tcp_listen_cb" not in stub.fd_hooks, "tcp listen fd unhooked"
+    # ==================================================================
+    # Phase M — multi-session: one buffer per connected pi session
+    # ==================================================================
+    assert BRIDGE.clients == [], "clean slate before the multi-session phase"
+    # Phase D left a token configured; restore the tokenless handshake
+    stub.config_set_plugin("token", "")
+    stub.pump(0.1)
+    def unix_client():
+        cl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        cl.connect(sock_path)
+        cl.setblocking(False)
+        return cl
+    def client_hello(cl, session_id=None):
+        obj = {"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi"}
+        if session_id:
+            obj["sessionId"] = session_id
+        cl.sendall((json.dumps(obj) + "\n").encode())
+        stub.pump(0.3)
+        lines = []
+        drain(cl, lines)
+        for line in lines:
+            m = json.loads(line)
+            if m["type"] in ("hello", "error"):
+                return m
+        raise AssertionError("no hello reply")
+    m1 = unix_client()
+    assert client_hello(m1)["type"] == "hello"
+    m2 = unix_client()
+    assert client_hello(m2)["type"] == "hello"
+    stub.pump(0.2)
+    s1 = BRIDGE.load_session
+    assert len(BRIDGE.sessions) == 2, "second client opens a second session"
+    s2 = BRIDGE.sessions[1]
+    assert s1.buffer != s2.buffer, "each session gets its own buffer"
+    assert stub.buf_names[s1.buffer] == "pi", "load-time buffer keeps name 'pi'"
+    assert len(BRIDGE.clients) == 2
+    # session_info: cwd renames the (non-fixed) buffer to pi:<cwd>
+    m1.sendall((json.dumps({"type": "session_info", "cwd": "/home/x/proj-a"}) + "\n").encode())
+    m2.sendall((json.dumps({"type": "session_info", "cwd": "/home/x/proj-b"}) + "\n").encode())
+    stub.pump(0.2)
+    assert stub.buf_names[s2.buffer] == "pi:" + ns["_short_path"]("/home/x/proj-b"), stub.buf_names
+    # prints route to the owning buffer only
+    m1.sendall((json.dumps({"type": "assistant_line", "text": "from A"}) + "\n").encode())
+    m1.sendall((json.dumps({"type": "assistant_flush"}) + "\n").encode())
+    m2.sendall((json.dumps({"type": "assistant_line", "text": "from B"}) + "\n").encode())
+    m2.sendall((json.dumps({"type": "assistant_flush"}) + "\n").encode())
+    stub.pump(0.2)
+    t1 = "\n".join(stub.buf_prints[s1.buffer])
+    t2 = "\n".join(stub.buf_prints[s2.buffer])
+    assert "from A" in t1 and "from B" not in t1, (t1, t2)
+    assert "from B" in t2 and "from A" not in t2
+    # a duplicate live sessionId is rejected (the first connection owns it)
+    m1.sendall((json.dumps({"type": "session_info", "sessionId": "sid-a"}) + "\n").encode())
+    stub.pump(0.2)
+    assert BRIDGE.session_by_id.get("sid-a") is s1
+    m3 = unix_client()
+    assert client_hello(m3, session_id="sid-a")["code"] == "session_id_in_use"
+    stub.pump(0.2)
+    assert s1.conn is not None, "original session untouched by the rejection"
+    # disconnect + reconnect with the same id reattaches to the SAME buffer
+    buf1_before = s1.buffer
+    m1.close()
+    stub.pump(0.3)
+    assert s1.conn is None
+    m4 = unix_client()
+    assert client_hello(m4, session_id="sid-a")["type"] == "hello"
+    stub.pump(0.2)
+    assert s1.buffer == buf1_before, "reattach reuses the existing buffer"
+    assert len(BRIDGE.sessions) == 2, "reattach does not create a new session"
+    # a client without sessionId always gets a fresh buffer
+    m5 = unix_client()
+    assert client_hello(m5)["type"] == "hello"
+    stub.pump(0.2)
+    assert len(BRIDGE.sessions) == 3
+    s3 = BRIDGE.sessions[2]
+    assert s3.buffer not in (s1.buffer, s2.buffer)
+    # !pick answers the prompt of the OWNING session only
+    m2.sendall((json.dumps({"type": "ui_request", "id": 9, "method": "select",
+                             "title": "choice", "options": ["x", "y"]}) + "\n").encode())
+    stub.pump(0.2)
+    assert s2.pending_ui is not None
+    s3.on_input("!pick 1")
+    stub.pump(0.2)
+    assert any("nothing to pick" in l for l in stub.buf_prints[s3.buffer])
+    s2.on_input("!pick 2")
+    stub.pump(0.2)
+    lines = []
+    drain(m2, lines)
+    resp = [json.loads(l) for l in lines if json.loads(l)["type"] == "ui_response"]
+    assert resp and resp[0].get("value") == "y", resp
+    # tidy up the phase's clients
+    for cl in (m2, m4, m5):
+        cl.close()
+    stub.pump(0.3)
+    assert BRIDGE.clients == [], "all multi-session clients dropped"
+    # ==================================================================
+    # Phase M2 — multi-session edge cases
+    # ==================================================================
+    # (Phase M left the 3 sessions disconnected: buffers live, no conns)
+    # the first client of a quiet load_session takes the `pi` buffer back
+    # (fixed name — its cwd does NOT rename it)
+    m6 = unix_client()
+    assert client_hello(m6)["type"] == "hello"
+    stub.pump(0.2)
+    assert BRIDGE.load_session.conn is not None and len(BRIDGE.sessions) == 3
+    m6.sendall((json.dumps({"type": "session_info", "cwd": "/home/x/proj-b"}) + "\n").encode())
+    stub.pump(0.2)
+    assert stub.buf_names[BRIDGE.load_session.buffer] == "pi", stub.buf_names
+    # malformed sessionId (non-string) is ignored; a same-cwd buffer gets -2
+    m7 = unix_client()
+    m7.sendall((json.dumps({"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi",
+                           "sessionId": 123}) + "\n").encode())
+    stub.pump(0.3)
+    assert len(BRIDGE.clients) == 2
+    assert all(not isinstance(k, int) for k in BRIDGE.session_by_id), BRIDGE.session_by_id
+    m7.sendall((json.dumps({"type": "session_info", "cwd": "/home/x/proj-b"}) + "\n").encode())
+    stub.pump(0.2)
+    s4 = BRIDGE.sessions[-1]
+    assert stub.buf_names[s4.buffer] == "pi:" + ns["_short_path"]("/home/x/proj-b") + "-2", stub.buf_names
+    # repeated hello on an authed conn is ignored (no duplicate session)
+    m7.sendall((json.dumps({"type": "hello", "protocol": ns["PROTOCOL"], "name": "pi"}) + "\n").encode())
+    stub.pump(0.2)
+    assert len(BRIDGE.sessions) == 4 and len(BRIDGE.clients) == 2, (BRIDGE.sessions, BRIDGE.clients)
+    # id change mid-connection: the reattach mapping follows the new id
+    m8 = unix_client()
+    assert client_hello(m8)["type"] == "hello"
+    stub.pump(0.2)
+    m8.sendall((json.dumps({"type": "session_info", "sessionId": "sid-old"}) + "\n").encode())
+    stub.pump(0.2)
+    s5 = BRIDGE.sessions[-1]
+    assert BRIDGE.session_by_id["sid-old"] is s5
+    m8.sendall((json.dumps({"type": "session_info", "sessionId": "sid-new"}) + "\n").encode())
+    stub.pump(0.2)
+    assert BRIDGE.session_by_id["sid-new"] is s5
+    assert "sid-old" not in BRIDGE.session_by_id
+    buf5_before = s5.buffer
+    m8.close()
+    stub.pump(0.3)
+    m8b = unix_client()
+    assert client_hello(m8b, session_id="sid-new")["type"] == "hello"
+    stub.pump(0.2)
+    assert s5.buffer == buf5_before, "reattach uses the CURRENT id"
+    m8c = unix_client()
+    assert client_hello(m8c, session_id="sid-old")["type"] == "hello"
+    stub.pump(0.2)
+    assert len(BRIDGE.sessions) == 6, "the released id no longer reattaches"
+    # user closes the buffer → reattach restores a NEW buffer (name from cwd)
+    m9 = unix_client()
+    assert client_hello(m9)["type"] == "hello"
+    stub.pump(0.2)
+    m9.sendall((json.dumps({"type": "session_info", "cwd": "/home/x/proj-c",
+                           "sessionId": "sid-c"}) + "\n").encode())
+    stub.pump(0.2)
+    s6 = BRIDGE.sessions[-1]
+    closed_buf = s6.buffer
+    ns["pi_close_cb"]("", closed_buf)
+    stub.buffer_close(closed_buf)  # UI: buffer gone, name released
+    stub.pump(0.1)
+    assert s6.alive is False
+    m9.close()
+    stub.pump(0.3)
+    m9b = unix_client()
+    assert client_hello(m9b, session_id="sid-c")["type"] == "hello"
+    stub.pump(0.2)
+    assert s6.buffer != closed_buf and s6.alive, "buffer restored on reattach"
+    assert stub.buf_names[s6.buffer] == "pi:" + ns["_short_path"]("/home/x/proj-c"), stub.buf_names
+    # closing one buffer leaves the other sessions live
+    other = [s for s in BRIDGE.sessions if s is not s6 and s.buffer and s.conn is None][0]
+    ns["pi_close_cb"]("", other.buffer)
+    stub.buffer_close(other.buffer)
+    stub.pump(0.1)
+    assert other.alive is False and s6.alive, "only the closed session's buffer dies"
+    assert any(c["session"] is s6 for c in BRIDGE.clients), "s6's connection keeps running"
+    # stale !pick after reconnect: the pending prompt is dropped with the
+    # connection, so a !pick on the new connection answers nothing and sends
+    # no ui_response to the (new) peer
+    ma = unix_client()
+    assert client_hello(ma)["type"] == "hello"
+    stub.pump(0.2)
+    ma.sendall((json.dumps({"type": "session_info", "sessionId": "sid-p"}) + "\n").encode())
+    stub.pump(0.2)
+    sa = BRIDGE.sessions[-1]
+    ma.sendall((json.dumps({"type": "ui_request", "id": 42,
+                            "method": "select", "title": "stale?",
+                            "options": [{"label": "a"}, {"label": "b"}]}) + "\n").encode())
+    stub.pump(0.2)
+    assert sa.pending_ui is not None, "prompt is pending on the live conn"
+    ma.close()
+    stub.pump(0.3)
+    assert sa.pending_ui is None, "prompt is dropped with the connection"
+    ma2 = unix_client()
+    assert client_hello(ma2, session_id="sid-p")["type"] == "hello"
+    stub.pump(0.2)
+    ns["pi_input_cb"]("", sa.buffer, "!pick 1")
+    stub.pump(0.2)
+    out = []
+    drain(ma2, out)
+    assert not any(b"ui_response" in l for l in out), out
+    assert any("nothing to pick" in m for m in stub.buf_prints.get(sa.buffer, [])), stub.buf_names
+    # tidy up
+    for cl in (m6, m7, m8b, m8c, m9b, ma2):
+        cl.close()
+    stub.pump(0.3)
+    assert BRIDGE.clients == []
+    # ==================================================================
+    # Phase M3 — stale buffer pointer (use-after-close) regression
+    # ==================================================================
+    # M2 ended with `other`'s buffer CLOSED (alive=False). Any buffer_*
+    # call passing that freed pointer would crash real WeeChat (use-
+    # after-free, e.g. in strlen); the stub records such calls in
+    # stub.stale_calls and asserts none happened.
+    assert other.alive is False
+    # mb is the first client of the quiet load_session: it takes the
+    # load-time `pi` buffer back (no new session is created)
+    mb = unix_client()
+    assert client_hello(mb)["type"] == "hello"
+    stub.pump(0.2)
+    sb = BRIDGE.load_session
+    assert sb.conn is not None and sb.alive
+    # mc: a genuinely new session → _new_buffer_name must skip the dead
+    # session's freed pointer (old code read it here → native crash)
+    mc = unix_client()
+    assert client_hello(mc)["type"] == "hello"
+    stub.pump(0.2)
+    sc = BRIDGE.sessions[-1]
+    # the new buffer's name must be unique among LIVE buffers (the dead
+    # session's pointer is never read, and its name is not counted)
+    live_names = {stub.buf_names[s.buffer] for s in BRIDGE.sessions
+                  if s.alive and s.buffer and s is not sc}
+    assert stub.buf_names[sc.buffer] not in live_names, stub.buf_names
+    # a nick config change re-applies the nick localvar to every LIVE
+    # session and must skip the dead one
+    stub.set_config("irc.server_default.nicks", "bob,bob2")
+    stub.pump(0.2)
+    # BOTH surviving sessions keep rendering
+    mb.sendall((json.dumps({"type": "assistant_line", "msgId": 1,
+                            "text": "still alive"}) + "\n").encode())
+    mc.sendall((json.dumps({"type": "assistant_line", "msgId": 1,
+                            "text": "so is mc"}) + "\n").encode())
+    # a lone paragraph line stays buffered (markdown block) until flushed
+    mb.sendall((json.dumps({"type": "assistant_flush"}) + "\n").encode())
+    mc.sendall((json.dumps({"type": "assistant_flush"}) + "\n").encode())
+    stub.pump(0.2)
+    assert any("still alive" in m for m in stub.buf_prints[sb.buffer])
+    assert any("so is mc" in m for m in stub.buf_prints[sc.buffer])
+    for cl in (mb, mc):
+        cl.close()
+    stub.pump(0.3)
+    assert BRIDGE.clients == []
+    assert stub.stale_calls == [], "stale (closed-buffer) API calls: %s" % stub.stale_calls
 
     print("smoke weechat: OK (%d buffer lines rendered)" % len(stub.prints))
 
