@@ -741,6 +741,111 @@ test("integration: !cd + !pick round trip", async (t) => {
   await mock.fire("session_shutdown");
 });
 
+test("integration: assistant markdown renders through the real extension", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wc-itg-md-"));
+  const sockPath = path.join(dir, "bridge.sock");
+  const wc = startWeechatSide(sockPath);
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  t.after(async () => {
+    try { wc.child.kill("SIGKILL"); } catch {}
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  await wc.waitFor((m) => m.type === "ready", "python driver ready", 10_000);
+  delete process.env.PI_WEECHAT_URL;
+  delete process.env.PI_WEECHAT_TOKEN;
+  process.env.PI_WEECHAT_SOCK = sockPath;
+  await loadExt();
+  await mock.fire("session_start");
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("pi connected"),
+    "buffer: connected"
+  );
+
+  // the stub weechat module maps colors to single letters and attributes to
+  // real control codes: M=magenta, E=yellow, BOLD/UNDER are raw \x1a codes
+  const BOLD = "\x1a\x01", UNDER = "\x1a\x04", R = "0";
+
+  await mock.fire("agent_start");
+  await mock.fire("message_start", { message: { role: "assistant" } });
+  await mock.fire("message_update", {
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "# Title\n" },
+  });
+  await mock.fire("message_update", {
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Some **bold** and `code`.\n" },
+  });
+  await mock.fire("message_update", {
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "- item one\n" },
+  });
+  await mock.fire("message_update", { assistantMessageEvent: { type: "text_end", contentIndex: 0 } });
+  await mock.fire("message_end", { message: { role: "assistant" } });
+
+  const head = await wc.waitFor(
+    (m) => m.type === "print" && m.text === "M" + BOLD + UNDER + "Title" + R,
+    "heading rendered with heading color + bold + underline"
+  );
+  assert.ok(head.prefix.includes("pi"), "heading keeps the pi nick prefix");
+  const para = await wc.waitFor(
+    (m) => m.type === "print" && m.text === "Some " + BOLD + "bold and Ecode." + R,
+    "emphasis and inline code render, their markers are gone"
+  );
+  assert.ok(para.text.includes(BOLD), "bold attribute reaches the buffer");
+  assert.ok(!wc.lines.some((m) => m.type === "print" && (m.text || "").includes("**")),
+    "no literal ** markers left in the buffer");
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text === "\u2022 item one" + R,
+    "list item renders as a bullet"
+  );
+
+  // ordering: the heading prints at once, the tool line keeps its place
+  await mock.fire("message_start", { message: { role: "assistant" } });
+  await mock.fire("message_update", {
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "## Step\n" },
+  });
+  await mock.fire("tool_execution_start", { toolCallId: "m1", toolName: "read", args: { path: "/tmp/a" } });
+  await mock.fire("message_update", {
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "after the tool\n" },
+  });
+  await mock.fire("message_update", { assistantMessageEvent: { type: "text_end", contentIndex: 0 } });
+  await mock.fire("message_end", { message: { role: "assistant" } });
+  const h2 = await wc.waitFor(
+    (m) => m.type === "print" && m.text === "M" + BOLD + "Step" + R,
+    "level-2 heading rendered"
+  );
+  const tool = await wc.waitFor(
+    (m) => m.type === "print" && (m.tags || "").includes("nick_read"),
+    "tool line under the tool nick"
+  );
+  const after = await wc.waitFor(
+    (m) => m.type === "print" && m.text === "after the tool" + R,
+    "paragraph after the tool line"
+  );
+  assert.ok(wc.lines.indexOf(h2) < wc.lines.indexOf(tool), "heading prints before the tool line");
+  assert.ok(wc.lines.indexOf(tool) < wc.lines.indexOf(after), "tool line before the following paragraph");
+
+  // !markdown off: the very same text arrives with its markers
+  wc.send({ op: "input", text: "!markdown off" });
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text.includes("markdown rendering: off"),
+    "markdown switched off"
+  );
+  await mock.fire("message_start", { message: { role: "assistant" } });
+  await mock.fire("message_update", {
+    assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "# Raw heading\n" },
+  });
+  await mock.fire("message_update", { assistantMessageEvent: { type: "text_end", contentIndex: 0 } });
+  await mock.fire("message_end", { message: { role: "assistant" } });
+  await wc.waitFor(
+    (m) => m.type === "print" && m.text === "# Raw heading" + R,
+    "markdown off restores the raw text, markers included"
+  );
+  wc.send({ op: "input", text: "!markdown on" });
+});
+
+
 function waitForMock(pred, what, ms = 5000) {
   return new Promise((resolve, reject) => {
     const iv = setInterval(() => {

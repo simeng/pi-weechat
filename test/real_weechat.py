@@ -52,6 +52,7 @@ def on_print(*args):
                 "prefix": weechat.string_remove_color(args[6], ""),
                 "prefix_raw": args[6] or "",
                 "message": weechat.string_remove_color(args[7], ""),
+                "message_raw": args[7] or "",
             }) + "\\n")
     except OSError:
         pass
@@ -80,7 +81,8 @@ def mkroot(name: str) -> str:
 
 
 def run_weechat(root: str, seed_conf: str | None,
-                mid: callable | None = None) -> tuple[list[dict], dict]:
+                mid: callable | None = None,
+                script: callable | None = None) -> tuple[list[dict], dict]:
     """Boot a real headless WeeChat with pi_bridge autoloaded, drive it as a
     client would, and return the lines WeeChat printed plus its nick colors."""
     home = os.path.join(root, "home")
@@ -114,6 +116,27 @@ def run_weechat(root: str, seed_conf: str | None,
 
     def send(msg: dict) -> None:
         c.sendall(json.dumps(msg).encode() + b"\n")
+
+    if script:
+        script(send, capture)
+        if mid:
+            # toggle markdown off from the WeeChat side and print one more line
+            fifo = next(f for f in os.listdir(home) if f.startswith("weechat_fifo_"))
+            mid(os.path.join(home, fifo))
+            send({"type": "assistant_line", "msgId": 5,
+                  "text": "## after markdown was switched off"})
+            time.sleep(1.0)
+        send({"type": "assistant_line", "msgId": 4, "text": "Bye."})
+        time.sleep(1.5)
+        c.close()
+        os.kill(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait()
+        rows = [json.loads(line) for line in open(capture, encoding="utf-8")]
+        return [r for r in rows if r["buffer"] == "python.pi"], {}
 
     send({"type": "session_info", "sessionId": "s1", "sessionFile": "/tmp/s.jsonl",
           "model": "opencode/gpt-5", "cwd": "/tmp/proj", "contextWindow": 200000,
@@ -255,6 +278,93 @@ def main() -> int:
                              all("pi" in r["prefix_raw"] for r in after if r["prefix_raw"])))
         results.append(check("after the switch: tool name back in the body",
                              any("⚙ grep" in r["message"] for r in after)))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    # --- markdown rendering (pi_bridge.markdown = on by default) -----------
+    root = mkroot("markdown")
+
+    def md_script(send, capture_path) -> None:
+        for text in [
+            "# Markdown heading",
+            "Some **bold**, some *italic*, and `inline code` together.",
+            "One ~~struck~~ line.",
+            "",
+            "- first item",
+            "  lazy continuation of the first item",
+            "- second item",
+            "",
+            "> quoted line",
+            ">> nested quote",
+            "",
+            "---",
+            "## Heading with `code` and **bold**",
+            "A long paragraph line " * 12,
+        ]:
+            send({"type": "assistant_line", "msgId": 10, "text": text})
+        send({"type": "assistant_flush", "msgId": 10})
+        # bounded wait for the bridge to render the block before the /set
+        # below: the FIFO command is processed immediately, so a fixed sleep
+        # here is a race, not a guarantee
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if os.path.exists(capture_path):
+                data = open(capture_path, encoding="utf-8").read()
+                if "Markdown heading" in data and "# Markdown" not in data:
+                    return
+            time.sleep(0.2)
+
+    def markdown_off(fifo: str) -> None:
+        with open(fifo, "w") as f:
+            f.write("core.weechat */set plugins.var.python.pi_bridge.markdown off\n")
+
+    try:
+        pi, _ = run_weechat(root, '[var]\npython.pi_bridge.markdown = "on"\n',
+                            mid=markdown_off, script=md_script)
+        print("\n=== markdown rendering ===")
+        dump(pi)
+
+        def find(sub):
+            return [r for r in pi if sub in r["message"]]
+
+        head = find("Markdown heading")
+        emph = find("Some bold, some italic, and inline code together.")
+        quote = find("quoted line")
+        nested = find("nested quote")
+        rules = [r for r in pi if r["message"].startswith("\u2500\u2500")]
+        long = [r for r in pi if r["message"].startswith("A long paragraph line")]
+        raw_after_off = find("after markdown was switched off")
+        results.append(check("ATX heading: markers stripped, bold + underline + color stored",
+                             len(head) == 1 and "#" not in head[0]["message"]
+                             and "\x1a\x01" in head[0]["message_raw"]
+                             and "\x1a\x04" in head[0]["message_raw"]
+                             and "\x19" in head[0]["message_raw"]))
+        results.append(check("emphasis and inline code render, their markers are gone",
+                             len(emph) == 1 and "**" not in emph[0]["message"]
+                             and "`" not in emph[0]["message"]))
+        results.append(check("bold, italic and color all survive in one stored line",
+                             len(emph) == 1 and "\x1a\x01" in emph[0]["message_raw"]
+                             and "\x1a\x03" in emph[0]["message_raw"]
+                             and "\x19" in emph[0]["message_raw"]))
+        struck = [r for r in pi if "\u0336" in r["message"]]
+        results.append(check("strikethrough renders as the combining stroke overlay",
+                             len(struck) == 1
+                             and struck[0]["message"].startswith("One ")
+                             and "~~" not in struck[0]["message"]))
+        results.append(check("list markers become bullets and the continuation hangs under them",
+                             any(r["message"].startswith("\u2022 first item") for r in pi)
+                             and any(r["message"].startswith("  lazy continuation") for r in pi)))
+        results.append(check("blockquote gets a bar, a nested quote gets two",
+                             len(quote) == 1 and quote[0]["message"].startswith("\u2502 ")
+                             and len(nested) == 1 and nested[0]["message"].startswith("\u2502 \u2502 ")))
+        results.append(check("horizontal rule renders as a box-drawing line", len(rules) == 1))
+        results.append(check("a long line stays one buffer line (client wraps it, not the bridge)",
+                             len(long) == 1 and len(long[0]["message"]) > 200))
+        results.append(check("markdown lines keep the pi nick prefix",
+                             all(has_nick(r, "pi") for r in head + emph + quote + nested)))
+        results.append(check("/set plugins.var.python.pi_bridge.markdown off switches rendering live",
+                             len(raw_after_off) == 1
+                             and "## after markdown was switched off" in raw_after_off[0]["message"]))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
