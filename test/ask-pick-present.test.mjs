@@ -8,21 +8,23 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+// No getAllTools here: pi's event ctx has none. The inventory is on the API.
 const MOCK_CTX = {
   cwd: "/tmp/ask-pick-present",
   model: { provider: "prov", id: "m" },
   isIdle: () => true,
   abort() {},
-  // Simulates pi-ask-user (or any other ask provider) already being loaded.
-  getAllTools: () => [
-    {
-      name: "ask_user",
-      description: "provided by another extension",
-      parameters: null,
-      promptGuidelines: [],
-    },
-  ],
 };
+
+// Simulates pi-ask-user (or any other ask provider) already being loaded.
+const MOCK_TOOLS = [
+  {
+    name: "ask_user",
+    description: "provided by another extension",
+    parameters: null,
+    promptGuidelines: [],
+  },
+];
 
 function makePiMock() {
   const handlers = {};
@@ -31,6 +33,7 @@ function makePiMock() {
     handlers,
     registeredTools,
     api: {
+      getAllTools: () => MOCK_TOOLS,
       on: (name, fn) => {
         (handlers[name] ??= []).push(fn);
       },

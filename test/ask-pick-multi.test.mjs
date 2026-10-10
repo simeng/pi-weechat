@@ -16,14 +16,16 @@ import {
   startWeechatSide,
 } from "./wc-harness.mjs";
 
+// No getAllTools here: pi's event ctx has none. The inventory is on the API.
 const MOCK_CTX = {
   cwd: "/tmp/ask-pick-multi",
   model: { provider: "prov", id: "model-multi" },
   isIdle: () => true,
   abort() {},
-  // rpiv-ask-user-question is loaded → the fallback must stay unregistered.
-  getAllTools: () => [{ name: "ask_user_question", description: "provided by rpiv" }],
 };
+
+// rpiv-ask-user-question is loaded -> the fallback must stay unregistered.
+const MOCK_TOOLS = ["read", "bash", "ask_user_question"];
 
 test("integration: ask_user_question questions[] → WeeChat !pick", async (t) => {
   const env = makeBridgeEnv("ask-pick-multi");
@@ -38,7 +40,7 @@ test("integration: ask_user_question questions[] → WeeChat !pick", async (t) =
 
   await wc.waitFor((m) => m.type === "ready", "python driver ready", 10_000);
   env.applyEnv();
-  const mock = makePiMock(MOCK_CTX);
+  const mock = makePiMock(MOCK_CTX, MOCK_TOOLS);
   await loadExtension(mock);
   await mock.fire("session_start");
   await wc.waitFor((m) => m.type === "print" && m.text.includes("pi connected"), "buffer: pi connected");
