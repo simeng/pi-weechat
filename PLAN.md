@@ -58,7 +58,9 @@ confidentiality is the VPN's job (§6).
   `<agent dir>/pi-weechat.json` — agent dir follows `$PI_CODING_AGENT_DIR`
   (default `~/.pi/agent`, next to pi's own settings.json); keys `url`,
   `token`, `debugLog` mirror `PI_WEECHAT_URL` / `PI_WEECHAT_TOKEN` /
-  `PI_BRIDGE_DEBUG`; env vars win over the file; re-read at every
+  `PI_BRIDGE_DEBUG`, plus the question-routing knobs `pick`, `pickTools` and
+  `askTool` (env `PI_WEECHAT_PICK` / `PI_WEECHAT_PICK_TOOLS` /
+  `PI_WEECHAT_ASK_TOOL`; strings or plain booleans); env vars win over the file; re-read at every
   `session_start` (so `/reload` picks up edits); a broken file degrades to
   env/default behavior + red `config_error` line in the buffer. On the
   WeeChat side the Unix
@@ -397,7 +399,7 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 | `irc.server_default.nicks` | WeeChat IRC option (read-only for the bridge): first non-empty entry = the user's nick for the `nick!me` prefix column; re-applied live via `hook_config`, no reload | the IRC plugin's `nicks` default |
 | `PI_WEECHAT_URL`     | pi extension env: `tcp://host:port` / `unix://<path>` / `host:port` / path | unset ⇒ config-file `url` ⇒ `PI_WEECHAT_SOCK` (deprecated) ⇒ default unix path |
 | `PI_WEECHAT_TOKEN`   | pi extension env: shared secret for the challenge (never in the URL) | unset (anonymous) ⇒ config-file `token` |
-| `pi-weechat.json`    | pi-side config file `<agent dir>/pi-weechat.json` (agent dir = `$PI_CODING_AGENT_DIR`, default `~/.pi/agent`); keys `url` / `token` / `debugLog` mirror the env vars above — **env always wins over the file**; re-read at each `session_start`; broken file ⇒ env/default behavior + red `config_error` line | missing (fine) |
+| `pi-weechat.json`    | pi-side config file `<agent dir>/pi-weechat.json` (agent dir = `$PI_CODING_AGENT_DIR`, default `~/.pi/agent`); keys `url` / `token` / `debugLog` mirror the env vars above, plus `pick` / `pickTools` / `askTool` for question routing — **env always wins over the file**; re-read at each `session_start`; broken file ⇒ env/default behavior + red `config_error` line | missing (fine) |
 | socket path (unix)   | weechat side: same env / XDG dirs | `$XDG_RUNTIME_DIR/pi-weechat.sock` |
 
 ## 8. Milestones
@@ -424,9 +426,21 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
    search + create option, ported from the standalone `/cd` extension);
    `globalThis.__pi_weechat_bridge__` handle so other extensions (e.g.
    ask_user-style tools) can offer their prompts in the buffer via
-   `isConnected()/select()/input()`. ✅ (ask-user relay itself: roadmap —
-   no public hook in pi-ask-user today, so the bridge only exposes the
-   channel.)
+   `isConnected()/select()/input()`. ✅ (ask-user relay: done in M7 — the
+   bridge intercepts question tools in `tool_call` instead of needing a hook in
+   the ask extension itself.)
+8. **M7 — one ask tool per session + questionnaire relay:** the built-in
+   `ask_user` is now a true fallback — `auto` registers it only when no other
+   question-shaped tool is loaded (`ask_user_question`, `askUserQuestion`,
+   `ask-user-question`, …), `PI_WEECHAT_ASK_TOOL=off|auto|force` overrides that,
+   and a tool literally named `ask_user` is never shadowed. The `tool_call`
+   relay understands both call shapes: singular `question` and a plural
+   `questions[]` questionnaire (rpiv-ask-user-question), asked one prompt at a
+   time (`Q1/3 · header — question`), `multiSelect` via `!pick 1,3`, option
+   `preview` folded into the option description, answers composed into one
+   blocked tool result; any fallback cancels the whole questionnaire. Also
+   fixed: `pick` / `pickTools` were documented but dropped by the config
+   parser, so only the env-var form worked. ✅
 
 ## 9. Repo layout
 
@@ -437,15 +451,28 @@ pi-weechat/
 ├── package.json             # pi package manifest ("pi-package" keyword)
 ├── tsconfig.json            # typecheck only (noEmit)
 ├── lib/
-│   └── codec.mjs            # shared NDJSON codec + protocol constants
+│   ├── codec.mjs            # shared NDJSON codec + protocol constants
+│   ├── pi-config.mjs        # pi-side config file reader (pi-weechat.json)
+│   └── cd-search.mjs        # !cd fuzzy project matching helpers
 ├── extensions/
-│   └── weechat-bridge.ts    # pi extension (socket client + mirroring)
+│   ├── weechat-bridge.ts    # pi extension (socket client, mirroring, !pick relay)
+│   └── cd.ts                # standalone /cd command (works without the bridge)
 ├── weechat/
 │   └── pi_bridge.py         # WeeChat script (socket server + buffer)
 └── test/
     ├── protocol.test.mjs    # codec unit tests + extension end-to-end (mock peer)
+    ├── config.test.mjs      # config-file parsing + key validation
+    ├── cd-search.test.mjs   # !cd matching helpers
+    ├── cd-ext.test.mjs      # standalone /cd extension
+    ├── glowing-bear.test.mjs# markdown stays decodable for relay clients
+    ├── ask-pick.test.mjs    # built-in ask_user fallback → !pick (live socket)
+    ├── ask-pick-multi.test.mjs# questions[] questionnaire → !pick (live socket)
+    ├── ask-pick-present.test.mjs# no fallback when another ask tool exists
+    ├── ask-tool-mode.test.mjs # askTool=auto|off|force + question-name detection
+    ├── wc-harness.mjs       # shared pi mock + WeeChat-side driver helpers
     ├── smoke_weechat.py     # weechat script smoke test (stub weechat module, stdlib only)
-    ├── py_driver.py         # stdin/stdout driver used by the integration test
+    ├── py_driver.py         # stdin/stdout driver used by the integration tests
+    ├── real_weechat.py      # manual check against a real WeeChat instance
     └── integration.test.mjs # REAL extension ↔ REAL weechat script over a live socket
 ```
 

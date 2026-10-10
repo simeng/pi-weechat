@@ -98,3 +98,38 @@ test("loadConfig: a directory in place of the file → {}, no error (EISDIR = mi
   assert.deepEqual(loadConfig({ onError: (m) => errors.push(m) }), {});
   assert.equal(errors.length, 0);
 });
+
+test("loadConfig: question-routing keys are read (string, boolean, or list)", () => {
+  withAgentDir(test, JSON.stringify({
+    pick: "off",
+    pickTools: ["ask_user_question", "askUserQuestion"],
+    askTool: false,
+  }));
+  const errors = [];
+  assert.deepEqual(loadConfig({ onError: (m) => errors.push(m) }), {
+    pick: "off",
+    pickTools: ["ask_user_question", "askUserQuestion"],
+    askTool: false,
+  });
+  assert.equal(errors.length, 0);
+});
+
+test("loadConfig: pickTools as a comma string is kept verbatim", () => {
+  withAgentDir(test, JSON.stringify({ pick: true, askTool: "force", pickTools: "ask_user,my_ask" }));
+  const errors = [];
+  assert.deepEqual(loadConfig({ onError: (m) => errors.push(m) }), {
+    pick: true,
+    askTool: "force",
+    pickTools: "ask_user,my_ask",
+  });
+  assert.equal(errors.length, 0);
+});
+
+test("loadConfig: a malformed routing key is dropped + onError, the rest kept", () => {
+  withAgentDir(test, JSON.stringify({ pick: "off", askTool: 7, pickTools: ["ok", 42] }));
+  const errors = [];
+  assert.deepEqual(loadConfig({ onError: (m) => errors.push(m) }), { pick: "off" });
+  assert.equal(errors.length, 2);
+  assert.match(errors[0], /"askTool" must be a string or boolean/);
+  assert.match(errors[1], /"pickTools" must be a string or an array of strings/);
+});

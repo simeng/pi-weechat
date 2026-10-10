@@ -4,10 +4,12 @@
  * Dials (as client) the WeeChat script (weechat/pi_bridge.py) over a Unix
  * socket or TCP, mirrors assistant text (batched into whole lines), tool
  * calls/results, and status; forwards lines typed in the WeeChat buffer back
- * to pi as user input. Decision questions raised by ask_user-style tools are
- * routed to the WeeChat buffer and answered with !pick (falling back to the pi
- * terminal when the bridge is down); if no other extension provides an
- * ask_user tool, a minimal built-in one is registered. Endpoint/token/debug
+ * to pi as user input. Decision questions raised by ask_user-style tools —
+ * a single `question` (ask_user) or a `questions[]` questionnaire
+ * (ask_user_question) — are routed to the WeeChat buffer and answered with
+ * !pick (falling back to the pi terminal when the bridge is down); a minimal
+ * built-in ask_user is registered only when no other question tool is loaded
+ * (PI_WEECHAT_ASK_TOOL=off|auto|force). Endpoint/token/debug
  * are read from environment
  * variables (PI_WEECHAT_URL / PI_WEECHAT_TOKEN / PI_BRIDGE_DEBUG) or from the
  * config file <agent dir>/pi-weechat.json (default ~/.pi/agent/) — env vars
@@ -47,7 +49,38 @@ function pickEnabled(env: string | undefined, cfg?: string | boolean): boolean {
   return v !== "off" && v !== "0" && v !== "false";
 }
 
-/** Tool names whose question prompts are routed to the buffer (default: ask_user). */
+/**
+ * Whether the bridge registers its built-in `ask_user` fallback tool:
+ *   - "auto" (default): only when no other question tool is loaded
+ *   - "off":   never (a foreign ask tool is the only question tool)
+ *   - "force": always, except a name clash with an existing `ask_user`
+ */
+type AskToolMode = "auto" | "off" | "force";
+function resolveAskToolMode(env: string | undefined, cfg?: string | boolean): AskToolMode {
+  const raw = env ?? (cfg === undefined ? undefined : String(cfg));
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (v === "off" || v === "0" || v === "false" || v === "never") return "off";
+  if (v === "force" || v === "on" || v === "true" || v === "always") return "force";
+  return "auto";
+}
+
+/**
+ * Names of tools whose job is asking the user a question. Used to decide
+ * whether some other extension already covers it: `ask_user` (pi-ask-user),
+ * `ask_user_question` (rpiv-ask-user-question), `askUserQuestion`
+ * (pi-ask-user-question), … Case and punctuation are ignored, so
+ * `ask-user-question` matches too.
+ */
+function isQuestionToolName(name: unknown): boolean {
+  if (typeof name !== "string") return false;
+  const n = name.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return n.startsWith("askuser") || (n.includes("ask") && n.includes("question"));
+}
+
+/** Routed to the buffer unless PI_WEECHAT_PICK_TOOLS says otherwise. */
+const DEFAULT_PICK_TOOLS = ["ask_user", "ask_user_question", "askUserQuestion"];
+
+/** Tool names whose question prompts are routed to the buffer. */
 function pickToolNames(env: string | undefined, cfg?: string | string[]): Set<string> {
   const raw =
     env ?? (Array.isArray(cfg) ? cfg.join(",") : typeof cfg === "string" ? cfg : undefined);
@@ -55,27 +88,38 @@ function pickToolNames(env: string | undefined, cfg?: string | string[]): Set<st
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  return new Set(names.length > 0 ? names : ["ask_user"]);
+  return new Set(names.length > 0 ? names : DEFAULT_PICK_TOOLS);
 }
 
-/** Coerce the `options` param of an ask-style tool into {label, description?} entries. */
+/** Max characters of an option `preview` folded into its buffer description line. */
+const OPTION_PREVIEW_MAX = 300;
+
+/**
+ * Coerce the `options` of an ask-style tool into {label, description?} entries.
+ * Accepts both shapes in the wild: {title, description} (ask_user) and
+ * {label, description, preview} (ask_user_question). The buffer renders one
+ * line per option, so a preview is folded into the description, truncated.
+ */
 function coerceAskOptions(raw: unknown): Array<{ label: string; description?: string }> {
   if (!Array.isArray(raw)) return [];
   const out: Array<{ label: string; description?: string }> = [];
   for (const item of raw) {
     if (typeof item === "string" && item.trim()) {
       out.push({ label: item.trim() });
-    } else if (
-      item &&
-      typeof item === "object" &&
-      typeof (item as { title?: unknown }).title === "string" &&
-      ((item as { title: string }).title).trim()
-    ) {
-      const t = item as { title: string; description?: unknown };
-      const description =
-        typeof t.description === "string" && t.description.trim() ? t.description.trim() : undefined;
-      out.push({ label: t.title.trim(), description });
+      continue;
     }
+    if (!item || typeof item !== "object") continue;
+    const o = item as { title?: unknown; label?: unknown; description?: unknown; preview?: unknown };
+    const title = typeof o.title === "string" ? o.title.trim() : "";
+    const label = title || (typeof o.label === "string" ? o.label.trim() : "");
+    if (!label) continue;
+    let description =
+      typeof o.description === "string" && o.description.trim() ? o.description.trim() : undefined;
+    if (typeof o.preview === "string" && o.preview.trim()) {
+      const preview = truncate(o.preview.trim(), OPTION_PREVIEW_MAX);
+      description = description ? `${description} · ${preview}` : preview;
+    }
+    out.push({ label, description });
   }
   return out;
 }
@@ -85,6 +129,79 @@ function buildAskTitle(question: string, context: unknown): string {
   const ctxText = typeof context === "string" ? context.trim() : "";
   if (!ctxText) return question;
   return `${question}\n\nContext:\n${truncate(ctxText, 800)}`;
+}
+
+/** One normalized question, whatever shape the ask-style tool used. */
+type AskQuestion = {
+  question: string;
+  header?: string;
+  context?: string;
+  options: Array<{ label: string; description?: string }>;
+  allowMultiple: boolean;
+  allowFreeform: boolean;
+  timeoutMs?: number;
+};
+
+function positiveNumber(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+}
+
+/**
+ * Normalize a question-tool call into a question list. Two shapes matter:
+ *   singular (ask_user):        { question, options: [{title}], allowMultiple, allowFreeform, timeout }
+ *   plural (ask_user_question): { questions: [{ question, header, options: [{label, description, preview}], multiSelect }] }
+ * Anything else yields [] — the hook then lets the tool run its own UI.
+ */
+function coerceAskQuestions(input: Record<string, unknown>): AskQuestion[] {
+  const topTimeout = positiveNumber(input?.timeout);
+  const out: AskQuestion[] = [];
+  const plural = input?.questions;
+  if (Array.isArray(plural) && plural.length > 0) {
+    for (const item of plural) {
+      if (!item || typeof item !== "object") continue;
+      const q = item as Record<string, unknown>;
+      const question = typeof q.question === "string" ? q.question.trim() : "";
+      if (!question) continue;
+      out.push({
+        question,
+        header: typeof q.header === "string" && q.header.trim() ? q.header.trim() : undefined,
+        context: typeof q.context === "string" && q.context.trim() ? q.context.trim() : undefined,
+        options: coerceAskOptions(q.options),
+        allowMultiple: q.multiSelect === true || q.allowMultiple === true,
+        allowFreeform: q.allowFreeform !== false,
+        timeoutMs: positiveNumber(q.timeout) ?? topTimeout,
+      });
+    }
+    return out;
+  }
+  const question = typeof input?.question === "string" ? input.question.trim() : "";
+  if (question) {
+    out.push({
+      question,
+      context:
+        typeof input.context === "string" && input.context.trim() ? input.context.trim() : undefined,
+      options: coerceAskOptions(input.options),
+      allowMultiple: input.allowMultiple === true,
+      allowFreeform: input.allowFreeform !== false,
+      timeoutMs: topTimeout,
+    });
+  }
+  return out;
+}
+
+/**
+ * Buffer title for one question. A lone question keeps the plain wording; a
+ * questionnaire is numbered so the buffer shows progress (Q1/3 · header — question).
+ */
+function buildQuestionTitle(q: AskQuestion, index: number, total: number): string {
+  const chip =
+    total > 1
+      ? q.header
+        ? `Q${index + 1}/${total} · ${q.header}`
+        : `Q${index + 1}/${total}`
+      : q.header ?? "";
+  const prefix = chip ? `${chip} — ` : "";
+  return buildAskTitle(prefix + q.question, q.context);
 }
 
 /** Quote each choice so the LLM sees unambiguous tool-result text. */
@@ -101,8 +218,10 @@ type BridgeConfig = {
   debugLog?: string;
   /** "off" disables routing decision questions to the buffer (default: on). */
   pick?: string | boolean;
-  /** Comma list / array of question tool names to route (default: ask_user). */
+  /** Comma list / array of question tool names to route (default: DEFAULT_PICK_TOOLS). */
   pickTools?: string | string[];
+  /** Built-in ask_user fallback: "off" never, "force" always, default "auto" (only if no other question tool is loaded). */
+  askTool?: string | boolean;
 };
 
 // Opt-in wire debug log. Enabled by PI_BRIDGE_DEBUG=<path>, then the
@@ -239,7 +358,8 @@ export default function weechatBridge(pi: ExtensionAPI) {
   let turnCount = 0;
   const timingPauseReasons = new Set<string>();
   let askPickEnabled = true;              // PI_WEECHAT_PICK=off disables question routing
-  let askToolNames = new Set(["ask_user"]); // PI_WEECHAT_PICK_TOOLS (comma list)
+  let askToolMode: AskToolMode = "auto"; // PI_WEECHAT_ASK_TOOL=off|auto|force (built-in fallback tool)
+  let askToolNames = new Set(DEFAULT_PICK_TOOLS); // PI_WEECHAT_PICK_TOOLS (comma list)
   let fallbackAskRegistered = false;      // we registered the built-in ask_user
   let pendingOut: string[] = []; // messages emitted before the socket is up
   let helloSent = false;         // our hello went out for the current connection
@@ -281,6 +401,7 @@ export default function weechatBridge(pi: ExtensionAPI) {
     token = process.env.PI_WEECHAT_TOKEN ?? (cfg.token ?? "");
     askPickEnabled = pickEnabled(process.env.PI_WEECHAT_PICK, cfg.pick);
     askToolNames = pickToolNames(process.env.PI_WEECHAT_PICK_TOOLS, cfg.pickTools);
+    askToolMode = resolveAskToolMode(process.env.PI_WEECHAT_ASK_TOOL, cfg.askTool);
   }
   refreshConfig(); // at load time (session_start refreshes again)
 
@@ -1165,73 +1286,102 @@ export default function weechatBridge(pi: ExtensionAPI) {
 
   // ------------------------- decision questions: route to the buffer (!pick)
   //
-  // ask_user-style tools (pi-ask-user and friends) block inside execute()
-  // waiting for their TUI. We intercept them EARLIER — in the tool_call hook,
-  // before execution starts — so when the bridge is connected the question
-  // is asked of the WeeChat buffer instead, with no modification to the ask
-  // extension itself:
+  // ask_user-style tools (rpiv-ask-user-question, pi-ask-user and friends)
+  // block inside execute() waiting for their TUI. We intercept them EARLIER —
+  // in the tool_call hook, before execution starts — so when the bridge is
+  // connected the question is asked of the WeeChat buffer instead, with no
+  // modification to the ask extension itself. Both call shapes are understood:
+  // a single `question` (ask_user) and a `questions[]` questionnaire
+  // (ask_user_question).
   //   - answered  → block the call; the LLM receives `reason` as the tool
   //                 result (a blocked tool_call surfaces it)
   //   - cancelled → block with a "user cancelled" result
-  //   - fallback  → return undefined; the tool runs its own local UI
-  //                 (terminal user, bridge down, timeout, abort)
+  //   - fallback  → return undefined; the tool runs its own local UI for the
+  //                 WHOLE questionnaire (answers already collected are dropped
+  //                 rather than half the questions asked in two different UIs)
+  // Questions are asked one at a time: the buffer tracks a single pending
+  // prompt, and a new ui_request would cancel the previous one.
   pi.on("tool_call", async (event: any, ctx: any) => {
     if (!askPickEnabled) return;
     const toolName = String(event?.toolName ?? "");
     if (!askToolNames.has(toolName)) return;
     const input = (event?.input ?? {}) as Record<string, unknown>;
-    const question = typeof input.question === "string" ? input.question.trim() : "";
-    if (!question) return; // not a question-shaped call — let it run locally
+    const questions = coerceAskQuestions(input);
+    if (questions.length === 0) return; // not a question-shaped call — let it run locally
     if (!weechatUIConnected) return; // no bridge: the tool's own UI handles it
 
-    const options = coerceAskOptions(input.options);
-    const allowMultiple = input.allowMultiple === true;
-    const allowFreeform = input.allowFreeform !== false;
-    const title = buildAskTitle(question, input.context);
-    const timeoutMs =
-      typeof input.timeout === "number" && Number.isFinite(input.timeout) && input.timeout > 0
-        ? input.timeout
-        : undefined;
-
-    let outcome: UIAskOutcome;
-    if (options.length === 0) {
-      outcome = await askWeechatUIOutcome(
-        { method: "input", title, placeholder: "Type your answer..." },
-        { timeoutMs, signal: ctx?.signal },
-      );
-    } else {
-      const selectOptions: Array<string | { label: string; description?: string }> = options.map(
-        (o) => (o.description ? { label: o.label, description: o.description } : o.label),
-      );
-      if (allowFreeform) selectOptions.push(FREEFORM_SENTINEL);
-      outcome = await askWeechatUIOutcome(
-        { method: "select", title, options: selectOptions, multiple: allowMultiple },
-        { timeoutMs, signal: ctx?.signal },
-      );
-      if (outcome.kind === "value") {
-        const picked = Array.isArray(outcome.value) ? outcome.value : [outcome.value];
-        if (picked.length === 1 && picked[0] === FREEFORM_SENTINEL) {
-          // The user chose the freeform option — ask for the text itself.
-          outcome = await askWeechatUIOutcome(
-            { method: "input", title, placeholder: "Type your answer..." },
-            { timeoutMs, signal: ctx?.signal },
-          );
+    const total = questions.length;
+    const answers: string[][] = [];
+    for (let i = 0; i < total; i++) {
+      const q = questions[i];
+      const title = buildQuestionTitle(q, i, total);
+      const askOpts = { timeoutMs: q.timeoutMs, signal: ctx?.signal };
+      let outcome: UIAskOutcome;
+      if (q.options.length === 0) {
+        outcome = await askWeechatUIOutcome(
+          { method: "input", title, placeholder: "Type your answer..." },
+          askOpts,
+        );
+      } else {
+        const selectOptions: Array<string | { label: string; description?: string }> = q.options.map(
+          (o) => (o.description ? { label: o.label, description: o.description } : o.label),
+        );
+        if (q.allowFreeform) selectOptions.push(FREEFORM_SENTINEL);
+        outcome = await askWeechatUIOutcome(
+          { method: "select", title, options: selectOptions, multiple: q.allowMultiple },
+          askOpts,
+        );
+        if (outcome.kind === "value") {
+          const picked = Array.isArray(outcome.value) ? outcome.value : [outcome.value];
+          if (picked.length === 1 && picked[0] === FREEFORM_SENTINEL) {
+            // The user chose the freeform option — ask for the text itself.
+            outcome = await askWeechatUIOutcome(
+              { method: "input", title, placeholder: "Type your answer..." },
+              askOpts,
+            );
+          }
         }
       }
+
+      if (outcome.kind === "fallback") return; // local TUI takes over
+      if (outcome.kind === "cancelled") {
+        sendNote(total > 1 ? `(question ${i + 1}/${total} cancelled)` : "(question cancelled)");
+        return {
+          block: true,
+          reason:
+            total > 1
+              ? `User cancelled question ${i + 1}/${total} via WeeChat (!pick cancel). No answers were given — do not assume any.`
+              : "User cancelled the question via WeeChat (!pick cancel). No answer was given — do not assume one.",
+        };
+      }
+      const picked = Array.isArray(outcome.value) ? outcome.value : [outcome.value];
+      answers.push(picked);
+      sendNote(
+        total > 1
+          ? `(question ${i + 1}/${total} answered: ${formatPickSummary(picked)})`
+          : `(question answered: ${formatPickSummary(picked)})`,
+      );
     }
 
-    if (outcome.kind === "fallback") return; // local TUI takes over
-    if (outcome.kind === "cancelled") {
-      sendNote("(question cancelled)");
-      return {
-        block: true,
-        reason:
-          "User cancelled the question via WeeChat (!pick cancel). No answer was given — do not assume one.",
-      };
+    // What the LLM sees: a blocked tool_call never reaches execute(), so the
+    // ask tool's own result envelope is bypassed — pi turns `reason` into the
+    // tool result (an error-flavored one, isError: true) and emits no
+    // tool_execution_start/end for the call. rpiv-ask-user-question returns
+    // `details` (not structuredContent), so nothing structured is lost here;
+    // extensions that watch blocking tools via tool_call (e.g. rpiv-warp) still
+    // see the call, only without its completion event.
+
+    if (answers.length === 1) {
+      const summary = formatPickSummary(answers[0]);
+      return { block: true, reason: `User answered: ${summary} (via WeeChat !pick)` };
     }
-    const summary = formatPickSummary(outcome.value);
-    sendNote(`(question answered: ${summary})`);
-    return { block: true, reason: `User answered: ${summary} (via WeeChat !pick)` };
+    const lines = answers.map(
+      (vals, i) => `${i + 1}. ${JSON.stringify(questions[i].question)} → ${formatPickSummary(vals)}`,
+    );
+    return {
+      block: true,
+      reason: `User answered ${answers.length} question(s) (via WeeChat !pick):\n${lines.join("\n")}`,
+    };
   });
 
   // ------------------- built-in ask_user fallback (when nothing else provides one)
@@ -1239,27 +1389,47 @@ export default function weechatBridge(pi: ExtensionAPI) {
   const ASK_TOOL_NAME = "ask_user";
 
   /**
-   * When no other extension provides an ask_user tool (e.g. pi-ask-user is
-   * not installed), register a minimal built-in one so decision questions
-   * are still asked structurally — and answered from WeeChat with !pick via
-   * the tool_call hook above (which intercepts before execute() runs). The
-   * local path below only runs when the bridge is down; it mirrors
-   * pi-ask-user's dialog fallback: select for single choice, comma-list
-   * input for multi-select, plain input when there are no options.
+   * Register the built-in ask_user fallback unless something else already
+   * covers asking questions. Shapes of that decision (PI_WEECHAT_ASK_TOOL or
+   * "askTool" in the config file):
+   *   - "auto" (default): skip when any question-shaped tool is loaded —
+   *     ask_user, ask_user_question (rpiv-ask-user-question),
+   *     askUserQuestion (pi-ask-user-question), … so one ask tool per session
+   *   - "off":   never register
+   *   - "force": register even when another question tool is loaded
+   * A tool literally named ask_user always wins: two tools with the same name
+   * is a collision, not a choice.
+   *
+   * Questions are answered from WeeChat with !pick via the tool_call hook
+   * above (which intercepts before execute() runs). The local path below only
+   * runs when the bridge is down; it mirrors pi-ask-user's dialog fallback:
+   * select for single choice, comma-list input for multi-select, plain input
+   * when there are no options.
    */
   function maybeRegisterFallbackAskTool(ctx: any): void {
     if (fallbackAskRegistered) return;
+    if (askToolMode === "off") {
+      dbg("askTool=off — built-in ask_user fallback not registered");
+      return;
+    }
     try {
       const tools: Array<{ name?: unknown }> = ctx?.getAllTools?.() ?? [];
       if (tools.some((t) => t?.name === ASK_TOOL_NAME)) {
         dbg("ask_user already provided by another extension — skipping the built-in fallback");
         return;
       }
+      if (askToolMode === "auto") {
+        const other = tools.map((t) => t?.name).find((n) => isQuestionToolName(n));
+        if (other) {
+          dbg(`question tool "${String(other)}" already loaded — skipping the built-in ask_user fallback`);
+          return;
+        }
+      }
     } catch (err) {
       dbg(`getAllTools failed (${String((err as Error)?.message ?? err)}) — registering the fallback ask tool`);
     }
     fallbackAskRegistered = true;
-    dbg("no ask_user tool found — registering the built-in fallback (WeeChat !pick or local TUI)");
+    dbg("no question tool found — registering the built-in fallback (WeeChat !pick or local TUI)");
     pi.registerTool({
       name: ASK_TOOL_NAME,
       label: "Ask User",
