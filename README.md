@@ -177,31 +177,66 @@ bridge — it degrades to env/default behavior, notes the problem in the debug
 log, and prints a red `config_error` line in the buffer. The file is re-read
 on every `/reload`, so edits apply without restarting pi.
 
-### Decision questions (ask_user → !pick)
+### Decision questions (ask_user / ask_user_question → !pick)
 
 While pi is connected, decision questions raised by **ask_user-style tools**
-(pi-ask-user and friends) are asked in the buffer instead of the pi terminal:
-the question and context appear as a `?` prompt with numbered options (plus a
-“✏️ Type custom response…” option when freeform answers are allowed), answered
-with `!pick`. The choice is returned to the LLM as the tool's result — no
-modification to the ask extension itself: pi-weechat intercepts the call in
-pi's `tool_call` hook *before* execution and blocks it with your selection.
+(rpiv-ask-user-question, pi-ask-user and friends) are asked in the buffer
+instead of the pi terminal: the question and context appear as a `?` prompt
+with numbered options (plus a “✏️ Type custom response…” option when freeform
+answers are allowed), answered with `!pick`. The choice is returned to the LLM
+as the tool's result — no modification to the ask extension itself: pi-weechat
+intercepts the call in pi's `tool_call` hook *before* execution and blocks it
+with your selection.
 
-- **No ask extension installed?** If nothing else provides an `ask_user`
-tool, pi-weechat registers a minimal built-in one (same parameter shape,
-single/multi-select + freeform), so decision questions are still structured
-and answerable from the buffer. When another provider is present the fallback
-is never registered. The local path of the fallback mirrors pi-ask-user's
-dialog fallback, so it also works in the pi terminal when the bridge is down.
-- **Graceful degradation**: if the bridge disconnects mid-question, or the
-tool's own timeout expires, or the run is aborted, the question falls back to
-the tool's normal terminal UI; `!pick cancel` gives the LLM an explicit
-“user cancelled” result instead.
+Both call shapes are understood:
+
+- **singular** — `{ question, options: [{ title }], allowMultiple, allowFreeform }`
+  (`ask_user`): one `?` prompt, exactly as before.
+- **plural** — `{ questions: [{ question, header, options: [{ label,
+  description, preview }], multiSelect }] }` (`ask_user_question`): the
+  questionnaire is asked **one question at a time** (`? Q1/3 · Auth method — …`,
+  since the buffer tracks a single pending prompt), `multiSelect` questions show
+  the `!pick 1,3` hint, and an option's `preview` is folded into its description
+  line, truncated. All answers come back in one tool result:
+
+  ```
+  User answered 2 question(s) (via WeeChat !pick):
+  1. "Which auth library?" → "OAuth"
+  2. "Which features do you want to enable?" → "Refresh", "Audit"
+  ```
+
+- **One ask tool per session.** The built-in `ask_user` is a *fallback*: by
+  default it is registered only when no other question-shaped tool is loaded —
+  `ask_user`, `ask_user_question`, `askUserQuestion`, `ask-user-question`, … all
+  count. With `ask_user_question` installed you get exactly that one tool, and
+  its questions route to the buffer. The local path of the fallback mirrors
+  pi-ask-user's dialog fallback, so it also works in the pi terminal when the
+  bridge is down.
+- **Graceful degradation**: if the bridge disconnects mid-questionnaire, the
+  tool's own timeout expires, or the run is aborted, the *whole* questionnaire
+  falls back to the tool's terminal UI rather than half-asking in two UIs;
+  `!pick cancel` gives the LLM an explicit “user cancelled” result instead.
+- **Side effect of blocking**: an intercepted call never reaches the tool's
+  `execute()`, so its own result envelope is replaced by our answer text (pi
+  surfaces it as an error-flavored tool result) and no
+  `tool_execution_start`/`tool_execution_end` fires for it. Extensions that
+  watch question tools by completion — `rpiv-warp` lists `ask_user_question` as
+  a blocking tool — still see the `tool_call`, just not its end.
 - **Opt-out / tuning** (env vars win over the config file):
   - `$PI_WEECHAT_PICK=off` or `"pick": "off"` — never intercept; questions
     always use the tools' own terminal UI.
   - `$PI_WEECHAT_PICK_TOOLS=a,b` or `"pickTools": ["ask_user_question"]` —
-    which question tool names to route (default: `ask_user`).
+    which question tool names to route (default: `ask_user`,
+    `ask_user_question`, `askUserQuestion`).
+  - `$PI_WEECHAT_ASK_TOOL=off|auto|force` or `"askTool": false|true` —
+    `off` never registers the built-in `ask_user`, `auto` (default) registers it
+    only when no other question tool is loaded, `force` registers it alongside
+    one. A tool literally named `ask_user` always wins: pi-weechat never
+    registers a second tool with the same name.
+
+> Note: `pick`, `pickTools` and `askTool` in `pi-weechat.json` are now actually
+> read (they used to be dropped by the config parser, so only the env-var form
+> worked). Strings and plain booleans are both accepted.
 
 ### Endpoint (where pi dials)
 
