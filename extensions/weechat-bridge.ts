@@ -1413,15 +1413,27 @@ export default function weechatBridge(pi: ExtensionAPI) {
       return;
     }
     try {
-      const tools: Array<{ name?: unknown }> = ctx?.getAllTools?.() ?? [];
-      if (tools.some((t) => t?.name === ASK_TOOL_NAME)) {
+      // pi's tool inventory lives on the extension API, not on the event ctx:
+      // ExtensionContext has no getAllTools() (core/extensions/types.d.ts), so
+      // reading it off ctx silently yielded [] and this guard never fired in a
+      // real session — only in tests that mock ctx.
+      const viaPi = (pi as any)?.getAllTools?.();
+      const viaCtx = ctx?.getAllTools?.();
+      const tools: Array<{ name?: unknown }> = Array.isArray(viaPi)
+        ? viaPi
+        : Array.isArray(viaCtx)
+          ? viaCtx
+          : [];
+      const names = tools.map((t) => String(t?.name ?? "?"));
+      dbg(`session_start: ${names.length} tool(s) loaded [${names.join(", ")}]`);
+      if (names.includes(ASK_TOOL_NAME)) {
         dbg("ask_user already provided by another extension — skipping the built-in fallback");
         return;
       }
       if (askToolMode === "auto") {
-        const other = tools.map((t) => t?.name).find((n) => isQuestionToolName(n));
+        const other = names.find((n) => isQuestionToolName(n));
         if (other) {
-          dbg(`question tool "${String(other)}" already loaded — skipping the built-in ask_user fallback`);
+          dbg(`question tool "${other}" already loaded — skipping the built-in ask_user fallback`);
           return;
         }
       }

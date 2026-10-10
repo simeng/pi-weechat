@@ -7,26 +7,28 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { loadExtension, makeBridgeEnv, makePiMock, writeConfig } from "./wc-harness.mjs";
 
-function ctxWithTools(names) {
+// pi's real shape: the inventory is on the API (pi.getAllTools); the event ctx
+// has no getAllTools of its own.
+function makeCtx() {
   return {
     cwd: "/tmp/ask-tool-mode",
     model: { provider: "prov", id: "m" },
     isIdle: () => true,
     abort() {},
-    getAllTools: () => names.map((name) => ({ name, description: "provided by another extension" })),
   };
 }
 
 /** Load the extension against a dead socket and report what it registered. */
-async function registeredAskTool({ tools = [], env, config } = {}) {
+async function registeredAskTool({ tools = [], env, config, ctxTools } = {}) {
   const env2 = makeBridgeEnv("ask-tool-mode");
   env2.applyEnv();
   try {
     if (env) Object.assign(process.env, env);
     if (config) writeConfig(env2.dir, config);
-    const mock = makePiMock(ctxWithTools(tools));
+    const mock = makePiMock(makeCtx(), tools);
+    const ctx = ctxTools ? { ...makeCtx(), getAllTools: () => ctxTools } : makeCtx();
     await loadExtension(mock);
-    await mock.fire("session_start");
+    await mock.fire("session_start", {}, ctx);
     await mock.fire("session_shutdown");
     return mock.registeredTools["ask_user"];
   } finally {
@@ -87,8 +89,8 @@ test("askTool routing still intercepts a foreign tool's questions", async () => 
   const env2 = makeBridgeEnv("ask-tool-route");
   env2.applyEnv();
   try {
-    const ctx = ctxWithTools(["ask_user_question"]);
-    const mock = makePiMock(ctx);
+    const ctx = makeCtx();
+    const mock = makePiMock(ctx, ["ask_user_question"]);
     await loadExtension(mock);
     await mock.fire("session_start");
     assert.equal(mock.registeredTools["ask_user"], undefined, "no duplicate ask tool");
@@ -110,4 +112,18 @@ test("askTool routing still intercepts a foreign tool's questions", async () => 
     env2.restoreEnv();
     env2.cleanup();
   }
+});
+
+// Regression: the inventory was read off the event ctx, which has no
+// getAllTools in real pi, so the guard silently saw an empty list and the
+// fallback was registered next to ask_user_question in every session.
+test("the inventory is read from pi.getAllTools, not from the event ctx", async () => {
+  const apiOnly = await registeredAskTool({ tools: ["bash", "ask_user_question"] });
+  assert.equal(apiOnly, undefined, "pi.getAllTools() is what the guard must trust");
+
+  const ctxOnly = await registeredAskTool({
+    tools: ["bash"],
+    ctxTools: ["ask_user_question"],
+  });
+  assert.ok(ctxOnly, "a ctx-only inventory is not pi's shape - the fallback stays registered");
 });

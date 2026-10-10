@@ -58,8 +58,10 @@ export function startWeechatSide(sockPath) {
   };
 }
 
-/** pi stand-in: records registered tools and returns non-undefined handler results. */
-export function makePiMock(ctx) {
+/** pi stand-in: records registered tools and returns non-undefined handler results.
+ * `tools` is the inventory pi.getAllTools() reports; it lives on the API because
+ * pi's event ctx has no getAllTools() of its own. */
+export function makePiMock(ctx, tools) {
   const handlers = {};
   const registeredTools = {};
   return {
@@ -75,6 +77,9 @@ export function makePiMock(ctx) {
       registerCommand: () => {},
       sendUserMessage: () => {},
       getSessionName: () => "ask-session",
+      ...(tools
+        ? { getAllTools: () => tools.map((name) => ({ name, description: "provided by another extension" })) }
+        : {}),
     },
     fire: async (name, event = {}, c = ctx) => {
       const outs = [];
