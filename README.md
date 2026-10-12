@@ -188,6 +188,11 @@ as the tool's result — no modification to the ask extension itself: pi-weechat
 intercepts the call in pi's `tool_call` hook _before_ execution and blocks it
 with your selection.
 
+The `?` prompt line carries the `notify_highlight` tag — the same
+notification level as the turn-settle `✔ ready!` banner — so WeeChat pings
+(per your own WeeChat notification settings) even when the buffer is
+off-screen: the user has to act with `!pick`.
+
 Both call shapes are understood:
 
 - **singular** — `{ question, options: [{ title }], allowMultiple, allowFreeform }`
