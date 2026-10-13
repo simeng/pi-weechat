@@ -1521,6 +1521,9 @@ class Session(object):
         `input` asks for free-form text. Only one prompt is tracked at a
         time — a new request supersedes the old one, which is released on
         the pi side with a cancelled ui_response so it doesn't wait forever.
+        The "?" title line is tagged notify_highlight (like the ready
+        banner) — it needs the user's attention, so it pings even when
+        the buffer is not visible. The option/hint lines stay quiet.
         """
         req_id = msg.get("id")
         method = msg.get("method")
@@ -1545,7 +1548,12 @@ class Session(object):
             multiple = bool(msg.get("multiple"))
             self.pending_ui = {"id": req_id, "method": "select",
                                "options": options, "multiple": multiple}
-            self._print(C_STATUS + "? " + title + R)
+            self._flush_md_block()
+            if self.alive and self.buffer:
+                # notify_highlight (like the ready banner): the user must
+                # act (!pick), so an off-screen buffer pings
+                weechat.prnt_date_tags(self.buffer, 0, "notify_highlight",
+                                       C_STATUS + "? " + title + R)
             for i, (label, desc) in enumerate(options, 1):
                 self._print("%2d. %s" % (i, label))
                 if desc:
@@ -1555,7 +1563,10 @@ class Session(object):
             self._print(C_DIM + hint + R)
         else:  # input
             self.pending_ui = {"id": req_id, "method": "input"}
-            self._print(C_STATUS + "? " + title + R)
+            self._flush_md_block()
+            if self.alive and self.buffer:
+                weechat.prnt_date_tags(self.buffer, 0, "notify_highlight",
+                                       C_STATUS + "? " + title + R)
             placeholder = msg.get("placeholder")
             ph = (" (%s)" % str(placeholder).replace("\n", " ")) if placeholder else ""
             self._print(C_DIM + "reply !pick <your answer>%s · !pick cancel" % ph + R)

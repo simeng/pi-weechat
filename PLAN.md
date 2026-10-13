@@ -92,7 +92,7 @@ confidentiality is the VPN's job (§6).
 
 | type (new in v3) | payload | direction | meaning |
 |---|---|---|---|
-| `ui_request` | select: `{id, method:"select", title, options[], multiple?}` · input: `{id, method:"input", title, placeholder?}` | pi → WeeChat | interactive prompt rendered in the buffer ("?" + numbered options or a free-text hint); answered with `!pick`. `options` entries are strings or `{label, description?}`; `multiple` allows comma-list answers. `id` is a per-connection monotonic counter |
+| `ui_request` | select: `{id, method:"select", title, options[], multiple?}` · input: `{id, method:"input", title, placeholder?}` | pi → WeeChat | interactive prompt rendered in the buffer ("?" + numbered options or a free-text hint); answered with `!pick`. The "?" title line is tagged `notify_highlight` (same level as the ready banner), so an off-screen buffer pings. `options` entries are strings or `{label, description?}`; `multiple` allows comma-list answers. `id` is a per-connection monotonic counter |
 | `ui_response` | answer: `{id, value}` (string; array when multiple) · cancel: `{id, cancelled:true}` | WeeChat → pi | answer to `ui_request`; `value` is the picked option text(s) or the entered free text. Stale/unknown ids are ignored on the pi side |
 
 Only one prompt is tracked per connection: a new `ui_request` supersedes the
