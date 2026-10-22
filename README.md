@@ -166,6 +166,7 @@ pi's own settings (the agent dir follows `$PI_CODING_AGENT_DIR`, default
   "url": "tcp://box:52311", // endpoint — same syntax as PI_WEECHAT_URL
   "token": "…", // shared secret — same as PI_WEECHAT_TOKEN
   "debugLog": "/path/to/log" // optional — same as PI_BRIDGE_DEBUG
+  "enabled": true, // master switch — same as PI_WEECHAT_ENABLED
   "pick": "weechat", // question routing: weechat | mirror | off
 }
 ```
@@ -177,6 +178,25 @@ file is fine. A _broken_ file (invalid JSON, wrong types) never breaks the
 bridge — it degrades to env/default behavior, notes the problem in the debug
 log, and prints a red `config_error` line in the buffer. The file is re-read
 on every `/reload`, so edits apply without restarting pi.
+
+### Enabling and disabling the bridge in a session (`/weechat`)
+
+`/weechat status` shows what the bridge is doing right now; `/weechat off` and
+`/weechat on` switch it without restarting pi:
+
+- the switch is the `enabled` key in `pi-weechat.json`, and `PI_WEECHAT_ENABLED`
+  overrides it as it overrides every other knob (`/weechat` refuses to write a
+  state the environment contradicts);
+- the command writes that key, then reloads the extension runtime — pi has no
+  API to unregister a tool, so a reload is what really unloads the socket, the
+  event hooks and the built-in `ask_user` fallback (and loads them again);
+- a disabled runtime registers **only** `/weechat`, so `/weechat on` also works
+  in a session where the bridge never connected;
+- pi's own `settings.json` is never touched. Keeping the package from loading
+  at all is still `pi config` / a `packages` filter there.
+
+With the bridge off, decision questions go to the ask tool's own terminal UI,
+and the buffer simply stops receiving output.
 
 ### Decision questions (ask_user / ask_user_question → !pick)
 
