@@ -166,6 +166,7 @@ pi's own settings (the agent dir follows `$PI_CODING_AGENT_DIR`, default
   "url": "tcp://box:52311", // endpoint — same syntax as PI_WEECHAT_URL
   "token": "…", // shared secret — same as PI_WEECHAT_TOKEN
   "debugLog": "/path/to/log" // optional — same as PI_BRIDGE_DEBUG
+  "pick": "weechat", // question routing: weechat | mirror | off
 }
 ```
 
@@ -212,6 +213,17 @@ Both call shapes are understood:
   its questions route to the buffer. The local path of the fallback mirrors
   pi-ask-user's dialog fallback, so it also works in the pi terminal when the
   bridge is down.
+- **Ask in both places** (`$PI_WEECHAT_PICK=mirror` or `"pick": "mirror"`): the
+  question appears as a dialog in the pi terminal _and_ as a `?` prompt in the
+  buffer, at the same time. The **first answer wins** and the other UI is
+  dismissed — answering in the terminal releases the buffer prompt, answering
+  with `!pick` closes the terminal dialog — so a late answer can never override
+  the one you gave. The tool result says where the answer came from
+  (`(via WeeChat !pick)`, `(in the pi terminal)`, or both for a questionnaire
+  answered in a mix). Multi-select questions use the terminal's comma-list
+  input, exactly like the built-in fallback. This is the mode to pick when you
+  work in the terminal but want WeeChat as an alternative, or vice versa; the
+  default (`weechat`) only asks in the buffer.
 - **Graceful degradation**: if the bridge disconnects mid-questionnaire, the
   tool's own timeout expires, or the run is aborted, the _whole_ questionnaire
   falls back to the tool's terminal UI rather than half-asking in two UIs;
@@ -223,8 +235,10 @@ Both call shapes are understood:
   watch question tools by completion — `rpiv-warp` lists `ask_user_question` as
   a blocking tool — still see the `tool_call`, just not its end.
 - **Opt-out / tuning** (env vars win over the config file):
-  - `$PI_WEECHAT_PICK=off` or `"pick": "off"` — never intercept; questions
-    always use the tools' own terminal UI.
+  - `$PI_WEECHAT_PICK=weechat|mirror|off` or `"pick": "…"` — where decision
+    questions are asked: buffer only (default), both UIs at once, or never
+    intercept (the tools' own terminal UI handles everything). `0`/`false` are
+    the same as `off`, `both` the same as `mirror`.
   - `$PI_WEECHAT_PICK_TOOLS=a,b` or `"pickTools": ["ask_user_question"]` —
     which question tool names to route (default: `ask_user`,
     `ask_user_question`, `askUserQuestion`).

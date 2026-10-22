@@ -403,6 +403,7 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 | `irc.server_default.nicks` | WeeChat IRC option (read-only for the bridge): first non-empty entry = the user's nick for the `nick!me` prefix column; re-applied live via `hook_config`, no reload | the IRC plugin's `nicks` default |
 | `PI_WEECHAT_URL`     | pi extension env: `tcp://host:port` / `unix://<path>` / `host:port` / path | unset ⇒ config-file `url` ⇒ `PI_WEECHAT_SOCK` (deprecated) ⇒ default unix path |
 | `PI_WEECHAT_TOKEN`   | pi extension env: shared secret for the challenge (never in the URL) | unset (anonymous) ⇒ config-file `token` |
+| `PI_WEECHAT_PICK`    | pi extension env: where decision questions are asked — `weechat` (default, buffer only) / `mirror` (buffer and pi terminal at once, first answer wins) / `off` (never intercept) | unset ⇒ config-file `pick` ⇒ `weechat` |
 | `pi-weechat.json`    | pi-side config file `<agent dir>/pi-weechat.json` (agent dir = `$PI_CODING_AGENT_DIR`, default `~/.pi/agent`); keys `url` / `token` / `debugLog` mirror the env vars above, plus `pick` / `pickTools` / `askTool` for question routing — **env always wins over the file**; re-read at each `session_start`; broken file ⇒ env/default behavior + red `config_error` line | missing (fine) |
 | socket path (unix)   | weechat side: same env / XDG dirs | `$XDG_RUNTIME_DIR/pi-weechat.sock` |
 
@@ -445,6 +446,14 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
    blocked tool result; any fallback cancels the whole questionnaire. Also
    fixed: `pick` / `pickTools` were documented but dropped by the config
    parser, so only the env-var form worked. ✅
+9. **M8 — mirrored questions (`pick=mirror`):** the same question is asked in
+   the pi terminal (`ctx.ui.select` / `ctx.ui.input`) and in the buffer at once;
+   the first answer wins and the losing UI is dismissed via paired
+   `AbortController`s — the dialog by aborting its signal, the buffer prompt by
+   the new `ui_cancel`. A UI that cannot answer (bridge down, timeout, print
+   mode without dialogs) drops out and the other keeps the question; an aborted
+   run is a fallback, not a cancellation. Multi-select uses the same comma-list
+   parsing as the built-in fallback. ✅
 
 ## 9. Repo layout
 
@@ -473,6 +482,8 @@ pi-weechat/
     ├── ask-pick-multi.test.mjs# questions[] questionnaire → !pick (live socket)
     ├── ask-pick-present.test.mjs# no fallback when another ask tool exists
     ├── ask-tool-mode.test.mjs # askTool=auto|off|force + question-name detection
+    ├── ask-pick-mirror.test.mjs # pick=mirror: terminal + buffer, first wins
+    ├── ui-cancel.test.mjs       # abandoned prompts are released (live socket)
     ├── wc-harness.mjs       # shared pi mock + WeeChat-side driver helpers
     ├── smoke_weechat.py     # weechat script smoke test (stub weechat module, stdlib only)
     ├── py_driver.py         # stdin/stdout driver used by the integration tests
