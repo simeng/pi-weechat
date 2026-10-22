@@ -94,10 +94,14 @@ confidentiality is the VPN's job (§6).
 |---|---|---|---|
 | `ui_request` | select: `{id, method:"select", title, options[], multiple?}` · input: `{id, method:"input", title, placeholder?}` | pi → WeeChat | interactive prompt rendered in the buffer ("?" + numbered options or a free-text hint); answered with `!pick`. `options` entries are strings or `{label, description?}`; `multiple` allows comma-list answers. `id` is a per-connection monotonic counter |
 | `ui_response` | answer: `{id, value}` (string; array when multiple) · cancel: `{id, cancelled:true}` | WeeChat → pi | answer to `ui_request`; `value` is the picked option text(s) or the entered free text. Stale/unknown ids are ignored on the pi side |
+| `ui_cancel` | `{id}` | pi → WeeChat | pi stopped waiting for that prompt (timeout, abort, or answered in the pi terminal in mirror mode); the buffer drops its pending `!pick` prompt when the id matches. Unknown ids are ignored, and older peers ignore the message entirely |
 
 Only one prompt is tracked per connection: a new `ui_request` supersedes the
 pending one (the WeeChat side immediately sends a cancelled `ui_response` for
-the old id). On disconnect, all pending prompts resolve as cancelled.
+the old id). On disconnect, all pending prompts resolve as cancelled. A prompt
+that pi stops waiting for (timeout, abort, or answered in another UI) is
+released with `ui_cancel`, so the buffer never keeps a `?` prompt that has no
+listener.
 
 ### Message types (pi extension → WeeChat)
 

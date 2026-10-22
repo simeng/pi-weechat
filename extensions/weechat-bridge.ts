@@ -1192,6 +1192,9 @@ export default function weechatBridge(pi: ExtensionAPI) {
    *   - { kind: "fallback" }  not connected, optional timeout expired, client
    *     disconnected, malformed reply, or the abort signal fired — callers
    *     should fall back to local UI. Throws nothing.
+   * Any outcome that is not an answer sends `ui_cancel {id}` so the buffer
+   * drops its pending `!pick` prompt instead of waiting for a reply nobody
+   * is waiting for any more.
    */
   function askWeechatUIOutcome(
     req:
@@ -1212,6 +1215,9 @@ export default function weechatBridge(pi: ExtensionAPI) {
         if (done) return;
         done = true;
         pendingUIs.delete(id);
+        // pi no longer waits for this prompt: release the buffer's pending `!pick`
+        // so a later answer cannot land on a question nobody is waiting for.
+        if (o.kind !== "value") send({ type: "ui_cancel", id });
         signal?.removeEventListener("abort", onAbort);
         resumeTiming(`weechat-ui:${id}`);
         resolve(o);
