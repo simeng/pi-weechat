@@ -716,6 +716,25 @@ def main():
     assert msg == {"type": "ui_response", "id": 11, "cancelled": True}, msg
     assert SESSION.pending_ui is None
 
+    # ui_cancel releases the pending prompt (timed out / answered in another UI)
+    send({"type": "ui_request", "id": 13, "method": "select",
+          "title": "asked in two places", "options": ["a"]})
+    pump_and_drain(client, 0.2)
+    assert SESSION.pending_ui["id"] == 13
+    assert "awaiting !pick" in stub.title
+    send({"type": "ui_cancel", "id": 99})  # stale id must not release it
+    pump_and_drain(client, 0.2)
+    assert SESSION.pending_ui["id"] == 13, "ui_cancel for another id must not drop the prompt"
+    send({"type": "ui_cancel", "id": 13})
+    pump_and_drain(client, 0.2)
+    assert SESSION.pending_ui is None, "ui_cancel must release the prompt"
+    assert "dismissed by pi" in buffer_text(stub)
+    assert "awaiting !pick" not in stub.title, "title hint must clear on ui_cancel"
+    ns["pi_input_cb"]("", "buffer", "!pick 1")
+    pump_and_drain(client, 0.3)
+    assert "nothing to pick" in buffer_text(stub)
+    assert recv_lines == [], "a released prompt must not answer a dead question"
+
     # input prompt: free-form answer via !pick <text> (incl. spaces)
     send({"type": "ui_request", "id": 12, "method": "input",
           "title": "Enter a value", "placeholder": "type something…"})
