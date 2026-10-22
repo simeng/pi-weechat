@@ -37,6 +37,8 @@
 # the user answers with `!pick <n>` (comma list / exact text) or
 # `!pick <text>` (input) or `!pick cancel`; this script sends back
 #   ui_response {id, value | cancelled}.
+#   ui_cancel {id} releases a prompt pi no longer waits for (its timeout
+#   expired, the run was aborted, or the question was answered elsewhere).
 #
 # Install: copy into ~/.local/share/weechat/python/ and start WeeChat, or
 #   /python load pi_bridge
@@ -1492,6 +1494,9 @@ class Session(object):
         if t == "ui_request":
             self._handle_ui_request(msg)
             return
+        if t == "ui_cancel":
+            self._handle_ui_cancel(msg)
+            return
         if t == "error":
             self._print(C_ERR + "pi bridge: %s: %s%s" % (
                 msg.get("code", "?"), msg.get("message", ""), R))
@@ -1521,6 +1526,9 @@ class Session(object):
         `input` asks for free-form text. Only one prompt is tracked at a
         time — a new request supersedes the old one, which is released on
         the pi side with a cancelled ui_response so it doesn't wait forever.
+        The "?" title line is tagged notify_highlight (like the ready
+        banner) — it needs the user's attention, so it pings even when
+        the buffer is not visible. The option/hint lines stay quiet.
         """
         req_id = msg.get("id")
         method = msg.get("method")
@@ -1545,7 +1553,12 @@ class Session(object):
             multiple = bool(msg.get("multiple"))
             self.pending_ui = {"id": req_id, "method": "select",
                                "options": options, "multiple": multiple}
-            self._print(C_STATUS + "? " + title + R)
+            self._flush_md_block()
+            if self.alive and self.buffer:
+                # notify_highlight (like the ready banner): the user must
+                # act (!pick), so an off-screen buffer pings
+                weechat.prnt_date_tags(self.buffer, 0, "notify_highlight",
+                                       C_STATUS + "? " + title + R)
             for i, (label, desc) in enumerate(options, 1):
                 self._print("%2d. %s" % (i, label))
                 if desc:
@@ -1555,11 +1568,31 @@ class Session(object):
             self._print(C_DIM + hint + R)
         else:  # input
             self.pending_ui = {"id": req_id, "method": "input"}
-            self._print(C_STATUS + "? " + title + R)
+            self._flush_md_block()
+            if self.alive and self.buffer:
+                weechat.prnt_date_tags(self.buffer, 0, "notify_highlight",
+                                       C_STATUS + "? " + title + R)
             placeholder = msg.get("placeholder")
             ph = (" (%s)" % str(placeholder).replace("\n", " ")) if placeholder else ""
             self._print(C_DIM + "reply !pick <your answer>%s · !pick cancel" % ph + R)
         self.set_state(self.state, "awaiting !pick")
+
+    def _handle_ui_cancel(self, msg):
+        """Drop a pending prompt that pi stopped waiting for.
+
+        pi sends `ui_cancel {id}` when a prompt is abandoned: its timeout
+        expired, the run was aborted, or the question was answered in another
+        UI (mirror mode asks in the pi terminal and in the buffer at once).
+        Only the prompt with the matching id is released, so a stale cancel
+        can never drop a newer question; a later `!pick` then reports that
+        there is nothing to pick instead of answering a dead prompt.
+        """
+        pending = self.pending_ui
+        if pending is None or pending["id"] != msg.get("id"):
+            return
+        self.pending_ui = None
+        self.set_state(self.state)  # drop the “awaiting !pick” title hint
+        self._print(C_DIM + "pi bridge: question dismissed by pi" + R)
 
     def handle_pick(self, arg, raw_line):
         """Answer the pending ui_request with one buffer line.

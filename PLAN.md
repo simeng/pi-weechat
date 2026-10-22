@@ -92,12 +92,16 @@ confidentiality is the VPN's job (§6).
 
 | type (new in v3) | payload | direction | meaning |
 |---|---|---|---|
-| `ui_request` | select: `{id, method:"select", title, options[], multiple?}` · input: `{id, method:"input", title, placeholder?}` | pi → WeeChat | interactive prompt rendered in the buffer ("?" + numbered options or a free-text hint); answered with `!pick`. `options` entries are strings or `{label, description?}`; `multiple` allows comma-list answers. `id` is a per-connection monotonic counter |
+| `ui_request` | select: `{id, method:"select", title, options[], multiple?}` · input: `{id, method:"input", title, placeholder?}` | pi → WeeChat | interactive prompt rendered in the buffer ("?" + numbered options or a free-text hint); answered with `!pick`. The "?" title line is tagged `notify_highlight` (same level as the ready banner), so an off-screen buffer pings. `options` entries are strings or `{label, description?}`; `multiple` allows comma-list answers. `id` is a per-connection monotonic counter |
 | `ui_response` | answer: `{id, value}` (string; array when multiple) · cancel: `{id, cancelled:true}` | WeeChat → pi | answer to `ui_request`; `value` is the picked option text(s) or the entered free text. Stale/unknown ids are ignored on the pi side |
+| `ui_cancel` | `{id}` | pi → WeeChat | pi stopped waiting for that prompt (timeout, abort, or answered in the pi terminal in mirror mode); the buffer drops its pending `!pick` prompt when the id matches. Unknown ids are ignored, and older peers ignore the message entirely |
 
 Only one prompt is tracked per connection: a new `ui_request` supersedes the
 pending one (the WeeChat side immediately sends a cancelled `ui_response` for
-the old id). On disconnect, all pending prompts resolve as cancelled.
+the old id). On disconnect, all pending prompts resolve as cancelled. A prompt
+that pi stops waiting for (timeout, abort, or answered in another UI) is
+released with `ui_cancel`, so the buffer never keeps a `?` prompt that has no
+listener.
 
 ### Message types (pi extension → WeeChat)
 
@@ -400,7 +404,8 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 | `PI_WEECHAT_URL`     | pi extension env: `tcp://host:port` / `unix://<path>` / `host:port` / path | unset ⇒ config-file `url` ⇒ `PI_WEECHAT_SOCK` (deprecated) ⇒ default unix path |
 | `PI_WEECHAT_TOKEN`   | pi extension env: shared secret for the challenge (never in the URL) | unset (anonymous) ⇒ config-file `token` |
 | `PI_WEECHAT_ENABLED` | pi extension env: master switch (`off`/`0`/`false`/`no` ⇒ the runtime registers only `/weechat`) | unset ⇒ config-file `enabled` ⇒ on |
-| `pi-weechat.json`    | pi-side config file `<agent dir>/pi-weechat.json` (agent dir = `$PI_CODING_AGENT_DIR`, default `~/.pi/agent`); keys `url` / `token` / `debugLog` mirror the env vars above, plus `enabled` (master switch, written by `/weechat on|off`) and `pick` / `pickTools` / `askTool` for question routing — **env always wins over the file**; re-read at each `session_start`; broken file ⇒ env/default behavior + red `config_error` line | missing (fine) |
+| `PI_WEECHAT_PICK`    | pi extension env: where decision questions are asked — `weechat` (default, buffer only) / `mirror` (buffer and pi terminal at once, first answer wins) / `off` (never intercept) | unset ⇒ config-file `pick` ⇒ `weechat` |
+| `pi-weechat.json`    | pi-side config file `<agent dir>/pi-weechat.json` (agent dir = `$PI_CODING_AGENT_DIR`, default `~/.pi/agent`); keys `url` / `token` / `debugLog` mirror the env vars above, plus `pick` / `pickTools` / `askTool` for question routing — **env always wins over the file**; re-read at each `session_start`; broken file ⇒ env/default behavior + red `config_error` line | missing (fine) |
 | socket path (unix)   | weechat side: same env / XDG dirs | `$XDG_RUNTIME_DIR/pi-weechat.sock` |
 
 ## 8. Milestones
@@ -442,7 +447,15 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
    blocked tool result; any fallback cancels the whole questionnaire. Also
    fixed: `pick` / `pickTools` were documented but dropped by the config
    parser, so only the env-var form worked. ✅
-9. **M9 — `/weechat on|off|status`:** a master switch (`PI_WEECHAT_ENABLED` /
+9. **M8 — mirrored questions (`pick=mirror`):** the same question is asked in
+   the pi terminal (`ctx.ui.select` / `ctx.ui.input`) and in the buffer at once;
+   the first answer wins and the losing UI is dismissed via paired
+   `AbortController`s — the dialog by aborting its signal, the buffer prompt by
+   the new `ui_cancel`. A UI that cannot answer (bridge down, timeout, print
+   mode without dialogs) drops out and the other keeps the question; an aborted
+   run is a fallback, not a cancellation. Multi-select uses the same comma-list
+   parsing as the built-in fallback. ✅
+10.**M9 — `/weechat on|off|status`:** a master switch (`PI_WEECHAT_ENABLED` /
    `enabled` in the config file) read before anything is registered. Off means
    the runtime registers only `/weechat` — no socket, tools or hooks — so the
    command can write the switch and `ctx.reload()` (pi cannot unregister a
@@ -478,6 +491,8 @@ pi-weechat/
     ├── ask-pick-present.test.mjs# no fallback when another ask tool exists
     ├── ask-tool-mode.test.mjs # askTool=auto|off|force + question-name detection
     ├── weechat-toggle.test.mjs # /weechat on|off|status + the enabled switch
+    ├── ask-pick-mirror.test.mjs # pick=mirror: terminal + buffer, first wins
+    ├── ui-cancel.test.mjs       # abandoned prompts are released (live socket)
     ├── wc-harness.mjs       # shared pi mock + WeeChat-side driver helpers
     ├── smoke_weechat.py     # weechat script smoke test (stub weechat module, stdlib only)
     ├── py_driver.py         # stdin/stdout driver used by the integration tests

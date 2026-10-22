@@ -659,6 +659,14 @@ def main():
     assert "!pick cancel" in text, "hint line must mention !pick"
     assert SESSION.pending_ui is not None and SESSION.pending_ui["id"] == 7
     assert stub.title == "π: %s (idle · last run 17m · 10 turns) — awaiting !pick" % proj, stub.title
+    # the "?" title line is the prompt's only tagged line and carries
+    # notify_highlight (like the ready banner): the user must !pick, so an
+    # off-screen buffer pings — options + hint stay plain prnt (no notify)
+    prompt_rows = [row for row in stub.printf_tags
+                   if row[2].startswith("C? ")]
+    assert len(prompt_rows) == 1, "exactly one tagged line per prompt"
+    assert "notify_highlight" in prompt_rows[0][0], prompt_rows
+    assert "No exact match for /x. Which directory?" in prompt_rows[0][2]
 
     # !pick by number → ui_response with the option text; title hint clears
     ns["pi_input_cb"]("", "buffer", "!pick 2")
@@ -708,12 +716,35 @@ def main():
     assert msg == {"type": "ui_response", "id": 11, "cancelled": True}, msg
     assert SESSION.pending_ui is None
 
+    # ui_cancel releases the pending prompt (timed out / answered in another UI)
+    send({"type": "ui_request", "id": 13, "method": "select",
+          "title": "asked in two places", "options": ["a"]})
+    pump_and_drain(client, 0.2)
+    assert SESSION.pending_ui["id"] == 13
+    assert "awaiting !pick" in stub.title
+    send({"type": "ui_cancel", "id": 99})  # stale id must not release it
+    pump_and_drain(client, 0.2)
+    assert SESSION.pending_ui["id"] == 13, "ui_cancel for another id must not drop the prompt"
+    send({"type": "ui_cancel", "id": 13})
+    pump_and_drain(client, 0.2)
+    assert SESSION.pending_ui is None, "ui_cancel must release the prompt"
+    assert "dismissed by pi" in buffer_text(stub)
+    assert "awaiting !pick" not in stub.title, "title hint must clear on ui_cancel"
+    ns["pi_input_cb"]("", "buffer", "!pick 1")
+    pump_and_drain(client, 0.3)
+    assert "nothing to pick" in buffer_text(stub)
+    assert recv_lines == [], "a released prompt must not answer a dead question"
+
     # input prompt: free-form answer via !pick <text> (incl. spaces)
     send({"type": "ui_request", "id": 12, "method": "input",
           "title": "Enter a value", "placeholder": "type something…"})
     pump_and_drain(client, 0.2)
     assert "!pick <your answer>" in buffer_text(stub)
     assert "type something…" in buffer_text(stub), "placeholder must render"
+    in_rows = [row for row in stub.printf_tags
+               if row[2].startswith("C? Enter a value")]
+    assert in_rows and "notify_highlight" in in_rows[0][0], \
+        "input prompt title must ping too"
     ns["pi_input_cb"]("", "buffer", "!pick hello world")
     pump_and_drain(client, 0.4)
     msg = json.loads(recv_lines.pop(0))
