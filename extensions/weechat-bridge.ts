@@ -9,7 +9,8 @@
  * (ask_user_question) — are routed to the WeeChat buffer and answered with
  * !pick (falling back to the pi terminal when the bridge is down); a minimal
  * built-in ask_user is registered only when no other question tool is loaded
- * (PI_WEECHAT_ASK_TOOL=off|auto|force). Endpoint/token/debug
+ * (PI_WEECHAT_ASK_TOOL=off|auto|force). `/weechat on|off|status` toggles the
+ * whole extension inside a session (PI_WEECHAT_ENABLED / "enabled" there). Endpoint/token/debug
  * are read from environment
  * variables (PI_WEECHAT_URL / PI_WEECHAT_TOKEN / PI_BRIDGE_DEBUG) or from the
  * config file <agent dir>/pi-weechat.json (default ~/.pi/agent/) — env vars
@@ -27,7 +28,7 @@ import { Type } from "@sinclair/typebox";
 // @ts-ignore - plain ESM module, no types needed
 import { LineDecoder, PROTOCOL_VERSION, parseEndpoint } from "../lib/codec.mjs";
 // @ts-ignore - plain ESM module, no types needed
-import { loadConfig } from "../lib/pi-config.mjs";
+import { configPath, loadConfig } from "../lib/pi-config.mjs";
 import {
   CD_CREATE_PREFIX,
   expandTilde,
@@ -62,6 +63,111 @@ function resolveAskToolMode(env: string | undefined, cfg?: string | boolean): As
   if (v === "off" || v === "0" || v === "false" || v === "never") return "off";
   if (v === "force" || v === "on" || v === "true" || v === "always") return "force";
   return "auto";
+}
+
+/**
+ * Master switch for the whole extension: `PI_WEECHAT_ENABLED` (env wins) or
+ * `enabled` in pi-weechat.json. Off means the runtime registers nothing but
+ * the `/weechat` command — no socket, no tools, no hooks — so a running
+ * session can switch the bridge off and back on without restarting pi or
+ * editing pi's own settings.
+ */
+function resolveEnabled(env: string | undefined, cfg?: string | boolean): boolean {
+  const raw = env ?? (cfg === undefined ? undefined : String(cfg));
+  const v = String(raw ?? "").trim().toLowerCase();
+  return !(v === "off" || v === "0" || v === "false" || v === "no" || v === "disabled");
+}
+
+/**
+ * Persist `enabled` in pi-weechat.json, keeping every other key. Refuses to
+ * rewrite a file it cannot parse, and writes through a temp file + rename so a
+ * half-written config never replaces a good one.
+ */
+function writeEnabledConfig(enabled: boolean, onError: (msg: string) => void): void {
+  const p = configPath();
+  let obj: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(p, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      obj = parsed as Record<string, unknown>;
+    } else {
+      onError(`refusing to rewrite ${p}: top level must be a JSON object`);
+      return;
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      onError(`refusing to rewrite ${p}: ${String((err as Error)?.message ?? err)}`);
+      return;
+    }
+  }
+  obj.enabled = enabled;
+  const tmp = `${p}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n");
+    fs.renameSync(tmp, p);
+  } catch (err) {
+    onError(`cannot write ${p}: ${String((err as Error)?.message ?? err)}`);
+  }
+}
+
+/** Status line for a runtime that loaded nothing because the bridge is off. */
+function disabledStatus(): string {
+  const env = process.env.PI_WEECHAT_ENABLED;
+  return (
+    `pi-weechat: disabled — no socket, no tools, no hooks (only /weechat is loaded)` +
+    ` · config: ${configPath()}${env ? ` · PI_WEECHAT_ENABLED=${env}` : ""}`
+  );
+}
+
+/**
+ * `/weechat on|off|status` — switch the bridge from inside a running session.
+ * `on`/`off` write the config file and reload the extension runtime: pi has no
+ * API to unregister a tool, so a reload is what really unloads (or loads) the
+ * socket, the hooks and the ask_user fallback. Nothing from this closure is
+ * touched after `await ctx.reload()` — that call replaces the runtime.
+ * `state.enabled` is the switch as seen when this runtime loaded, so the inert
+ * runtime still offers `/weechat on`.
+ */
+function registerToggleCommand(
+  pi: ExtensionAPI,
+  state: { enabled: boolean; describe: () => string },
+): void {
+  pi.registerCommand("weechat", {
+    description: "Enable, disable or inspect the WeeChat bridge in this session",
+    handler: async (rawArgs: string, ctx: any) => {
+      const sub = String(rawArgs ?? "").trim().toLowerCase();
+      if (sub === "" || sub === "status") {
+        ctx.ui.notify(state.describe(), "info");
+        return;
+      }
+      if (sub !== "on" && sub !== "off") {
+        ctx.ui.notify("usage: /weechat on|off|status", "warning");
+        return;
+      }
+      const want = sub === "on";
+      const env = process.env.PI_WEECHAT_ENABLED;
+      if (env && resolveEnabled(env) !== want) {
+        ctx.ui.notify(
+          `PI_WEECHAT_ENABLED=${env} overrides /weechat ${sub} — unset it to change the state`,
+          "warning",
+        );
+        return;
+      }
+      if (want === state.enabled) {
+        ctx.ui.notify(`pi-weechat is already ${sub}`, "info");
+        return;
+      }
+      const problems: string[] = [];
+      writeEnabledConfig(want, (m: string) => problems.push(m));
+      if (problems.length > 0) {
+        ctx.ui.notify(problems.join("\n"), "error");
+        return;
+      }
+      ctx.ui.notify(`pi-weechat ${want ? "enabled" : "disabled"} — reloading extensions…`, "info");
+      await ctx.reload();
+    },
+  });
 }
 
 /**
@@ -216,6 +322,8 @@ type BridgeConfig = {
   url?: string;
   token?: string;
   debugLog?: string;
+  /** Master switch: false/"off" loads nothing but the `/weechat` command. */
+  enabled?: string | boolean;
   /** "off" disables routing decision questions to the buffer (default: on). */
   pick?: string | boolean;
   /** Comma list / array of question tool names to route (default: DEFAULT_PICK_TOOLS). */
@@ -334,6 +442,17 @@ function makeProof(token: string, nonce: string): string {
 }
 
 export default function weechatBridge(pi: ExtensionAPI) {
+  // Master switch, read before anything is registered. When it is off this
+  // runtime exposes only `/weechat` — so `/weechat off` and `/weechat on`
+  // really unload and reload the bridge, and a disabled session can re-enable
+  // it without restarting pi.
+  const startupConfig = loadConfig({ onError: (m: string) => dbg(m) }) as BridgeConfig;
+  reinitDebugLog(startupConfig);
+  if (!resolveEnabled(process.env.PI_WEECHAT_ENABLED, startupConfig.enabled)) {
+    dbg("pi-weechat is disabled — registering only /weechat");
+    registerToggleCommand(pi, { enabled: false, describe: disabledStatus });
+    return;
+  }
   let endpoint: Endpoint;
   let token = "";
   let sock: net.Socket | null = null;
@@ -1052,6 +1171,13 @@ export default function weechatBridge(pi: ExtensionAPI) {
   });
 
   // ----------------------------------------------------------------- tools
+
+  registerToggleCommand(pi, {
+    enabled: true,
+    describe: () =>
+      `pi-weechat: enabled · ${weechatUIConnected ? "connected" : "not connected"} to ${describeEndpoint(endpoint)}` +
+      ` · config: ${configPath()}`,
+  });
 
   pi.registerCommand("weechat-ctl", {
     description: "Control commands forwarded from the WeeChat bridge buffer (internal)",

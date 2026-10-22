@@ -399,7 +399,8 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 | `irc.server_default.nicks` | WeeChat IRC option (read-only for the bridge): first non-empty entry = the user's nick for the `nick!me` prefix column; re-applied live via `hook_config`, no reload | the IRC plugin's `nicks` default |
 | `PI_WEECHAT_URL`     | pi extension env: `tcp://host:port` / `unix://<path>` / `host:port` / path | unset ⇒ config-file `url` ⇒ `PI_WEECHAT_SOCK` (deprecated) ⇒ default unix path |
 | `PI_WEECHAT_TOKEN`   | pi extension env: shared secret for the challenge (never in the URL) | unset (anonymous) ⇒ config-file `token` |
-| `pi-weechat.json`    | pi-side config file `<agent dir>/pi-weechat.json` (agent dir = `$PI_CODING_AGENT_DIR`, default `~/.pi/agent`); keys `url` / `token` / `debugLog` mirror the env vars above, plus `pick` / `pickTools` / `askTool` for question routing — **env always wins over the file**; re-read at each `session_start`; broken file ⇒ env/default behavior + red `config_error` line | missing (fine) |
+| `PI_WEECHAT_ENABLED` | pi extension env: master switch (`off`/`0`/`false`/`no` ⇒ the runtime registers only `/weechat`) | unset ⇒ config-file `enabled` ⇒ on |
+| `pi-weechat.json`    | pi-side config file `<agent dir>/pi-weechat.json` (agent dir = `$PI_CODING_AGENT_DIR`, default `~/.pi/agent`); keys `url` / `token` / `debugLog` mirror the env vars above, plus `enabled` (master switch, written by `/weechat on|off`) and `pick` / `pickTools` / `askTool` for question routing — **env always wins over the file**; re-read at each `session_start`; broken file ⇒ env/default behavior + red `config_error` line | missing (fine) |
 | socket path (unix)   | weechat side: same env / XDG dirs | `$XDG_RUNTIME_DIR/pi-weechat.sock` |
 
 ## 8. Milestones
@@ -441,6 +442,13 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
    blocked tool result; any fallback cancels the whole questionnaire. Also
    fixed: `pick` / `pickTools` were documented but dropped by the config
    parser, so only the env-var form worked. ✅
+9. **M9 — `/weechat on|off|status`:** a master switch (`PI_WEECHAT_ENABLED` /
+   `enabled` in the config file) read before anything is registered. Off means
+   the runtime registers only `/weechat` — no socket, tools or hooks — so the
+   command can write the switch and `ctx.reload()` (pi cannot unregister a
+   tool), and `/weechat on` works from the disabled runtime. pi's own
+   `settings.json` is never rewritten; a config file that cannot be parsed is
+   refused rather than replaced. ✅
 
 ## 9. Repo layout
 
@@ -469,6 +477,7 @@ pi-weechat/
     ├── ask-pick-multi.test.mjs# questions[] questionnaire → !pick (live socket)
     ├── ask-pick-present.test.mjs# no fallback when another ask tool exists
     ├── ask-tool-mode.test.mjs # askTool=auto|off|force + question-name detection
+    ├── weechat-toggle.test.mjs # /weechat on|off|status + the enabled switch
     ├── wc-harness.mjs       # shared pi mock + WeeChat-side driver helpers
     ├── smoke_weechat.py     # weechat script smoke test (stub weechat module, stdlib only)
     ├── py_driver.py         # stdin/stdout driver used by the integration tests

@@ -64,9 +64,11 @@ export function startWeechatSide(sockPath) {
 export function makePiMock(ctx, tools) {
   const handlers = {};
   const registeredTools = {};
+  const registeredCommands = {};
   return {
     handlers,
     registeredTools,
+    registeredCommands,
     api: {
       on: (name, fn) => {
         (handlers[name] ??= []).push(fn);
@@ -74,7 +76,9 @@ export function makePiMock(ctx, tools) {
       registerTool: (tool) => {
         registeredTools[tool.name] = tool;
       },
-      registerCommand: () => {},
+      registerCommand: (name, spec) => {
+        registeredCommands[name] = spec;
+      },
       sendUserMessage: () => {},
       getSessionName: () => "ask-session",
       ...(tools
@@ -104,6 +108,7 @@ export function makeBridgeEnv(tag) {
     PI_WEECHAT_PICK: process.env.PI_WEECHAT_PICK,
     PI_WEECHAT_PICK_TOOLS: process.env.PI_WEECHAT_PICK_TOOLS,
     PI_WEECHAT_ASK_TOOL: process.env.PI_WEECHAT_ASK_TOOL,
+    PI_WEECHAT_ENABLED: process.env.PI_WEECHAT_ENABLED,
   };
   const applyEnv = () => {
     delete process.env.PI_WEECHAT_URL;
@@ -111,6 +116,7 @@ export function makeBridgeEnv(tag) {
     delete process.env.PI_WEECHAT_PICK;
     delete process.env.PI_WEECHAT_PICK_TOOLS;
     delete process.env.PI_WEECHAT_ASK_TOOL;
+    delete process.env.PI_WEECHAT_ENABLED;
     process.env.PI_CODING_AGENT_DIR = dir;
     process.env.PI_WEECHAT_SOCK = sockPath;
   };
