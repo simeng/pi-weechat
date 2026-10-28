@@ -11,7 +11,8 @@ requires-python = ">=3.9"
 # anything the local python3 supports.
 target-version = "py39"
 line-length = 100
-exclude = ["node_modules", "__pycache__"]
+# .pi is Pi's own scratch dir (task output, throwaway scripts), not project code
+exclude = ["node_modules", "__pycache__", ".pi"]
 
 [tool.ruff.lint]
 select = [
