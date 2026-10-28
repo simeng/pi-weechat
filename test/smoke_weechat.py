@@ -15,11 +15,13 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import select
 import socket
 import sys
 import tempfile
 import time
+import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "weechat", "pi_bridge.py")
@@ -27,6 +29,13 @@ SCRIPT = os.path.join(HERE, "..", "weechat", "pi_bridge.py")
 # ---------------------------------------------------------------- weechat stub
 
 WEECHAT_RC_OK = 3
+
+_STUB_CODE_RE = re.compile(r"\x19(?:F@\d{5}|F[0-9a-zA-Z]{2}|[0-9a-zA-Z]{2})|\x1a.|[\x18\x1c]")
+
+
+def _stub_visible(text):
+    """The bridge's color/attribute codes, as a terminal would drop them."""
+    return _STUB_CODE_RE.sub("", text)
 
 
 class WeechatStub:
@@ -62,13 +71,24 @@ class WeechatStub:
         return {"white": "W", "magenta": "M", "cyan": "C", "blue": "B",
                 "yellow": "E", "green": "G", "red": "r", "236": "D",
                 # syntax-highlight palette (HL_TOKENS) + reset marker
-                "reset": "0", "bold magenta": "K", "darkgray": "d",
+                "reset": "\x1c", "bold magenta": "K", "darkgray": "d",
                 "lightblue": "L", "lightgreen": "g",
                 # text attributes: exactly the codes real WeeChat 4.10.1
                 # returns (probed), which the TUI and relay clients decode
                 "bold": "\x1a\x01", "italic": "\x1a\x03",
                 "underline": "\x1a\x04", "reverse": "\x1a\x02",
                 "dim": "\x1a\x06"}.get(name, "")
+
+    def strlen_screen(self, text):
+        """Emulate weechat.strlen_screen(): codes cost no columns, wide chars two.
+
+        The bridge uses this for table column widths when WeeChat provides it, so the
+        stub has to behave like the real binding rather than len().
+        """
+        stripped = _stub_visible(text)
+        return sum(0 if unicodedata.combining(c) else
+                   2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                   for c in stripped)
 
     def config_is_set_plugin(self, name):
         return name in self.plugin_opts
@@ -469,7 +489,7 @@ def main():
           if "notify_highlight" in tags]
     assert len(hl) == 1, "settle emits exactly one highlight line"
     assert hl[0][1] == "", "highlight line has no nick prefix"
-    assert hl[0][2].strip("G0") == "✔ ready!", "highlight line text"
+    assert hl[0][2].strip("G\x1c") == "✔ ready!", "highlight line text"
     n_printf = len(stub.printf_tags)
     send({"type": "status", "state": "idle"})  # idle → idle: not a settle
     pump_and_drain(client, 0.2)
@@ -856,7 +876,7 @@ def main():
     # Nick prefixes — who-spoke rendering (pi_bridge.nicks + irc nicks)
     # ==================================================================
 
-    RS = "0"  # the stub's reset marker (real WeeChat: color:reset)
+    RS = "\x1c"  # the stub's reset marker, the code real WeeChat returns
     # the buffer localvar carries the user nick (first config entry);
     # user lines render in the prefix column under the real nick
     assert stub.localvars.get("nick") == "alice", \
@@ -1043,7 +1063,7 @@ def main():
     assert msg == {"type": "user_input", "text": "nickless line",
                    "deliverAs": "steer"}, \
         "the line still reaches pi (only the rendering falls back)"
-    assert any(k == "PRINT" and "> 0nickless line" in t
+    assert any(k == "PRINT" and "> \x1cnickless line" in t
                for k, t in stub.prints[n0:]), \
         "empty nicks ⇒ user line falls back to the '> ' marker via prnt"
     assert stub.printf_tags[n1:] == [], "no user-nick printf while nick is empty"
@@ -1058,8 +1078,8 @@ def main():
     # ==================================================================
 
     # color chars from the stub palette (see WeechatStub.color); C_DIM falls
-    # back to palette cyan, so fence lines render "C…0" like status lines
-    KW, STR, NUM, COM, FN, VAR, TYP, RS = "K", "G", "C", "d", "L", "E", "g", "0"
+    # back to palette cyan, so fence lines render cyan plus a reset like status lines
+    KW, STR, NUM, COM, FN, VAR, TYP, RS = "K", "G", "C", "d", "L", "E", "g", "\x1c"
     DIM = "C"
     hl = ns["highlight_code"]
 
@@ -1541,6 +1561,93 @@ def main():
             "%s is a rule of the same fixed length" % rule
         assert ns["_md_block_kind"](rule) == "hr"
     assert len(HR) == 20, "rules are a fixed length: no width is knowable here"
+    # --- tables (unit level): cell splitting, delimiter row, screen width
+    spl = ns["_md_split_row"]
+    assert spl("| a | b |") == ["a", "b"], "outer pipes are optional and stripped"
+    assert spl("a | b") == ["a", "b"], "no outer pipes at all"
+    assert spl("a | b |") == ["a", "b"], "only the trailing pipe is stripped"
+    assert spl("| a \\| b | c |") == ["a | b", "c"], \
+        "an escaped pipe stays inside its cell (and prints as a plain pipe)"
+    assert spl("| `a|b` | c |") == ["`a|b`", "c"], \
+        "a pipe inside a code span never splits a cell"
+    assert spl("| `a\\|b` | c |") == ["`a|b`", "c"], \
+        "an escaped pipe inside a code span is a literal pipe too"
+    assert spl("| a |  |") == ["a", ""], "an empty cell is still a cell"
+    assert spl("plain prose") == ["plain prose"], "no pipe: one cell, not a table line"
+    assert spl("| **b** | `c` |") == ["**b**", "`c`"], "cell text keeps its markers"
+
+    dlm = ns["_md_table_delimiter"]
+    assert dlm("|---|---|") == ["left", "left"], "the plain form"
+    assert dlm(":--|--:|:-:|-") == ["left", "right", "center", "left"], \
+        "colon placement is the alignment"
+    assert dlm(" --- | :-: ") == ["left", "center"], "padding around the cells is ignored"
+    assert dlm("---") is None, "a bare --- is a rule or an underline, not a delimiter"
+    assert dlm("| a | b |") is None, "a header row is not a delimiter row"
+    assert dlm("| --- | x |") is None, "one non-dash cell rejects the whole row"
+
+    row = ns["_md_is_table_row"]
+    assert row("| a | b |") and row("|---|:-:|") and row("a | b"), "rows and delimiter"
+    assert not row(""), "blank lines end a table"
+    assert not row("prose without pipes"), "prose ends a table"
+    assert not row("- item | x"), "a list marker is its own block"
+    assert not row("> quoted | x"), "a quote is its own block"
+    assert not row("# head | x"), "a heading is its own block"
+    assert not row("```"), "a fence is its own block"
+
+    wd = ns["_md_disp_width_py"]      # the twin used outside WeeChat, real code shapes
+    assert wd("abc") == 3
+    assert wd("\x19F11red\x1c") == 3, "palette color codes cost no columns"
+    assert wd("\x1901x\x1c") == 1, "theme color codes cost no columns"
+    assert wd("\x19F@00236x\x1c") == 1, "extended color codes cost no columns"
+    assert wd("\x1a\x01bold\x1c") == 4, "attribute codes cost no columns"
+    assert wd("中文") == 4, "wide characters cost two columns"
+    assert wd("a\u0336b") == 2, "the strikethrough overlay costs nothing"
+    assert ns["_md_disp_width"]("plain") == 5, "the WeeChat path agrees on plain text"
+    # strlen_screen is a recent binding: a WeeChat without it measures on its own
+    saved = ns["_STRLEN_SCREEN"]
+    ns["_STRLEN_SCREEN"] = None
+    try:
+        assert ns["_md_disp_width"]("中文 \x1a\x01x\x1c") == 6, \
+            "without the binding the bridge strips the codes and measures itself"
+    finally:
+        ns["_STRLEN_SCREEN"] = saved
+
+    # two width implementations is a divergence risk: the binding is what production
+    # pads by, so the fallback has to agree with it on every shape a cell can hold
+    for sample in ("", "abc", "中文", "日本語テキスト", "a\u0336b", "café", "😀 hi",
+                   "\x19F11red\x1c", "\x1901x\x1c", "\x19F@00236x\x1c", "\x1a\x01bold\x1c",
+                   "\x19F13\x1a\x04**two styles**\x1c", "  spaced  ", "| no pipes here |"):
+        assert ns["_md_disp_width"](sample) == ns["_md_disp_width_py"](sample), \
+            "strlen_screen and the local measure disagree on %r" % sample
+
+    def plain_grid(line):
+        """A grid line as the reader sees it: the bridge's codes and the strike
+        overlay removed, so a snapshot reads as the box printed."""
+        return re.sub(r"\x1a.|[\x18\x1c]", "", line).replace("\u0336", "")
+
+    assert [plain_grid(t) for t in ns["_md_render_table"](
+        ["| file | size | notes |", "|:---|---:|:-:|",
+         "| main.c | 12 KiB | ok |", "| util.c | 1 KiB | hot |"])] == [
+        "┌────────┬────────┬───────┐",
+        "│ file   │   size │ notes │",
+        "├────────┼────────┼───────┤",
+        "│ main.c │ 12 KiB │  ok   │",
+        "│ util.c │  1 KiB │  hot  │",
+        "└────────┴────────┴───────┘"], \
+        "columns aligned by their widest cell, one rule under the header only"
+    assert [plain_grid(t) for t in ns["_md_render_table"](
+        ["| name | **n** | note |", "|:---|---:|:-:|",
+         "| 中文 | 1 | ok |", "| a\\|b | ~~two~~ | *em* |"])] == [
+        "┌──────┬─────┬──────┐",
+        "│ name │   n │ note │",
+        "├──────┼─────┼──────┤",
+        "│ 中文 │   1 │  ok  │",
+        "│ a|b  │ two │  em  │",
+        "└──────┴─────┴──────┘"], (
+            "wide characters cost two columns, while bold, italic and the strike "
+            "overlay cost nothing: a cell reserves exactly what it displays")
+    assert ns["_md_render_table"](["| a | b |"]) is None, \
+        "no delimiter row means no table, so nothing to render"
 
     # a quote ends where a paragraph starts, and rules stand alone
     n0 = len(stub.prints)
@@ -1566,6 +1673,202 @@ def main():
     pump_and_drain(client)
     assert md_fresh(n0) == ["a paragraph" + RS, "", DIMA + HR + RS], \
         "--- after a blank is a rule, at the end of a message as much as at its start"
+
+    # --- tables (buffer level): the block waits for every row, then the grid lands
+    n0 = len(stub.prints)
+    for text in ("| file | size |", "|:---|---:|",
+                 "| main.c | 12 KiB | extra |", "| 中文 | 1 |"):
+        send({"type": "assistant_line", "msgId": 81, "text": text})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [], \
+        "a table waits for every row: the column widths are only knowable at the end"
+    send({"type": "assistant_line", "msgId": 81, "text": ""})   # the blank ends it
+    pump_and_drain(client)
+    sent = md_fresh(n0)
+    assert [plain_grid(t) for t in sent] == [
+        "┌────────┬────────┐",
+        "│ file   │   size │",
+        "├────────┼────────┤",
+        "│ main.c │ 12 KiB │",
+        "│ 中文   │      1 │",
+        "└────────┴────────┘"], \
+        "the grid: a row wider than the header is truncated to its columns"
+    assert len(sent) == 6, "frame, header, rule, rows, frame — and nothing else"
+    assert sent[0].startswith(ns["MD_TABLE_STYLE"]), "the frame is dim, not colored"
+    assert ns["A_BOLD"] in sent[1] and ns["A_BOLD"] not in sent[3], \
+        "the header row is bold, the body is not"
+    send({"type": "assistant_line", "msgId": 81, "text": "done"})
+    send({"type": "assistant_flush", "msgId": 81})
+    pump_and_drain(client)
+    assert md_fresh(n0)[6:] == ["", "done" + RS], \
+        "the blank that ended the table is owed, and printed before what follows it"
+
+    n0 = len(stub.prints)
+    for text in ("> | a | b |", "> |:--|--:|", "> | 1 | 2 |"):
+        send({"type": "assistant_line", "msgId": 82, "text": text})
+    send({"type": "assistant_flush", "msgId": 82})
+    pump_and_drain(client)
+    sent = md_fresh(n0)
+    assert [plain_grid(t) for t in sent] == [
+        "│ ┌───┬───┐", "│ │ a │ b │", "│ ├───┼───┤", "│ │ 1 │ 2 │", "│ └───┴───┘"], \
+        "a table inside a quote keeps its grid, behind the quote bar"
+    assert QS in sent[0], "and it keeps the quote's own style"
+    # a runaway table inside a quote degrades the same way as one at top level
+    cap = ns["MD_TABLE_MAX_ROWS"]
+    ns["MD_TABLE_MAX_ROWS"] = 2
+    n0 = len(stub.prints)
+    for text in ("> | a | b |", "> |:--|--:|", "> | 1 | 2 |", "> | 3 | 4 |"):
+        send({"type": "assistant_line", "msgId": 97, "text": text})
+    send({"type": "assistant_flush", "msgId": 97})
+    pump_and_drain(client)
+    ns["MD_TABLE_MAX_ROWS"] = cap
+    sent = md_fresh(n0)
+    assert not any("┌" in t for t in sent), "a capped quoted table draws no grid"
+    assert [t for t in sent if "|" in t] == [
+        BAR + QS + t + RS for t in ("| a | b |", "|:--|--:|", "| 1 | 2 |", "| 3 | 4 |")], \
+        "every quoted row appears once, behind the quote bar, as written"
+
+
+    n0 = len(stub.prints)
+    for text in ("- run it", "  | a | b |", "  |---|---|", "  | 1 | 2 |"):
+        send({"type": "assistant_line", "msgId": 83, "text": text})
+    send({"type": "assistant_flush", "msgId": 83})
+    pump_and_drain(client)
+    sent = md_fresh(n0)
+    assert not any("┌" in t for t in sent), \
+        "a table nested in a list item stays plain text (v1 scope)"
+    assert any("| a | b |" in t for t in sent), "as the text pi wrote it"
+
+    n0 = len(stub.prints)
+    for text in ("two lines", "of prose | here", "|---|---|"):
+        send({"type": "assistant_line", "msgId": 84, "text": text})
+    send({"type": "assistant_flush", "msgId": 84})
+    pump_and_drain(client)
+    assert not any("┌" in t for t in md_fresh(n0)), \
+        "a delimiter row after prose is prose, not a table header"
+
+    n0 = len(stub.prints)
+    for text in ("| only |", "---"):
+        send({"type": "assistant_line", "msgId": 85, "text": text})
+    send({"type": "assistant_flush", "msgId": 85})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [HEAD + BOLD + "| only |" + RS], \
+        "a one-column table whose dashes carry no pipes is a setext heading (known v1 edge)"
+
+    # a table the stream never finishes still prints, as a grid of the rows it got
+    n0 = len(stub.prints)
+    for text in ("| a | b |", "|---|---|", "| 1 | 2 |"):
+        send({"type": "assistant_line", "msgId": 86, "text": text})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [], "the next message has not arrived yet"
+    send({"type": "assistant_line", "msgId": 87, "text": "next message"})
+    pump_and_drain(client)
+    sent = md_fresh(n0)
+    assert plain_grid(sent[0]).startswith("┌") and "│ 1 │ 2 │" in plain_grid(sent[3]), \
+        "the interrupted table is flushed as the grid of the rows that made it"
+    send({"type": "assistant_flush", "msgId": 87})
+    pump_and_drain(client)
+
+    # a runaway table degrades to plain text instead of holding the buffer hostage
+    rows, limit = ns["MD_TABLE_MAX_ROWS"], ns["MD_TABLE_MAX_BYTES"]
+    ns["MD_TABLE_MAX_ROWS"] = 3
+    n0 = len(stub.prints)
+    for text in ("| a | b |", "|---|---|", "| 1 | 2 |", "| 3 | 4 |", "| 5 | 6 |"):
+        send({"type": "assistant_line", "msgId": 88, "text": text})
+    send({"type": "assistant_flush", "msgId": 88})
+    pump_and_drain(client)
+    ns["MD_TABLE_MAX_ROWS"] = rows
+    assert md_fresh(n0) == [t + RS for t in
+                            ("| a | b |", "|---|---|", "| 1 | 2 |", "| 3 | 4 |", "| 5 | 6 |")], \
+        "past the row cap every row prints exactly as it arrived, and no grid is drawn"
+
+    ns["MD_TABLE_MAX_BYTES"] = 24
+    n0 = len(stub.prints)
+    for text in ("| a | b |", "|---|---|", "| a fairly long cell | and another |"):
+        send({"type": "assistant_line", "msgId": 89, "text": text})
+    send({"type": "assistant_flush", "msgId": 89})
+    pump_and_drain(client)
+    ns["MD_TABLE_MAX_BYTES"] = limit
+    sent = md_fresh(n0)
+    assert not any("┌" in t for t in sent), "the byte cap degrades to plain text too"
+    assert any("fairly long cell" in t for t in sent), "nothing is dropped on the way"
+    # overflow terminated by prose (no blank line in sight): the raw rows print once,
+    # in order, and the block *after* the degraded one renders markdown again — the
+    # plain mode belongs to the table block, not to the rest of the message
+    rows = ns["MD_TABLE_MAX_ROWS"]
+    ns["MD_TABLE_MAX_ROWS"] = 3
+    n0 = len(stub.prints)
+    for text in ("| a | b |", "|---|---|", "| 1 | 2 |", "| 3 | 4 |", "# then a heading"):
+        send({"type": "assistant_line", "msgId": 94, "text": text})
+    send({"type": "assistant_flush", "msgId": 94})
+    pump_and_drain(client)
+    ns["MD_TABLE_MAX_ROWS"] = rows
+    sent = md_fresh(n0)
+    assert sum(1 for t in sent if "| 3 | 4 |" in t) == 1, \
+        "the row that tripped the cap prints exactly once, not twice"
+    assert not any("┌" in t for t in sent), "and no grid is drawn around the overflow"
+    assert sent == [t + RS for t in
+                    ("| a | b |", "|---|---|", "| 1 | 2 |", "| 3 | 4 |")] + \
+        [HEAD + BOLD + UNDER + "then a heading" + RS], \
+        "markdown rendering resumes for the block after a degraded table"
+
+    # a code span inside a cell is highlighted, and the columns still line up
+    n0 = len(stub.prints)
+    for text in ("| cmd | rc |", "|---|---|", "| `git status` | ok |"):
+        send({"type": "assistant_line", "msgId": 90, "text": text})
+    send({"type": "assistant_flush", "msgId": 90})
+    pump_and_drain(client)
+    sent = md_fresh(n0)
+    assert any(ns["C_CODE"] in t and "git status" in t for t in sent), \
+        "inline code inside a cell renders like inline code in prose"
+    assert sum(t.count("│") for t in (sent[1], sent[3])) == 6, \
+        "two columns, three boundaries: styled cells sit on the same ones"
+
+    # with rendering off, a table is the source text pipes and all
+    ns["pi_input_cb"]("", "buffer", "!markdown off")
+    pump_and_drain(client, 0.2)
+    n0 = len(stub.prints)
+    for text in ("| a | b |", "|---|---|", "| 1 | 2 |"):
+        send({"type": "assistant_line", "msgId": 91, "text": text})
+    send({"type": "assistant_flush", "msgId": 91})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [t + RS for t in ("| a | b |", "|---|---|", "| 1 | 2 |")], \
+        "markdown off: the table reaches the buffer exactly as pi wrote it"
+    ns["pi_input_cb"]("", "buffer", "!markdown on")
+    pump_and_drain(client, 0.2)
+
+    # the table lookahead must not swallow an ordinary last line: a single-line
+    # paragraph held for a possible delimiter row still prints when the message ends
+    n0 = len(stub.prints)
+    send({"type": "assistant_line", "msgId": 92, "text": "the last line of the reply"})
+    pump_and_drain(client)
+    assert md_fresh(n0) == [], "it waits one line, in case a delimiter row follows"
+    send({"type": "assistant_flush", "msgId": 92})
+    pump_and_drain(client)
+    assert md_fresh(n0) == ["the last line of the reply" + RS], \
+        "the end of the message prints the held paragraph as prose"
+
+    # a held line also flushes in the right order when the next construct is not a
+    # delimiter row: a fence, a list, or a blank line each cut in after the prose
+    n0 = len(stub.prints)
+    for text in ("one prose line", "```bash", "ls -l", "```"):
+        send({"type": "assistant_line", "msgId": 95, "text": text})
+    send({"type": "assistant_flush", "msgId": 95})
+    pump_and_drain(client)
+    fresh = md_fresh(n0)
+    assert fresh[0] == "one prose line" + RS, \
+        "the held paragraph prints before the fence that ends it"
+    assert any("ls -l" in t for t in fresh[1:]), "and the fence follows it, intact"
+
+    n0 = len(stub.prints)
+    for text in ("a lone line", "- first item"):
+        send({"type": "assistant_line", "msgId": 96, "text": text})
+    send({"type": "assistant_flush", "msgId": 96})
+    pump_and_drain(client)
+    fresh = md_fresh(n0)
+    assert fresh[0] == "a lone line" + RS and fresh[1] == "\u2022 first item" + RS, \
+        "a list opens after the held line, not before it"
+
 
     # client disconnect → title back to waiting (unix client is done)
     # an unfinished call leaves an entry in the toolCallId→nick map; a new
@@ -1930,12 +2233,12 @@ def main():
     assert s2.pending_ui is not None
     s3.on_input("!pick 1")
     stub.pump(0.2)
-    assert any("nothing to pick" in l for l in stub.buf_prints[s3.buffer])
+    assert any("nothing to pick" in line for line in stub.buf_prints[s3.buffer])
     s2.on_input("!pick 2")
     stub.pump(0.2)
     lines = []
     drain(m2, lines)
-    resp = [json.loads(l) for l in lines if json.loads(l)["type"] == "ui_response"]
+    resp = [json.loads(line) for line in lines if json.loads(line)["type"] == "ui_response"]
     assert resp and resp[0].get("value") == "y", resp
     # tidy up the phase's clients
     for cl in (m2, m4, m5):
@@ -2044,7 +2347,7 @@ def main():
     stub.pump(0.2)
     out = []
     drain(ma2, out)
-    assert not any(b"ui_response" in l for l in out), out
+    assert not any(b"ui_response" in chunk for chunk in out), out
     assert any("nothing to pick" in m for m in stub.buf_prints.get(sa.buffer, [])), stub.buf_names
     # tidy up
     for cl in (m6, m7, m8b, m8c, m9b, ma2):

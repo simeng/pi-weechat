@@ -49,4 +49,12 @@ test("glowing bear decodes the bridge's markdown styles", async (t) => {
   assert.equal(parts[1].fgColor.name, "yellow", "inner span color");
   assert.equal(parts[1].attrs.override.b, false, "color span drops the outer bold");
   assert.equal(parts[2].attrs.override.b, true, "the restored bold survives to the tail");
+
+  // a table row, exactly as the grid emits it: dim bar, bold cell, padding after
+  // every reset — the glyphs and the bold must both survive the decode
+  parts = rawText2Rich("\x1a\x06│\x1c \x1a\x01file\x1c \x1a\x06│\x1c");
+  assert.equal(parts.map((p) => p.text).join(""), "│ file │", "the glyphs survive the decode");
+  assert.ok(parts.some((p) => p.attrs.override.b), "the header cell stays bold");
+  assert.ok(!parts.some((p) => p.text.includes("│") && p.attrs.override.b),
+    "the frame bar does not inherit that bold");
 });
