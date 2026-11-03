@@ -127,15 +127,14 @@ listener.
 | type        | payload                          | meaning                                        |
 |-------------|----------------------------------|------------------------------------------------|
 | `hello`     | as above                         | handshake                                      |
-| `user_input`| `{text, deliverAs?}`             | typed line; `deliverAs` ∈ undefined (normal), `"steer"` (`!s ...` prefix → mid-stream steering), `"followUp"` (`!q ...`). The pi side fills in `"followUp"` for plain input that arrives while a turn is running, so nothing is dropped |
+| `user_input`| `{text, deliverAs?}`             | typed line; `deliverAs` ∈ `"steer"` (default for plain input → mid-stream steering; ignored by pi when idle), `"followUp"` (`!q ...`). The pi side also fills in `"steer"` for plain input that arrives while a turn is running, so nothing is dropped |
 | `command`   | `{name, arg?}`                   | name ∈ `new_session`, `compact`, `abort`, `status`, `model`, `cd`; `arg` carries the optional argument (e.g. model id for `model`, path for `cd`). `abort` runs `ctx.abort()` directly (safe from event handlers); the rest are routed through a registered extension command (`/weechat-ctl <name> [arg]`) sent with `expandPromptTemplates: true` so it executes immediately — even mid-stream. `cd` is handled built-in by the bridge (no LLM round trip): exact existing dir ⇒ immediate session switch; otherwise fuzzy-similar dirs + a “➕ create … as new project” option are offered as a `ui_request`, answered with `!pick` |
 | `pong`      | `{ts}`                           | keepalive response                             |
 
 Buffer-local commands typed in the WeeChat buffer (all start with `!` so they
 never reach the LLM):
 
-- `!s <text>`  — steer (interrupt current stream, inject)
-- `!q <text>`  — queue follow-up message
+- `!q <text>`  — queue follow-up message (plain text steers the running turn by default)
 - `!new`       — new session (`ctx.newSession()`)
 - `!compact`   — compaction (`ctx.compact()`)
 - `!abort`     — abort current turn (`ctx.abort()`)
@@ -324,8 +323,10 @@ Structure (single file is fine at this size; split if it grows):
 - **Input handling:** on `user_input`, call
   `pi.sendUserMessage(text, { deliverAs })`. Plain input that arrives while a
   turn is streaming (`agent_start` without `agent_settled`) gets
-  `deliverAs: "followUp"` — otherwise pi's `prompt()` throws "Agent is already
-  processing" and the message would vanish with no error visible in WeeChat.
+  `deliverAs: "steer"` (injected mid-stream) — otherwise pi's `prompt()`
+  throws "Agent is already processing" and the message would vanish with no
+  error visible in WeeChat. When pi is idle, `steer` is simply ignored and
+  the message starts a new turn.
   Because injected messages arrive back at pi with
   `event.source === "extension"`, the `input` handler skips them for
   `user_echo` — no echo loops.

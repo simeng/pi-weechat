@@ -280,6 +280,13 @@ test("end-to-end: handshake, output mirroring, input injection", async (t) => {
   await waitFor(() => ext.sent.length >= 2, "sendUserMessage steer");
   assert.deepEqual(ext.sent[1], { text: "steer me", opts: { deliverAs: "steer" } });
 
+  // plain input while a turn is running defaults to steer (nothing dropped)
+  await ext.fire("agent_start", {});
+  weechat.send({ type: "user_input", text: "while busy" });
+  await waitFor(() => ext.sent.length >= 3, "sendUserMessage while busy");
+  assert.deepEqual(ext.sent[2], { text: "while busy", opts: { deliverAs: "steer" } });
+  await ext.fire("agent_settled", {});
+
   // user prompts typed in the pi terminal are mirrored back
   await ext.fire("input", { text: "typed in pi", source: "interactive" });
   const echo = await waitFor(() => weechat.received.find((m) => m.type === "user_echo"), "user_echo");

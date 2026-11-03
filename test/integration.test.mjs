@@ -417,15 +417,15 @@ test("integration: real extension ↔ real weechat script", async (t) => {
   // buffer title tracks state
   await wc.waitFor((m) => m.type === "title" && /read_file/.test(m.text), "title: tool state");
 
-  // user types in the weechat buffer → pi.sendUserMessage
+  // user types in the weechat buffer → pi.sendUserMessage (plain text steers)
   wc.send({ op: "input", text: "hello from weechat" });
   await waitForMock(
-    () => mock.sentUserMessages.find((m) => m.text === "hello from weechat"),
-    "user_input delivered"
+    () => mock.sentUserMessages.find((m) => m.text === "hello from weechat" && m.deliverAs === "steer"),
+    "plain input delivered as steer"
   );
 
-  // !s steer prefix maps to deliverAs: steer
-  wc.send({ op: "input", text: "!s do it this way" });
+  // plain text also steers (no prefix needed)
+  wc.send({ op: "input", text: "do it this way" });
   await waitForMock(
     () => mock.sentUserMessages.find((m) => m.text === "do it this way" && m.deliverAs === "steer"),
     "steer delivered"
@@ -578,7 +578,7 @@ test("integration: real extension ↔ real weechat script over TCP with token", 
     () => mock.sentUserMessages.find((m) => m.text === "hello over tcp"),
     "user_input delivered over tcp"
   );
-  wc.send({ op: "input", text: "!s steer over tcp" });
+  wc.send({ op: "input", text: "steer over tcp" });
   await waitForMock(
     () => mock.sentUserMessages.find((m) => m.text === "steer over tcp" && m.deliverAs === "steer"),
     "steer delivered over tcp"

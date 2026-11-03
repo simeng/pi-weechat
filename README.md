@@ -94,10 +94,9 @@ Open the `pi` buffer:
   a restart of the Pi extension cannot recover active timing from before it
   restarted.
 - **Input**: type a line and press enter to send it as a prompt to pi. Plain
-  messages typed while a turn is running are queued as follow-ups (delivered
-  when pi settles) instead of being dropped.
+  text steers the current run (injected mid-stream); when pi is idle it
+  simply starts a new turn. Nothing is dropped either way.
   - `!help` — list all buffer commands (answered locally, never reaches the LLM)
-  - `!s <text>` — steer the current run (interrupts, injects)
   - `!q <text>` — queue a follow-up message for after the current turn
   - `!new` — new session
   - `!compact` — compact the session

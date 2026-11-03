@@ -590,18 +590,19 @@ def main():
     assert ns["_theme"]("no_such_name", "white") == "W", \
         "undefined theme names fall back to the palette color"
 
-    # weechat → pi: user input over the wire
+    # weechat → pi: user input over the wire (plain text steers by default)
     ns["pi_input_cb"]("", "buffer", "hello from weechat")
     pump_and_drain(client, 0.4)
     msg = json.loads(recv_lines.pop(0))
-    assert msg == {"type": "user_input", "text": "hello from weechat"}, msg
+    assert msg == {"type": "user_input", "text": "hello from weechat",
+                   "deliverAs": "steer"}, msg
 
-    # steer prefix maps to deliverAs
-    ns["pi_input_cb"]("", "buffer", "!s do this instead")
+    # !q prefix maps to deliverAs: followUp
+    ns["pi_input_cb"]("", "buffer", "!q and then that")
     pump_and_drain(client, 0.4)
     msg = json.loads(recv_lines.pop(0))
-    assert msg == {"type": "user_input", "text": "do this instead",
-                   "deliverAs": "steer"}, msg
+    assert msg == {"type": "user_input", "text": "and then that",
+                   "deliverAs": "followUp"}, msg
 
     # control command routing
     ns["pi_input_cb"]("", "buffer", "!new")
@@ -618,7 +619,7 @@ def main():
     assert all("alice" in p for p, _ in me_rows), \
         "user lines carry the user's nick as the line prefix"
     assert "hello from weechat" in me_lines, "buffer input echo under user nick"
-    assert "!s do this instead" in me_lines, "!s echo under user nick"
+    assert "!q and then that" in me_lines, "!q echo under user nick"
     assert not any(t.startswith("> ") for t in me_lines), \
         "user-nick lines must not carry the legacy '> ' marker"
 
@@ -899,7 +900,7 @@ def main():
                    for tags, p, _ in stub.printf_tags), \
         "a tool line is never labelled `pi` in auto mode"
 
-    # user lines (buffer input, !s echo, user_echo) render under the user's
+    # user lines (buffer input, !q echo, user_echo) render under the user's
     # nick — prefix_nick_chat_nick_self, no legacy '> ' marker in the text
     me_lines = [b for tags, _, b in stub.printf_tags if tags == me_tags]
     assert "typed in pi terminal" in me_lines, "user_echo under user nick"
@@ -1039,7 +1040,8 @@ def main():
     ns["pi_input_cb"]("", "buffer", "nickless line")
     pump_and_drain(client, 0.3)
     msg = json.loads(recv_lines.pop(0))
-    assert msg == {"type": "user_input", "text": "nickless line"}, \
+    assert msg == {"type": "user_input", "text": "nickless line",
+                   "deliverAs": "steer"}, \
         "the line still reaches pi (only the rendering falls back)"
     assert any(k == "PRINT" and "> 0nickless line" in t
                for k, t in stub.prints[n0:]), \

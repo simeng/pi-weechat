@@ -887,10 +887,12 @@ export default function weechatBridge(pi: ExtensionAPI) {
         if (!text) return;
         let deliverAs =
           msg.deliverAs === "steer" || msg.deliverAs === "followUp" ? msg.deliverAs : undefined;
-        // Plain input while a turn is running: queue it as a follow-up.
-        // Without this, pi's prompt() throws ("Agent is already processing")
-        // and the message is lost — with no error visible in WeeChat.
-        if (!deliverAs && busy) deliverAs = "followUp";
+        // Plain input while a turn is running: steer it by default. pi
+        // ignores deliverAs when idle (the message just starts a turn), so
+        // "steer" is a safe default in both states; without it, pi's
+        // prompt() throws ("Agent is already processing") and the message
+        // is lost — with no error visible in WeeChat.
+        if (!deliverAs && busy) deliverAs = "steer";
         dbg(
           `sendUserMessage: deliverAs=${deliverAs ?? "(default)"} text=${JSON.stringify(text.slice(0, 200))}`,
         );

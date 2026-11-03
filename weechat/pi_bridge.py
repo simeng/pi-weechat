@@ -766,7 +766,8 @@ PLUGIN_OPTIONS = (
 )
 
 HELP_TEXT = (
-    "!s <text> steer current turn · !q <text> queue follow-up\n"
+    "plain text → pi (steer current turn; starts a new turn if idle)\n"
+    "!q <text> queue a follow-up message for after the current turn\n"
     "!new new session · !compact compact context · !abort abort current turn\n"
     "!cd <path> switch pi to a project dir (fuzzy match → pick list)\n"
     "!pick <n|text> answer pi’s “?” prompt (!pick cancel aborts)\n"
@@ -776,7 +777,6 @@ HELP_TEXT = (
     "!highlight [on|off] syntax-highlight fenced code blocks (default: on)\n"
     "!nick [auto|pi] nick column: tool names vs just “pi” (default: auto)\n"
     "!markdown [on|off] render pi's markdown replies (default: on)\n"
-    "anything else is sent to pi as a normal message"
 )
 
 
@@ -1659,7 +1659,7 @@ class Session(object):
     def _send_user_input(self, text, echo, msg):
         """Forward one buffer line to pi as user_input (rate-limited).
 
-        `text` is what goes on the wire (prefixes like "!s " stripped),
+        `text` is what goes on the wire (prefixes like "!q " stripped),
         `echo` is what gets echoed into the buffer (the line as typed).
 
         This is the only path that spends the remote pi's LLM budget, so it
@@ -1785,12 +1785,12 @@ class Session(object):
         elif line == "!pick" or line.startswith("!pick "):
             self.handle_pick(line[5:].strip(), line)
             return
-        elif line.startswith("!s "):
-            self._send_user_input(line[3:], line, {"deliverAs": "steer"})
         elif line.startswith("!q "):
             self._send_user_input(line[3:], line, {"deliverAs": "followUp"})
         else:
-            self._send_user_input(line, line, {})
+            # Plain text steers the running turn; when pi is idle the
+            # deliverAs is ignored and a new turn simply starts.
+            self._send_user_input(line, line, {"deliverAs": "steer"})
 
     def _reset_transient(self):
         """Forget per-connection rendering state: a (re)connect starts fresh
