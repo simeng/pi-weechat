@@ -4,11 +4,11 @@
 Loads the REAL weechat/pi_bridge.py against a stub weechat module, pumps its
 event loop, and talks to the node test over stdin/stdout:
 
-  stdin  lines:  {"op":"input","text":...,"buffer":...}   simulate user typing (buffer defaults to "buffer")
+  stdin  lines:  {"op":"input","text":...,"buffer":...}  typing ("buffer" is default)
                  {"op":"set","name":...,"value":...}  set a pi_bridge option
                  {"op":"dropclient"}       drop all authed clients (extension reconnects)
                  {"op":"quit"}             shut down
-  stdout lines:  {"type":"print","buffer":...,"text":...,"tags":...}  every line rendered in a buffer
+  stdout lines:  {"type":"print","buffer":...,"text":...,"tags":...}  a line rendered in a buffer
                  {"type":"title","text":...} buffer title changes
                  {"type":"ready","socket":...}
 """

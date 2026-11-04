@@ -123,6 +123,36 @@ Open the `pi` buffer:
 - Prompts you type directly in pi's own terminal are echoed into the buffer too,
   so both surfaces stay in sync.
 
+### Idle buffers (`auto_clean`)
+
+A disconnected pi session keeps its buffer — but not forever. `auto_clean` says how
+many **hours** a buffer may print nothing before the bridge closes it. The default
+is **24**; `0` turns cleanup off and keeps every buffer:
+
+```
+/set plugins.var.python.pi_bridge.auto_clean 24    # hours (fractional values work)
+/set plugins.var.python.pi_bridge.auto_clean 0     # never close anything
+```
+
+- The sweep runs **once an hour**, and once more the moment you `/set` the option
+  (so a `/set` shows its effect at once, no reload, no waiting).
+- Idle time comes from the buffer's **last printed line**. No per-buffer timers and
+  no bookkeeping: a disconnect prints a line, so for a disconnected buffer the idle
+  time is the time since that line.
+- A buffer whose pi connection is **alive** is never closed, however quiet pi is.
+- A buffer is also skipped when it is shown in a window (the bridge prints a hint
+  instead — close the window with `/window merge`), when it is the current buffer,
+  or when its input line holds text.
+- A reaped session id is forgotten. If that pi process is still alive and reconnects,
+  it gets a new session, a new buffer, and no history: auto-clean ends a session.
+- These buffers are **not logged** (`no_log`): a closed buffer cannot be reopened and
+  its content is gone. Set `auto_clean 0` to keep them all.
+
+A session that has neither a connection nor a buffer (closed by hand, or already
+swept) is dropped from the bridge's session list at the next sweep, and a closed
+buffer's name is reusable immediately. If WeeChat stays open longer than the limit,
+the `pi` buffer created at load is closed too; the next pi connection recreates it.
+
 ### Markdown rendering
 
 Assistant text is rendered as markdown, block by block (on by default; see
@@ -393,8 +423,9 @@ Then (re)start or `/reload` the pi session. The buffer on A shows
   gets a `pi:<short cwd>` buffer (numeric suffix on a name collision). A
   reconnected pi process with the same session id reattaches to its buffer
   with history intact; `!cd` / `!new` switches inside pi update the mapping
-  and rename the buffer. Disconnected buffers stay open until you close
-  them.
+  and rename the buffer. A disconnected buffer stays open until
+  `pi_bridge.auto_clean` closes it: 24 idle hours by default, `0` keeps every
+  buffer (see [Idle buffers](#idle-buffers-auto_clean)).
 - Remote traffic is **not encrypted** (token ≠ encryption) — use Tailscale/
   VPN for confidentiality (see [Remote setup](#remote-setup-tcp)).
 - Assistant text is rendered in whole lines (WeeChat has no partial-line redraw);
@@ -445,8 +476,10 @@ The integration test spawns the real Python bridge and drives it with the real
 TypeScript extension over a live socket — both transports (Unix and TCP with
 token auth), no mocks on the wire. `test:real` boots an actual WeeChat, autoloads
 `pi_bridge.py`, and asserts on the lines WeeChat itself stored in the buffer
-(nick tags, nick column, per-nick colors) in both `nicks` modes; it skips when
-`weechat-headless` is not installed.
+(nick tags, nick column, per-nick colors) in both `nicks` modes, after a live
+`/set`, and for markdown. Three more runs drive `pi_bridge.auto_clean` through the
+WeeChat FIFO and assert which buffers WeeChat has left afterwards. `test:real`
+skips when `weechat-headless` is not installed.
 
 ## Threat model (remote/TCP)
 

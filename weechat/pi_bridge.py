@@ -101,6 +101,10 @@ FAIL_WINDOW_S = 60             # …that trigger a lockout
 LOCKOUT_S = 600                # …for this long (silent drop, no oracle)
 MAX_BYTES_PER_EVENT = 256 * 1024  # read budget per client fd event
 USER_INPUT_MAX_PER_S = 5       # buffer lines forwarded to pi per sliding 1 s
+# Idle-buffer cleanup (pi_bridge.auto_clean): how many hours a buffer whose pi
+# connection is gone may print nothing before the sweep closes it. 0 = never.
+AUTO_CLEAN_DEFAULT_HOURS = "24"   # option default (config_set_plugin wants a str)
+AUTO_CLEAN_SWEEP_S = 3600         # sweep interval; hook_timer wants milliseconds
 
 
 def _color(name):
@@ -986,6 +990,12 @@ PLUGIN_OPTIONS = (
      'Render pi’s markdown replies (headings, bold/italic, inline code, lists, '
      'blockquotes, rules) with WeeChat color and attribute codes: on | off. '
      'Blocks are printed when complete, so a paragraph appears at its blank line.'),
+    ("auto_clean", AUTO_CLEAN_DEFAULT_HOURS,
+     'Hours a pi buffer whose pi connection is gone may print nothing before '
+     'auto-clean closes it (default 24; 0 = never close; fractional hours '
+     'accepted). A buffer shown in a window is skipped, and so is one with '
+     'text on its input line. These buffers are not logged, so a closed '
+     'buffer is gone for good. Swept once an hour and on /set.'),
 )
 
 HELP_TEXT = (
@@ -1114,6 +1124,37 @@ def _fmt_elapsed(secs):
     h, m = s // 3600, (s % 3600) // 60
     return ("%dh%dm" % (h, m)) if m else ("%dh" % h)
 
+def _last_line_date(buf):
+    """Epoch date of the newest dated line in `buf`, or None when it has none.
+
+    `buffer_lines` walks oldest to newest, so `infolist_prev` reaches the
+    newest line first. `infolist_time(…, "date")` is epoch seconds on modern
+    WeeChat; lines WeeChat stamps with date 0 (internal lines) are skipped.
+    """
+    infolist = weechat.infolist_get("buffer_lines", buf, "")
+    if not infolist:
+        return None
+    date = None
+    while weechat.infolist_prev(infolist):
+        d = weechat.infolist_time(infolist, "date")
+        if isinstance(d, str):      # WeeChat < 2.2 returned a string
+            d = 0
+        if d:
+            date = d
+            break
+    weechat.infolist_free(infolist)
+    return date
+
+
+def _line_age(now, date):
+    """Age in seconds of a line date, or None when the date is unusable."""
+    if not date or date <= 0:
+        return None
+    if date > 10_000_000_000:       # a future WeeChat reporting milliseconds
+        date //= 1000
+    if date > now:                  # clock jumped forward: treat as just written
+        return 0.0
+    return now - date
 class Session(object):
     """One pi session: a persistent buffer/controller with a replaceable
     connection.
@@ -2163,6 +2204,8 @@ class Bridge(object):
         self.ip_failures = {}         # ip -> [timestamps of auth failures]
         self.ip_lockouts = {}         # ip -> lockout-until (epoch)
         self.tick_hook = None         # 1s hook_timer handle (live counters)
+        self.auto_clean_hook = None   # hourly sweep (pi_bridge.auto_clean)
+        self._sweeping = False        # re-entrancy guard for the sweep
 
     # ------------------------------------------------------- connection state
 
@@ -2266,6 +2309,98 @@ class Bridge(object):
         """Print into every live session buffer (listener-level news)."""
         for session in self.sessions:
             session._print(text)
+
+    # ------------------------------------------------ idle-buffer auto-clean
+
+    def _auto_clean_hours(self):
+        """pi_bridge.auto_clean as float hours; 0.0 means cleanup is off.
+
+        Empty, unparseable, zero, or negative all mean "never close".
+        """
+        try:
+            hours = float(self._opt("auto_clean"))
+        except ValueError:
+            return 0.0
+        return hours if hours > 0 else 0.0
+
+    def _drop_session(self, session):
+        """Remove a Session from every registry, by object identity.
+
+        Nothing here may look a closed buffer pointer up again: after
+        buffer_close() it can already belong to a newer buffer.
+        """
+        try:
+            self.sessions.remove(session)
+        except ValueError:
+            pass
+        self.session_by_buffer = {b: s for b, s in self.session_by_buffer.items()
+                                  if s is not session}
+        self.session_by_id = {i: s for i, s in self.session_by_id.items()
+                              if s is not session}
+        session.pending_ui = None
+        session.tool_nicks = {}
+        session.timing_snapshot = None
+        session.timing_received_at = None
+
+    def sweep_idle_sessions(self):
+        """Close buffers whose pi connection is gone and that printed nothing
+        for pi_bridge.auto_clean hours, then drop their Sessions.
+
+        Returns the number of buffers closed. Called by the hourly timer and
+        by pi_config_cb, both on WeeChat's main thread. It only ever walks
+        Bridge.sessions, so it can never close a buffer the bridge does not own.
+        """
+        if self._sweeping:
+            return 0        # a timer sweep and a /set sweep never overlap
+        hours = self._auto_clean_hours()
+        if not hours:
+            return 0        # auto_clean 0 or garbage: keep every buffer
+        limit = hours * 3600.0
+        closed = 0
+        self._sweeping = True
+        try:
+            for session in list(self.sessions):
+                if session.conn is not None:
+                    continue    # a live pi session keeps its buffer, however quiet
+                buffer = session.buffer if session.alive else None
+                if not buffer:
+                    # No connection and no buffer: it can never render again and
+                    # its lines are already gone (these buffers set no_log).
+                    self._drop_session(session)
+                    continue
+                name = weechat.buffer_get_string(buffer, "name") or "?"
+                age = _line_age(time.time(), _last_line_date(buffer))
+                if age is None or age < limit:
+                    continue    # nothing dated, or young enough to keep
+                if (weechat.buffer_get_string(buffer, "first_window")
+                        or buffer == weechat.current_buffer()):
+                    weechat.prnt("", C_DIM + "pi bridge: %s idle %s but shown "
+                                 "in a window — close the window (/window "
+                                 "merge) to let auto-clean close it%s"
+                                 % (name, _fmt_elapsed(age), R))
+                    continue
+                if weechat.buffer_get_string(buffer, "input"):
+                    continue    # someone is mid-line in that buffer
+                # buffer_close() runs pi_close_cb inside the call, which pops
+                # the buffer map and clears session.buffer/alive. The pointer is
+                # dead when it returns: nothing below may use it again.
+                rc = weechat.buffer_close(buffer)
+                if not rc:
+                    weechat.prnt("", C_ERR + "pi bridge: could not close idle "
+                                 "buffer %s; the next sweep will retry%s"
+                                 % (name, R))
+                    continue
+                # Belt and braces: should the close callback ever fail to run,
+                # the Session must not keep a pointer WeeChat has freed.
+                session.buffer = None
+                session.alive = False
+                self._drop_session(session)
+                closed += 1
+                weechat.prnt("", C_STATUS + "pi bridge: closed idle buffer %s "
+                             "(idle %s)%s" % (name, _fmt_elapsed(age), R))
+        finally:
+            self._sweeping = False
+        return closed
 
     # ------------------------------------------------------------ listeners
 
@@ -2578,13 +2713,27 @@ class Bridge(object):
         if session is None:
             if self.load_session.conn is None:
                 session = self.load_session  # first client takes the load-time buffer
+                if session not in self.sessions:
+                    # the sweep drops a Session that owns no buffer and no
+                    # connection; taking it again puts it back in the list
+                    self.sessions.append(session)
             else:
                 session = Session(self)
                 self.sessions.append(session)
                 session.make_buffer(self.session_name_for(session))
         conn["session"] = session
         session.conn = conn
+        # A Session must own a buffer before anything renders on it: the
+        # load-time Session may have lost its buffer to auto-clean or to a
+        # manual /buffer close, and a new Session's make_buffer may have
+        # failed. handle_reattach() covers a reattach; this covers every path.
+        if not (session.alive and session.buffer):
+            session.make_buffer(self.session_name_for(session))
         if session_id:
+            if session.session_id and session.session_id != session_id:
+                # release the old mapping only if it still points here
+                if self.session_by_id.get(session.session_id) is session:
+                    del self.session_by_id[session.session_id]
             session.session_id = session_id
             self.session_by_id[session_id] = session
         self.clients.append(conn)
@@ -2707,6 +2856,9 @@ class Bridge(object):
         if self.tick_hook:
             weechat.unhook(self.tick_hook)
             self.tick_hook = None
+        if self.auto_clean_hook:
+            weechat.unhook(self.auto_clean_hook)
+            self.auto_clean_hook = None
         try:
             os.unlink(self.sock_path)
         except OSError:
@@ -2774,12 +2926,14 @@ def pi_input_cb(data, buffer, line):
 
 def pi_close_cb(data, buffer):
     session = BRIDGE.session_by_buffer.pop(buffer, None)
-    if session is not None:
-        session.alive = False
-        # drop the native buffer pointer: WeeChat frees the buffer once
-        # this callback returns, so any later buffer_* call with it is a
-        # use-after-free (native crash, not catchable in Python).
+    if session is not None and session.buffer == buffer:
+        # Drop the native buffer pointer: WeeChat frees the buffer once this
+        # callback returns, so any later buffer_* call with it is a
+        # use-after-free (native crash, not catchable in Python). The guard
+        # keeps a duplicate callback for an old pointer from clearing a
+        # buffer the session recreated in the meantime.
         session.buffer = None
+        session.alive = False
     return weechat.WEECHAT_RC_OK
 
 
@@ -2813,12 +2967,18 @@ def pi_tick_cb(data, *args):
         session.tick()
     return weechat.WEECHAT_RC_OK
 
+def pi_auto_clean_cb(data, *args):
+    """Hourly timer: close idle buffers whose pi connection is gone."""
+    BRIDGE.sweep_idle_sessions()
+    return weechat.WEECHAT_RC_OK
+
 
 def pi_config_cb(data, option, *args):
     """Fired on any plugins.var.python.pi_bridge.* option change.
 
     tcp_listen changes rebind the listener live (urlserver.py pattern);
-    token/allowed_ips need no restart — they apply per connection/accept.
+    token/allowed_ips need no restart — they apply per connection/accept;
+    auto_clean runs the idle-buffer sweep at once.
     """
     name = option.rsplit(".", 1)[-1] if option else ""
     if name == "tcp_listen":
@@ -2839,6 +2999,23 @@ def pi_config_cb(data, option, *args):
         # built under the old one, so print it before the switch takes effect
         for session in BRIDGE.sessions:
             session._flush_md_block()
+    if name == "auto_clean":
+        # The feedback rides on the core buffer: printing it into a pi buffer
+        # would stamp a fresh line there and reset the idle age being set.
+        raw = BRIDGE._opt("auto_clean")
+        try:
+            hours = float(raw) if raw else 0.0
+        except ValueError:
+            weechat.prnt("", C_REJECT + "pi bridge: auto_clean %r is not a "
+                         "number of hours — auto-clean is off%s" % (raw, R))
+        else:
+            if hours > 0:
+                weechat.prnt("", C_STATUS + "pi bridge: auto_clean = %g h%s"
+                             % (hours, R))
+            else:
+                weechat.prnt("", C_STATUS + "pi bridge: auto_clean off — pi "
+                             "buffers are kept%s" % R)
+        BRIDGE.sweep_idle_sessions()   # immediate effect, no reload needed
     if name in ("tcp_listen", "token"):
         BRIDGE.config_warnings()
     return weechat.WEECHAT_RC_OK
@@ -2870,7 +3047,7 @@ def pi_shutdown_cb():
 
 def main():
     dbg("main(): loading (sock=%s, debug=%s)" % (default_socket_path(), bool(_DBG_PATH)))
-    weechat.register("pi_bridge", "simeng", "0.7.0", "MIT",
+    weechat.register("pi_bridge", "simeng", "0.8.0", "MIT",
                      "mirror a pi coding agent session through a WeeChat buffer",
                      "pi_shutdown_cb", "")
     # plugin options: PLUGIN_OPTIONS = (name, default, description).
@@ -2885,6 +3062,10 @@ def main():
     BRIDGE.make_buffer()
     # 1s tick timer: refresh the buffer-title turn counter while a request runs
     BRIDGE.tick_hook = weechat.hook_timer(1000, 0, 0, "pi_tick_cb", "")
+    # hourly sweep: close a buffer whose pi connection is gone and that printed
+    # nothing for pi_bridge.auto_clean hours (0 disables auto-clean entirely)
+    BRIDGE.auto_clean_hook = weechat.hook_timer(AUTO_CLEAN_SWEEP_S * 1000, 0, 0,
+                                                "pi_auto_clean_cb", "")
     try:
         BRIDGE.make_unix_server()
     except OSError as err:

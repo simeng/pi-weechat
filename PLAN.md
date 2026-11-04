@@ -183,6 +183,10 @@ Design:
   rejected with `error{code: "session_id_in_use"}`. Up to 3 in-flight
   handshakes are held, then closed silently. Client fds are non-blocking in
   both transports, with the shared `rxbuff` + write-hook backpressure model.
+  Every Session picked by a hello is guaranteed a buffer before it renders: one
+  that auto-clean or a manual `/buffer close` removed is recreated by the next
+  hello, and a hello whose id differs from the Session's current one updates the
+  reattach mapping only while that mapping still points to the same Session.
 - **Reader:** accumulate in a buffer, split on `\n`, JSON-parse each line,
   dispatch on `type`. Partial reads wait for more data (return `RC_OK`).
 - **Writer:** `sendall()` is safe enough at these volumes; if the socket ever
@@ -295,6 +299,27 @@ Design:
   `agent_start`; Pi UI prompt events pause both clocks on runtimes that emit them,
   WeeChat `!pick` waits always pause, and tool execution counts as turn time.
 - **Cleanup:** on close callback / WeeChat quit, unhook fd, unlink socket file.
+- **Idle-buffer sweep (`pi_bridge.auto_clean`, default 24 hours):**
+  `Bridge.sweep_idle_sessions()` runs once an hour on a single `hook_timer`
+  (`pi_auto_clean_cb`) and once on every `/set` of the option (`pi_config_cb`),
+  both on WeeChat's main thread, with `Bridge._sweeping` blocking any overlap.
+  It walks a copy of `Bridge.sessions` and closes a buffer whose connection is
+  gone and whose newest printed line is older than `auto_clean` hours. That date
+  comes from `_last_line_date(buffer)` — the `buffer_lines` infolist walked with
+  `infolist_prev` (newest line first), `infolist_time(…, "date")` in epoch
+  seconds, date-0 lines skipped — and `_line_age(now, date)` turns it into
+  seconds (missing/zero date → no age, implausibly large value read as
+  milliseconds, future date read as just printed). Sessions holding a live
+  connection are never touched, and neither is a buffer shown in a window
+  (`first_window` / `current_buffer()`, hint printed instead), the current
+  buffer, or a buffer with text on its input line. `buffer_close()` fires
+  `pi_close_cb` inside the call, so the pointer is dead when it returns: the
+  teardown drops the Session from `sessions`, `session_by_buffer`, and
+  `session_by_id` **by object identity**, and the notice is printed to the core
+  buffer, never to the closed one. A session with neither a connection nor a
+  buffer is dropped from the registries, and a closed buffer's name is reusable
+  at once. A reaped `sessionId` is forgotten, so a reconnect under it starts a
+  new session with a new buffer.
 
 ## 4. Pi side — `extensions/weechat-bridge.ts` (pi package)
 
@@ -413,6 +438,7 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 | `pi_bridge.highlight` | WeeChat option (`/set plugins.var.python.pi_bridge.highlight on\|off`, or `!highlight <mode>` in the buffer) — syntax highlighting of fenced code blocks in assistant messages | `on` |
 | `pi_bridge.nicks` | WeeChat option (`/set plugins.var.python.pi_bridge.nicks auto\|pi`, or `!nick <mode>` in the buffer) — `auto`: nick column names the tool on tool lines, `think` on thinking lines, `pi` on replies; `pi`: every pi-side line under the single nick `pi` | `auto` |
 | `pi_bridge.markdown` | WeeChat option (`/set plugins.var.python.pi_bridge.markdown on\|off`, or `!markdown <mode>` in the buffer) — block-level markdown rendering of assistant text (headings, emphasis, inline code, lists, quotes, rules, table grids) | `on` |
+| `pi_bridge.auto_clean` | WeeChat option (`/set plugins.var.python.pi_bridge.auto_clean <hours>`; `0` = disabled) — how many hours a buffer whose pi connection is gone may print nothing before `Bridge.sweep_idle_sessions()` closes it. Idle age is the buffer's last printed line date; the sweep runs on one hourly `hook_timer` and once per `/set` of the option; a buffer with a live connection, shown in a window, current, or holding input text is skipped | `24` |
 | `irc.server_default.nicks` | WeeChat IRC option (read-only for the bridge): first non-empty entry = the user's nick for the `nick!me` prefix column; re-applied live via `hook_config`, no reload | the IRC plugin's `nicks` default |
 | `PI_WEECHAT_URL`     | pi extension env: `tcp://host:port` / `unix://<path>` / `host:port` / path | unset ⇒ config-file `url` ⇒ `PI_WEECHAT_SOCK` (deprecated) ⇒ default unix path |
 | `PI_WEECHAT_TOKEN`   | pi extension env: shared secret for the challenge (never in the URL) | unset (anonymous) ⇒ config-file `token` |
