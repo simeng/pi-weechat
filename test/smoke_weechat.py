@@ -62,6 +62,13 @@ class WeechatStub:
         self.conf = {"irc.server_default.nicks": "alice,alice2"}  # global opts
         self.printf_tags = []     # [(tags, prefix, body)] from prnt_date_tags
         self.localvars = {}       # buffer localvars (localvar_set_*)
+        self.buf_lines = {}       # buffer pointer -> [[date, text]], oldest first
+        self.buf_close_cbs = {}   # buffer pointer -> close callback name
+        self.buf_displayed = set()  # buffers treated as "shown in a window"
+        self.buf_input = {}       # buffer pointer -> text on its input line
+        self.current_buf = None   # what current_buffer() answers
+        self.infolists = {}       # infolist handle -> {lines, pos, cur}
+        self._infolist_seq = 0
 
     # -- colors / plugin options -----------------------------------------
     def color(self, name):
@@ -144,6 +151,8 @@ class WeechatStub:
         self.buffer_name = name
         self.buf_names[buf] = name
         self.buf_prints[buf] = []
+        self.buf_lines[buf] = []
+        self.buf_close_cbs[buf] = close_cb
         self.input_cb_name = input_cb
         return buf
 
@@ -161,9 +170,18 @@ class WeechatStub:
         return 1
 
     def buffer_close(self, buf):
+        # Real WeeChat fires the buffer's own close callback INSIDE this call
+        # and frees the buffer when it returns: every later buffer_*/prnt*
+        # with that pointer is a use-after-free, which _note_stale records.
+        cb = self.buf_close_cbs.pop(buf, None)
+        if cb:
+            self.ns[cb]("", buf)
         self.closed_bufs.add(buf)
         self.buf_names.pop(buf, None)
         self.buf_prints.pop(buf, None)
+        self.buf_lines.pop(buf, None)
+        self.buf_displayed.discard(buf)
+        self.buf_input.pop(buf, None)
         return 1
 
     def _note_stale(self, func, buf, prop):
@@ -181,12 +199,17 @@ class WeechatStub:
             return ""
         if prop in ("name", "short_name"):
             return self.buf_names.get(buf, "")
+        if prop == "input":
+            return self.buf_input.get(buf, "")
+        if prop == "first_window":
+            return "window1" if buf in self.buf_displayed else ""
         return ""
 
     def prnt(self, buf, msg):
         self._note_stale("prnt", buf, None)
         self.prints.append(("PRINT", msg))
         self.buf_prints.setdefault(buf, []).append(msg)
+        self.buf_lines.setdefault(buf, []).append([time.time(), msg])
 
     def prnt_date_tags(self, buf, date, tags, message):
         self._note_stale("prnt_date_tags", buf, None)
@@ -198,8 +221,75 @@ class WeechatStub:
             prefix, body = "", message
         self.prints.append(("PRINTF", body))
         self.buf_prints.setdefault(buf, []).append(message)
+        # date 0 means "now", like the real API
+        self.buf_lines.setdefault(buf, []).append([date or time.time(), message])
         self.printf_tags.append((tags, prefix, body))
         return 1
+
+    # -- buffer_lines infolist (auto-clean reads the newest line's date) --
+    def infolist_get(self, name, target, args):
+        self._note_stale("infolist_get", target, name)
+        if name != "buffer_lines":
+            return None
+        self._infolist_seq += 1
+        handle = "infolist-%d" % self._infolist_seq
+        # Like the real API: the lines are copied out, so a print that happens
+        # after infolist_get does not move this handle's cursor.
+        self.infolists[handle] = {"lines": [list(row) for row
+                                            in self.buf_lines.get(target, [])],
+                                  "pos": None, "cur": None}
+        return handle
+
+    def infolist_prev(self, infolist):
+        # WeeChat starts positioned before the first entry, so the first
+        # prev() lands on the newest line.
+        info = self.infolists.get(infolist)
+        if not info or not info["lines"]:
+            return 0
+        if info["pos"] is None:
+            info["pos"] = len(info["lines"]) - 1
+        elif info["pos"] > 0:
+            info["pos"] -= 1
+        else:
+            return 0
+        info["cur"] = info["lines"][info["pos"]]
+        return 1
+
+    def infolist_time(self, infolist, key):
+        info = self.infolists.get(infolist)
+        if not info or info["cur"] is None or key != "date":
+            return 0
+        return info["cur"][0]
+
+    def infolist_free(self, infolist):
+        self.infolists.pop(infolist, None)
+        return 1
+
+    # -- test knobs: windows, input line, line dates ----------------------
+    def show_in_window(self, buf):
+        self.buf_displayed.add(buf)
+
+    def hide_from_window(self, buf):
+        self.buf_displayed.discard(buf)
+
+    def set_input_line(self, buf, text):
+        self.buf_input[buf] = text
+
+    def current_buffer(self):
+        return self.current_buf
+
+    def age_buffer(self, buf, seconds):
+        """Move every stored line of `buf` `seconds` into the past."""
+        for row in self.buf_lines.get(buf, []):
+            row[0] -= seconds
+
+    def newest_line_date(self, buf):
+        rows = self.buf_lines.get(buf, [])
+        return rows[-1][0] if rows else None
+
+    def reset_stale_calls(self):
+        """Forget recorded use-after-free calls, for per-phase assertions."""
+        self.stale_calls = []
 
     # -- hooks -----------------------------------------------------------
     def hook_fd(self, fd, fr, fw, fe, cb, data):
@@ -381,9 +471,13 @@ def main():
     assert stub.plugin_opts.get("token") == "", "token defaults empty"
     assert stub.plugin_opts.get("allowed_ips") == "", "allowed_ips defaults empty"
     assert stub.plugin_opts.get("tool_output") == "summary", "tool_output defaults summary"
+    assert stub.plugin_opts.get("auto_clean") == ns["AUTO_CLEAN_DEFAULT_HOURS"] == "24", \
+        "auto_clean defaults to 24 hours (cleanup on)"
+    assert any(t["cb"] == "pi_auto_clean_cb" for t in stub.timers.values()), \
+        "main() hooks the hourly auto-clean sweep"
     # help descriptions registered for every plugin option (/help set …)
     for name in ("tcp_listen", "token", "allowed_ips",
-                "tool_output", "thinking", "highlight"):
+                "tool_output", "thinking", "highlight", "auto_clean"):
         assert name in stub.plugin_descs, "missing description for %s" % name
         assert stub.plugin_descs[name], "empty description for %s" % name
     assert stub.localvars.get("nick") == "alice", \
@@ -2399,6 +2493,212 @@ def main():
         cl.close()
     stub.pump(0.3)
     assert BRIDGE.clients == []
+    assert stub.stale_calls == [], "stale (closed-buffer) API calls: %s" % stub.stale_calls
+    # ==================================================================
+    # Phase N — auto_clean: close a buffer whose pi connection is gone and
+    # that printed nothing for pi_bridge.auto_clean hours (default 24)
+    # ==================================================================
+    stub.reset_stale_calls()
+    assert ns["AUTO_CLEAN_SWEEP_S"] == 3600, "the sweep runs once an hour"
+    # Phase M3 left every client closed. `other` is the session whose buffer a
+    # user closed by hand: no buffer, no connection → the sweep drops the Session.
+    assert other.alive is False and other.buffer is None
+    assert other in BRIDGE.sessions
+    assert BRIDGE.sweep_idle_sessions() == 0, "no buffer is old enough yet"
+    assert other not in BRIDGE.sessions, "hand-closed session dropped by the sweep"
+    assert all(v is not other for v in BRIDGE.session_by_buffer.values())
+    assert all(v is not other for v in BRIDGE.session_by_id.values())
+
+    def n_client(session_id, cwd):
+        cl = unix_client()
+        assert client_hello(cl, session_id=session_id)["type"] == "hello"
+        cl.sendall((json.dumps({"type": "session_info", "sessionId": session_id,
+                                "cwd": cwd}) + "\n").encode())
+        stub.pump(0.2)
+        return cl, BRIDGE.session_by_id[session_id]
+
+    live_cl, live = n_client("sid-live", "/home/x/live")
+    aged_cl, aged = n_client("sid-aged", "/home/x/aged")
+    young_cl, young = n_client("sid-young", "/home/x/young")
+    window_cl, window = n_client("sid-window", "/home/x/window")
+    current_cl, current = n_client("sid-current", "/home/x/current")
+    typed_cl, typed = n_client("sid-typed", "/home/x/typed")
+    assert live is BRIDGE.load_session, "the first client takes the load-time session"
+    assert stub.buf_names[live.buffer] == "pi"
+    aged_name, aged_buf = stub.buf_names[aged.buffer], aged.buffer
+
+    # Only `live` keeps its connection; each disconnect prints one line.
+    for cl in (aged_cl, young_cl, window_cl, current_cl, typed_cl):
+        cl.close()
+    stub.pump(0.4)
+    assert all(s.conn is None for s in (aged, young, window, current, typed))
+    assert live.conn is not None
+
+    # Idle age comes from the buffer's newest line date: rewrite those dates
+    # instead of sleeping. Guards are set the way WeeChat reports them.
+    stub.age_buffer(aged.buffer, 25 * 3600)
+    stub.age_buffer(young.buffer, 23 * 3600)
+    stub.age_buffer(window.buffer, 25 * 3600)
+    stub.age_buffer(current.buffer, 25 * 3600)
+    stub.age_buffer(typed.buffer, 25 * 3600)
+    stub.age_buffer(live.buffer, 30 * 3600)      # old and quiet, but still connected
+    stub.show_in_window(window.buffer)           # buffer_get_string → first_window
+    stub.current_buf = current.buffer            # current_buffer()
+    stub.set_input_line(typed.buffer, "half a line")
+
+    assert BRIDGE.sweep_idle_sessions() == 1, "only the plain aged buffer closes"
+    assert aged.alive is False and aged.buffer is None
+    assert aged not in BRIDGE.sessions, "closed session dropped from the registry"
+    assert all(v is not aged for v in BRIDGE.session_by_buffer.values())
+    assert "sid-aged" not in BRIDGE.session_by_id, "a reaped id is forgotten"
+    assert aged_buf not in stub.buf_names, "the closed buffer's name is released"
+    assert stub.buf_prints.get(aged_buf) is None
+    notice = [t for k, t in stub.prints if "closed idle buffer" in t]
+    assert len(notice) == 1 and aged_name in notice[0] and "idle 25h" in notice[0], notice
+    # 23 h under the 24 h limit, a live connection, a window, the current
+    # buffer, and text on the input line all keep their buffers.
+    assert young.buffer is not None, "23 h is under the 24 h limit"
+    assert window.buffer is not None, "a buffer shown in a window is never closed"
+    assert current.buffer is not None, "the buffer in the current window is kept"
+    assert typed.buffer is not None, "text on the input line keeps the buffer"
+    assert live.buffer is not None and live.alive, "a live pi session keeps its buffer"
+    hints = [t for k, t in stub.prints if "shown in a window" in t]
+    assert len(hints) == 2 and any("/home/x/window" in t for t in hints), hints
+    assert stub.stale_calls == [], "stale (closed-buffer) API calls: %s" % stub.stale_calls
+
+    # The id the sweep reaped now starts a NEW session (no history), and its
+    # buffer takes the name the sweep released.
+    reborn_cl, reborn = n_client("sid-aged", "/home/x/aged")
+    assert reborn is not aged, "a reaped session id does not reattach"
+    assert reborn.buffer != aged_buf
+    assert stub.buf_names[reborn.buffer] == aged_name, "a freed name is reusable"
+
+    # Release the guards: the next hourly pass closes all three.
+    stub.hide_from_window(window.buffer)
+    stub.current_buf = None
+    stub.set_input_line(typed.buffer, "")
+    assert BRIDGE.sweep_idle_sessions() == 3, "unguarded idle buffers close"
+    assert all(s.buffer is None for s in (window, current, typed))
+
+    # A quiet buffer closes when it crosses the limit, not before.
+    stub.age_buffer(young.buffer, 2 * 3600)      # 23 h → 25 h
+    assert BRIDGE.sweep_idle_sessions() == 1
+    assert young.buffer is None and young not in BRIDGE.sessions
+
+    # The load-time `pi` buffer ages from WeeChat's start; a later hello must
+    # give that Session a buffer again instead of dropping its output.
+    live_cl.close()
+    stub.pump(0.4)
+    # The disconnect line is now the newest line, so it is what gets aged.
+    stub.age_buffer(live.buffer, 25 * 3600)
+    assert BRIDGE.sweep_idle_sessions() == 1
+    assert live.buffer is None and live not in BRIDGE.sessions, "the pi buffer was reaped"
+    load_cl, back = n_client("sid-load", "/home/x/load")
+    assert back is BRIDGE.load_session is live, "the load-time Session is reused"
+    assert back in BRIDGE.sessions, "and put back in the session list"
+    assert back.alive and back.buffer and stub.buf_names[back.buffer] == "pi", \
+        "_handle_hello recreated the buffer"
+    load_cl.sendall((json.dumps({"type": "assistant_line", "msgId": 1,
+                                 "text": "renders again"}) + "\n").encode())
+    load_cl.sendall((json.dumps({"type": "assistant_flush", "msgId": 1}) + "\n").encode())
+    stub.pump(0.3)
+    assert any("renders again" in m for m in stub.buf_prints[back.buffer]), \
+        "the recreated buffer renders"
+
+    # auto_clean 0 and a garbage value: nothing closes, and /set says why.
+    reborn_cl.close()
+    stub.pump(0.4)
+    stub.age_buffer(reborn.buffer, 25 * 3600)
+    stub.config_set_plugin("auto_clean", "0")
+    assert any("auto_clean off" in t for k, t in stub.prints), stub.prints[-3:]
+    assert BRIDGE.sweep_idle_sessions() == 0 and reborn.buffer is not None, \
+        "auto_clean 0 keeps every buffer"
+    stub.config_set_plugin("auto_clean", "abc")
+    assert any("not a number of hours" in t for k, t in stub.prints), stub.prints[-3:]
+    assert BRIDGE.sweep_idle_sessions() == 0 and reborn.buffer is not None, \
+        "a garbage value behaves as disabled"
+    # A valid /set sweeps at once — no reload, no waiting for the timer.
+    mark = len(stub.prints)
+    stub.config_set_plugin("auto_clean", "24")
+    assert reborn.buffer is None and reborn not in BRIDGE.sessions, \
+        "the /set sweep closed it immediately"
+    assert any("closed idle buffer" in t for k, t in stub.prints[mark:])
+
+    # A bad value must not leave an earlier threshold in force. A buffer that
+    # died later survives the next sweep and the hourly timer, and closes only
+    # when a usable value returns.
+    stale_cl, stale_s = n_client("sid-stale", "/home/x/stale")
+    stale_cl.close()
+    stub.pump(0.4)
+    stub.age_buffer(stale_s.buffer, 25 * 3600)
+    stub.config_set_plugin("auto_clean", "abc")
+    assert BRIDGE.sweep_idle_sessions() == 0 and stale_s.buffer is not None, \
+        "a garbage value closes nothing, not even a newer idle buffer"
+    ns["pi_auto_clean_cb"]("")
+    assert stale_s.buffer is not None, "the hourly timer sweep keeps it too"
+    stub.config_set_plugin("auto_clean", "0.001")
+    assert stale_s.buffer is None and stale_s not in BRIDGE.sessions, \
+        "a usable value closes it at once"
+
+    # A close WeeChat refuses changes nothing and warns; the next sweep retries.
+    refused_cl, refused = n_client("sid-refused", "/home/x/refused")
+    refused_cl.close()
+    stub.pump(0.4)
+    stub.age_buffer(refused.buffer, 25 * 3600)
+    real_close = stub.buffer_close
+    stub.buffer_close = lambda buf: 0
+    assert BRIDGE.sweep_idle_sessions() == 0, "a refused close closes nothing"
+    stub.buffer_close = real_close
+    assert any("could not close idle buffer" in t for k, t in stub.prints), stub.prints[-3:]
+    assert refused.buffer is not None and refused.alive and refused in BRIDGE.sessions, \
+        "nothing was torn down after a refused close"
+    assert BRIDGE.sweep_idle_sessions() == 1, "the next sweep retries and succeeds"
+    assert refused.buffer is None and refused not in BRIDGE.sessions
+
+    # A sweep started inside a sweep (a /set landing mid-close) does nothing.
+    nested_cl, nested_s = n_client("sid-nested", "/home/x/nested")
+    nested_cl.close()
+    stub.pump(0.4)
+    stub.age_buffer(nested_s.buffer, 25 * 3600)
+    nested_results = []
+
+    def close_with_nested(buf):
+        nested_results.append(BRIDGE.sweep_idle_sessions())   # re-entrant call
+        return real_close(buf)
+
+    stub.buffer_close = close_with_nested
+    assert BRIDGE.sweep_idle_sessions() == 1
+    stub.buffer_close = real_close
+    assert nested_results == [0], "the re-entrancy guard blocked the nested sweep"
+    assert nested_s.buffer is None and nested_s not in BRIDGE.sessions
+    assert BRIDGE._sweeping is False, "the guard is cleared even after a nested call"
+
+    # Date handling, straight through the stub's buffer_lines infolist.
+    now = time.time()
+    assert ns["_line_age"](now, None) is None and ns["_line_age"](now, 0) is None
+    assert ns["_line_age"](now, now + 500) == 0.0, "a future date reads as just printed"
+    assert abs(ns["_line_age"](now, now - 3600) - 3600) < 1
+    assert abs(ns["_line_age"](now, int((now - 3600) * 1000)) - 3600) < 5, \
+        "a millisecond-sized date is read as milliseconds"
+    probe = stub.buffer_new("empty-probe", "pi_input_cb", "", "pi_close_cb", "")
+    assert ns["_last_line_date"](probe) is None, "an empty buffer has no age"
+    zero = stub.buffer_new("zerodate-probe", "pi_input_cb", "", "pi_close_cb", "")
+    stub.buf_lines[zero] = [[now - 30 * 3600, "old"], [0, "internal"]]
+    assert ns["_last_line_date"](zero) == now - 30 * 3600, "date-0 lines are skipped"
+    # A Session whose buffer holds no dated line is kept: age 0 would be a guess.
+    quiet = ns["Session"](BRIDGE)
+    BRIDGE.sessions.append(quiet)
+    quiet.make_buffer("undated-probe")
+    stub.buf_lines[quiet.buffer] = [[0, "no real date"]]
+    assert BRIDGE.sweep_idle_sessions() == 0, "an undated buffer is never closed"
+    assert quiet in BRIDGE.sessions and quiet.buffer is not None
+
+    # main() hooked the hourly sweep; cleanup() must unhook it.
+    assert any(t["cb"] == "pi_auto_clean_cb" for t in stub.timers.values()), stub.timers
+    ns["BRIDGE"].cleanup()
+    assert not any(t["cb"] == "pi_auto_clean_cb" for t in stub.timers.values()), \
+        "cleanup() unhooks the auto-clean timer"
+    assert ns["BRIDGE"].auto_clean_hook is None
     assert stub.stale_calls == [], "stale (closed-buffer) API calls: %s" % stub.stale_calls
 
     print("smoke weechat: OK (%d buffer lines rendered)" % len(stub.prints))
