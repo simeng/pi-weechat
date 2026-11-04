@@ -49,10 +49,10 @@ def on_print(*args):
             f.write(json.dumps({
                 "buffer": buffer,
                 "tags": args[3] or "",
-                "prefix": weechat.string_remove_color(args[6], ""),
-                "prefix_raw": args[6] or "",
-                "message": weechat.string_remove_color(args[7], ""),
-                "message_raw": args[7] or "",
+                "prefix": weechat.string_remove_color(args[-2], "") if len(args) >= 8 else "",
+                "prefix_raw": args[-2] if len(args) >= 8 else "",
+                "message": weechat.string_remove_color(args[-1], ""),
+                "message_raw": args[-1] or "",
             }) + "\\n")
     except OSError:
         pass
@@ -297,6 +297,15 @@ def main() -> int:
             "> quoted line",
             ">> nested quote",
             "",
+            "| file | size |",
+            "|:---|---:|",
+            "| main.c | 12 KiB | extra |",
+            "| 中文 | 1 |",
+            "",
+            "> | a | b |",
+            "> |:--|--:|",
+            "> | 1 | 2 |",
+            "",
             "---",
             "## Heading with `code` and **bold**",
             "A long paragraph line " * 12,
@@ -357,6 +366,33 @@ def main() -> int:
         results.append(check("blockquote gets a bar, a nested quote gets two",
                              len(quote) == 1 and quote[0]["message"].startswith("\u2502 ")
                              and len(nested) == 1 and nested[0]["message"].startswith("\u2502 \u2502 ")))
+        grid_top = [r for r in pi if r["message"].startswith("\u250c")]
+        grid_rule = [r for r in pi if r["message"].startswith("\u251c")]
+        grid_bot = [r for r in pi if r["message"].startswith("\u2514")]
+        grid_head = [r for r in pi if r["message"].startswith("\u2502 ") and "file" in r["message"]]
+        grid_row = [r for r in pi if r["message"].startswith("\u2502 ") and "main.c" in r["message"]]
+        grid_cjk = [r for r in pi if r["message"].startswith("\u2502 ") and "中文" in r["message"]]
+        quoted_grid = [r for r in pi if r["message"].startswith("\u2502 \u250c")]
+        results.append(check("table renders as a grid: frame, one rule under the header, rows",
+                             len(grid_top) == 1 and len(grid_rule) == 1 and len(grid_bot) == 1
+                             and len(grid_head) == 1 and len(grid_row) == 1))
+        results.append(check("the rule's joints and the rows' bars agree: columns are aligned",
+                             len(grid_top) == 1 and len(grid_head) == 1 and len(grid_cjk) == 1
+                             and grid_top[0]["message"].count("\u252c") + 2 ==
+                             grid_head[0]["message"].count("\u2502") ==
+                             grid_cjk[0]["message"].count("\u2502")))
+        results.append(check("the header row is bold and the frame is dim in the stored line",
+                             len(grid_head) == 1 and "\x1a\x01" in grid_head[0]["message_raw"]
+                             and len(grid_top) == 1 and "\x1a\x06" in grid_top[0]["message_raw"]))
+        results.append(check("a row wider than the header is truncated to its columns",
+                             len(grid_row) == 1 and "extra" not in grid_row[0]["message"]))
+        results.append(check("a table inside a quote keeps its grid behind the quote bar",
+                             len(quoted_grid) == 1
+                             and quoted_grid[0]["message"].startswith("\u2502 \u250c")))
+        results.append(check("the source rows are not printed next to the grid",
+                             not any("| main.c | 12 KiB" in r["message"] for r in pi)))
+        results.append(check("grid lines keep the pi nick prefix",
+                             all(has_nick(r, "pi") for r in grid_top + grid_head + grid_row)))
         results.append(check("horizontal rule renders as a box-drawing line", len(rules) == 1))
         results.append(check("a long line stays one buffer line (client wraps it, not the bridge)",
                              len(long) == 1 and len(long[0]["message"]) > 200))

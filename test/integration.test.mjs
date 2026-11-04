@@ -832,8 +832,8 @@ test("integration: assistant markdown renders through the real extension", async
   );
 
   // the stub weechat module maps colors to single letters and attributes to
-  // real control codes: M=magenta, E=yellow, BOLD/UNDER are raw \x1a codes
-  const BOLD = "\x1a\x01", UNDER = "\x1a\x04", R = "0";
+  // real control codes: M=magenta, E=yellow, BOLD/UNDER/reset are raw codes
+  const BOLD = "\x1a\x01", UNDER = "\x1a\x04", R = "\x1c";
 
   await mock.fire("agent_start");
   await mock.fire("message_start", { message: { role: "assistant" } });
@@ -892,6 +892,40 @@ test("integration: assistant markdown renders through the real extension", async
   assert.ok(wc.lines.indexOf(h2) < wc.lines.indexOf(tool), "heading prints before the tool line");
   assert.ok(wc.lines.indexOf(tool) < wc.lines.indexOf(after), "tool line before the following paragraph");
 
+  // a table: buffered while it streams, then one aligned grid
+  const DIM = "\x1a\x06";
+  await mock.fire("message_start", { message: { role: "assistant" } });
+  for (const delta of ["| a | b |\n", "|---|---|\n", "| 1 | 22 |\n"]) {
+    await mock.fire("message_update", {
+      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta },
+    });
+  }
+  await mock.fire("message_update", { assistantMessageEvent: { type: "text_end", contentIndex: 0 } });
+  await mock.fire("message_end", { message: { role: "assistant" } });
+
+  const top = await wc.waitFor(
+    (m) => m.type === "print" && (m.text || "").startsWith(DIM + "┌"),
+    "the table's top rule"
+  );
+  const headRow = await wc.waitFor(
+    (m) => m.type === "print" && (m.text || "").startsWith(DIM + "│") && (m.text || "").includes(BOLD + "a"),
+    "the header row, bold"
+  );
+  const bodyRow = await wc.waitFor(
+    (m) => m.type === "print" && (m.text || "").startsWith(DIM + "│") && (m.text || "").includes("22") &&
+      !(m.text || "").includes(BOLD),
+    "a body row, not bold"
+  );
+  assert.ok(wc.lines.indexOf(top) < wc.lines.indexOf(headRow) &&
+            wc.lines.indexOf(headRow) < wc.lines.indexOf(bodyRow), "grid lines in order");
+  assert.ok(wc.lines.indexOf(top) > wc.lines.indexOf(after),
+    "the grid prints only once the table is over: the widths need every row");
+  const joints = (top.text.match(/┬/g) || []).length;
+  assert.equal((headRow.text.match(/│/g) || []).length, joints + 2,
+    "header columns line up with the joints of the rule");
+  assert.equal((bodyRow.text.match(/│/g) || []).length, joints + 2, "body columns too");
+  assert.ok(!wc.lines.some((m) => m.type === "print" && (m.text || "").includes("| a | b |")),
+    "the source row is not printed next to the grid");
   // !markdown off: the very same text arrives with its markers
   wc.send({ op: "input", text: "!markdown off" });
   await wc.waitFor(

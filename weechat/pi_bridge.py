@@ -53,6 +53,7 @@ import re
 import secrets
 import socket
 import time
+import unicodedata
 
 try:
     import weechat
@@ -413,6 +414,7 @@ MD_BLOCK_QUOTE = "quote"
 MD_BLOCK_HEADING = "heading"
 MD_BLOCK_HR = "hr"
 MD_BLOCK_SETEXT = "setext"
+MD_BLOCK_TABLE = "table"
 
 
 def _md_block_kind(line):
@@ -516,6 +518,133 @@ def _md_list_items(lines):
             items.append(("", line))
     return items
 
+
+# Tables (GitHub-flavored): a header row with at least one unescaped | followed by a
+# delimiter row of dash cells; the colon placement in a delimiter cell sets that
+# column's alignment. A table cannot be laid out before its last row arrives (the
+# column widths come from every cell), so it is buffered like the other blocks
+# (see _print_assistant) — with caps, so a runaway table cannot stall the buffer.
+MD_TABLE_ALIGN_RE = re.compile(r"^:?-+:?$")
+MD_TABLE_LEFT = "left"
+MD_TABLE_RIGHT = "right"
+MD_TABLE_CENTER = "center"
+MD_TABLE_MAX_ROWS = 200          # rows buffered before the block flushes as plain text
+MD_TABLE_MAX_BYTES = 64 * 1024   # …and the size cap on the same block
+
+
+def _md_split_row(line):
+    """One table line → raw cell texts, inline markdown left untouched.
+
+    Split on a `|` that is neither backslash-escaped nor inside a backtick code span,
+    so `\\|` and `` `a|b` `` stay inside their own cell. Both forms become a literal
+    `|` for display — WeeChat has no escape for it, and the inline renderer would
+    otherwise print the backslash. One leading and one trailing pipe are stripped;
+    both are optional in GFM.
+    """
+    cells = []
+    buf = []
+    i, n = 0, len(line)
+    while i < n:
+        ch = line[i]
+        if ch == "\\" and i + 1 < n:
+            buf.append("|" if line[i + 1] == "|" else ch + line[i + 1])
+            i += 2
+            continue
+        if ch == "`":
+            j = i
+            while j < n and line[j] == "`":
+                j += 1
+            run = line[i:j]
+            close = line.find(run, j)
+            body = line[j:close] if close >= 0 else line[j:]
+            buf.append(run + body.replace("\\|", "|") + (run if close >= 0 else ""))
+            i = close + len(run) if close >= 0 else n
+            continue
+        if ch == "|":
+            cells.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    cells.append("".join(buf))
+    if len(cells) > 1:
+        if not cells[0].strip() and not cells[-1].strip():
+            cells = cells[1:-1]
+        elif not cells[0].strip():
+            cells = cells[1:]
+        elif not cells[-1].strip():
+            cells = cells[:-1]
+    return [c.strip() for c in cells]
+
+
+def _md_table_delimiter(line):
+    """Delimiter row → the column alignments, or None when the line is not one.
+
+    At least one `|` is required: a bare `---` is a horizontal rule (or a setext
+    underline), never a delimiter row.
+    """
+    if "|" not in line:
+        return None
+    cells = _md_split_row(line)
+    if not cells or not all(MD_TABLE_ALIGN_RE.match(c) for c in cells):
+        return None
+    aligns = []
+    for c in cells:
+        left = c.startswith(":")
+        right = c.endswith(":")
+        if left and right:
+            aligns.append(MD_TABLE_CENTER)
+        elif right:
+            aligns.append(MD_TABLE_RIGHT)
+        else:
+            aligns.append(MD_TABLE_LEFT)
+    return aligns
+
+
+def _md_is_table_row(line):
+    """True when a line can belong to a table block.
+
+    Either a delimiter row, or a paragraph line holding at least one unescaped pipe:
+    blank lines, fences, headings, rules, list markers and quotes belong to their own
+    blocks, so they end a table instead of extending it.
+    """
+    if not line.strip() or _fence_open(line) is not None:
+        return False
+    if _md_table_delimiter(line) is not None:
+        return True
+    return _md_block_kind(line) == MD_BLOCK_PARA and len(_md_split_row(line)) > 1
+
+
+# Screen width of a *rendered* string: WeeChat's color and attribute codes cost zero
+# columns, wide chars cost two, and the strikethrough overlay (U+0336) costs none — so
+# len() would misalign every styled cell. weechat.strlen_screen is authoritative; the
+# Python twin below covers contexts outside WeeChat (tests) and codes WeeChat did not
+# resolve ("" for unknown names).
+_STRLEN_SCREEN = getattr(weechat, "strlen_screen", None) if weechat is not None else None
+# WeeChat color codes: "\x19" + 2 (theme/base), 3 (palette, "F11") or 6 ("F@00236")
+# chars; attributes "\x1a" + 1; resets "\x1c" / "\x18". Probed on 4.10.1.
+_MD_CODE_RE = re.compile(r"\x19(?:F@\d{5}|F[0-9a-zA-Z]{2}|[0-9a-zA-Z]{2})|\x1a.|[\x18\x1c]")
+
+
+def _md_disp_width_py(text):
+    """Display columns without WeeChat: strip the codes, then measure by character."""
+    width = 0
+    for ch in _MD_CODE_RE.sub("", text):
+        if unicodedata.category(ch).startswith("M"):   # combining: zero width
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+def _md_disp_width(text):
+    """Display columns a rendered string occupies (WeeChat's own measure if available)."""
+    if _STRLEN_SCREEN is not None:
+        try:
+            return _STRLEN_SCREEN(text)
+        except Exception:
+            pass
+    return _md_disp_width_py(text)
 
 # Inline markdown: emphasis, code, strikethrough. Backslash escapes, and
 # markers that do not open a span stay literal.
@@ -659,6 +788,100 @@ def _md_inline(text, base="", pending=None, lookahead=None, strike=False):
     return "".join(out), None
 
 
+# The table grid. The frame is dim (the same no-color-on-purpose choice as the quote
+# bar) so the structure never competes with prose; header cells are bold in the message
+# color, body cells keep it. One rule under the header, none between rows.
+MD_TABLE_TOP = "\u250c"      # ┌
+MD_TABLE_JOINT = "\u252c"    # ┬
+MD_TABLE_RIGHT_TOP = "\u2510"   # ┐
+MD_TABLE_CROSS_L = "\u251c"  # ├ (not MD_TABLE_LEFT: that is the alignment name)
+MD_TABLE_CROSS = "\u253c"    # ┼
+MD_TABLE_RIGHT_MID = "\u2524"   # ┤
+MD_TABLE_BOTTOM = "\u2514"   # └
+MD_TABLE_JOINT_B = "\u2534"  # ┴
+MD_TABLE_RIGHT_BOT = "\u2518"   # ┘
+MD_TABLE_V = "\u2502"        # │
+MD_TABLE_H = "\u2500"        # ─
+MD_TABLE_STYLE = MD_QUOTE_STYLE
+MD_TABLE_CELL_PAD = 1        # one space each side of a cell, inside the frame
+
+
+def _md_table_rule(widths, left, joint, right):
+    """One horizontal frame line: `─` per column, joined by the corner glyphs."""
+    return left + joint.join(MD_TABLE_H * (w + 2 * MD_TABLE_CELL_PAD)
+                             for w in widths) + right
+
+
+def _md_table_cell(body, measured, width, align):
+    """Pad one already-rendered cell to `width` columns, between two spaces.
+
+    `measured` is the cell's display width without its trailing reset (that code costs
+    nothing on screen, and counting it would make the padding depend on who measures).
+    The padding sits after the reset, so no attribute or background bleeds into the gap,
+    and a `**bold**` cell reserves only the columns it actually displays.
+    """
+    fill = max(0, width - measured)
+    if align == MD_TABLE_RIGHT:
+        body = " " * fill + body
+    elif align == MD_TABLE_CENTER:
+        left = fill // 2
+        body = " " * left + body + " " * (fill - left)
+    else:
+        body = body + " " * fill
+    return " " + body + " "
+
+
+def _md_render_table(lines, cell_base=None):
+    """A complete table block → box-drawing grid lines, or None if it is not one.
+
+    The widths come from every cell, so this can only run once the block is finished.
+    Ragged rows are padded or truncated to the header's column count, and cells render
+    through _md_inline (never through the print path), so styled text costs exactly the
+    columns it displays.
+    """
+    if len(lines) < 2:
+        return None
+    aligns = _md_table_delimiter(lines[1])
+    if not aligns:
+        return None
+    header = _md_split_row(lines[0])
+    cols = len(header)
+    if not cols:
+        return None
+    rows = [header]
+    for line in lines[2:]:
+        row = _md_split_row(line)
+        rows.append((row + [""] * cols)[:cols])   # ragged rows follow the header
+    # cells are rendered first (the header is bold, the body is not), then measured:
+    # a column reserves exactly the widest cell as it will be displayed
+    prepared = []
+    cell_base = C_PI if cell_base is None else cell_base
+    head_base = cell_base + A_BOLD
+    for idx, row in enumerate(rows):
+        base = head_base if idx == 0 else cell_base
+        cells = []
+        for text in row:
+            rendered, _open = _md_inline(text, base)
+            styled = base + rendered
+            cells.append((styled + R, _md_disp_width(styled)))
+        prepared.append(cells)
+    widths = [max([cells[i][1] for cells in prepared] + [1]) for i in range(cols)]
+    bar = MD_TABLE_STYLE + MD_TABLE_V + R   # the dim separator at every column boundary
+    out = [MD_TABLE_STYLE + _md_table_rule(widths, MD_TABLE_TOP, MD_TABLE_JOINT,
+                                           MD_TABLE_RIGHT_TOP) + R]
+    for idx, cells in enumerate(prepared):
+        line = [_md_table_cell(body, measured, widths[i],
+                               aligns[i] if i < len(aligns) else MD_TABLE_LEFT)
+                for i, (body, measured) in enumerate(cells)]
+        out.append(bar + bar.join(line) + bar + R)
+        if idx == 0:
+            out.append(MD_TABLE_STYLE + _md_table_rule(widths, MD_TABLE_CROSS_L,
+                                                       MD_TABLE_CROSS,
+                                                       MD_TABLE_RIGHT_MID) + R)
+    out.append(MD_TABLE_STYLE + _md_table_rule(widths, MD_TABLE_BOTTOM,
+                                               MD_TABLE_JOINT_B, MD_TABLE_RIGHT_BOT) + R)
+    return out
+
 # Per-tool summary of tool_start args: the "main content" of each tool's
 # argument struct, in display order (see format_tool_args).
 TOOL_ARG_KEYS = {
@@ -776,7 +999,7 @@ HELP_TEXT = (
     "!think [on|off] show/hide thinking lines (default: off)\n"
     "!highlight [on|off] syntax-highlight fenced code blocks (default: on)\n"
     "!nick [auto|pi] nick column: tool names vs just “pi” (default: auto)\n"
-    "!markdown [on|off] render pi's markdown replies (default: on)\n"
+    "!markdown [on|off] render pi's markdown, tables as grids (default: on)\n"
 )
 
 
@@ -925,6 +1148,7 @@ class Session(object):
         self._md_block = []           # raw lines of the block being built
         self._md_block_type = None    # MD_BLOCK_* while a block is open
         self._md_block_mode = True    # pi_bridge.markdown state when it started
+        self._md_block_bytes = 0      # size of the pending block (table caps, see above)
         self._md_blank_owed = False   # blank separator owed before the NEXT block
         self._md_printing = False     # inside a flush: never flush recursively
         # pending interactive prompt from pi (ui_request); answered via !pick
@@ -1196,6 +1420,43 @@ class Session(object):
             self._print_msg(C_PI + text + R, "pi")
             return
 
+        # A table is only recognisable once its delimiter row arrives, so a one-line
+        # header candidate stays pending and every further line is re-examined until the
+        # construct settles. Nothing prints while it is pending, so relabelling the block
+        # is safe: the header was never rendered as prose.
+        while True:
+            if self._md_block_type == MD_BLOCK_TABLE:
+                if _md_is_table_row(text):
+                    self._md_append_table_row(text)
+                    return
+                self._flush_md_block()   # the table ended; re-handle this line
+            elif (self._md_block_type == MD_BLOCK_PARA and len(self._md_block) == 1 and
+                  _md_table_delimiter(text) is not None):
+                self._md_block_type = MD_BLOCK_TABLE
+                self._md_block.append(text)
+                self._md_block_bytes += len(text)
+                return
+            break
+        self._md_handle_block_line(text)
+
+    def _md_append_table_row(self, text):
+        """Extend an open table block, degrading to plain text past the caps.
+
+        A table is buffered until it ends (the column widths need every cell), so a
+        runaway one must not hold the buffer hostage: past either cap the block is
+        printed exactly as pi wrote it, and the rows that follow keep that plain mode.
+        """
+        if (len(self._md_block) + 1 > MD_TABLE_MAX_ROWS or
+                self._md_block_bytes + len(text) + 1 > MD_TABLE_MAX_BYTES):
+            self._md_block_mode = False       # the rows as pi wrote them, not a grid
+            self._flush_md_block()            # ... of a table nobody asked for
+            self._md_start_block(MD_BLOCK_TABLE, text, mode=False)  # the rest, as text
+            return
+        self._md_block.append(text)
+        self._md_block_bytes += len(text) + 1
+
+    def _md_handle_block_line(self, text):
+        """Route one assistant line into the block being built (no table in progress)."""
         setext = _md_setext_level(text)
         if setext and self._md_block_type == MD_BLOCK_PARA:
             self._md_block.append(text)
@@ -1250,15 +1511,17 @@ class Session(object):
             body = text
         self._print_msg("  " + body, "pi")
 
-    def _md_start_block(self, kind, text):
+    def _md_start_block(self, kind, text, mode=None):
         self._md_block_type = kind
-        self._md_block_mode = self.markdown_enabled()
+        self._md_block_mode = self.markdown_enabled() if mode is None else mode
         self._md_block = [text]
+        self._md_block_bytes = len(text)
 
     def _md_block_done(self):
         """Forget the pending block (it has just been flushed)."""
         self._md_block = []
         self._md_block_type = None
+        self._md_block_bytes = 0
 
     def _flush_md_block(self):
         """Print the pending block. Idempotent, and never re-entrant.
@@ -1319,6 +1582,12 @@ class Session(object):
                 rendered, pending = _md_inline(content, C_PI, pending, rest)
                 out.append(prefix + C_PI + rendered + R)
             return out
+        if kind == MD_BLOCK_TABLE:
+            # classified as one by the streaming state machine; None means the block
+            # never got a real delimiter row, so it prints as prose
+            grid = _md_render_table(lines)
+            if grid is not None:
+                return grid
         return self._render_styled(lines, C_PI)
 
     def _render_quote(self, lines):
@@ -1347,13 +1616,48 @@ class Session(object):
                 body.append((depth, inner))
         while body and not body[-1][1]:
             body.pop()
+        # A table inside a quote keeps its grid: consecutive quoted rows that begin
+        # with a header row plus a delimiter row become one table run.
+        segments = []
+        i = 0
+        while i < len(body):
+            level, text = body[i]
+            if (_md_is_table_row(text) and i + 1 < len(body) and
+                    _md_table_delimiter(body[i + 1][1]) is not None):
+                rows = [text]
+                j = i + 1
+                while j < len(body) and _md_is_table_row(body[j][1]):
+                    rows.append(body[j][1])
+                    j += 1
+                if (len(rows) > MD_TABLE_MAX_ROWS or
+                        sum(len(r) + 1 for r in rows) > MD_TABLE_MAX_BYTES):
+                    # the same degradation the streaming machine applies to a top-level
+                    # table: past the caps, print the rows as they arrived
+                    segments.extend(body[i:j])
+                    i = j
+                    continue
+                grid = _md_render_table(rows, MD_QUOTE_STYLE)
+                if grid is not None:
+                    segments.append((level, grid))
+                    i = j
+                    continue
+            segments.append((level, text))
+            i += 1
         out = []
         pending = None
-        texts = [t for _, t in body]
-        for idx, (level, text) in enumerate(body):
-            rest = "\n".join(texts[idx + 1:]) if idx + 1 < len(texts) else None
-            rendered, pending = _md_inline(text, MD_QUOTE_STYLE, pending, rest)
-            if not text:
+        texts = [s[1] for s in segments if type(s[1]) is str]
+        seen = 0
+        for level, payload in segments:
+            if type(payload) is not str:
+                # a grid interrupts an emphasis span carried across lines
+                pending = None
+                for line in payload:
+                    out.append(MD_QUOTE_BAR * level + line)
+                continue
+            rest = "\n".join(texts[seen + 1:]) if seen + 1 < len(texts) else None
+            seen += 1
+            rendered, pending = _md_inline(payload, MD_QUOTE_STYLE, pending, rest)
+            if not payload:
                 out.append("")           # blank between quoted paragraphs
             else:
                 out.append(MD_QUOTE_BAR * level + MD_QUOTE_STYLE + rendered + R)

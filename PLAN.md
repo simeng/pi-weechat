@@ -244,14 +244,26 @@ Design:
     line tokenizer (ordered regex alternation; block-comment state carried per
     fence). Toggled by `pi_bridge.highlight` (`!highlight`, default on);
     unknown languages render plain but stay indented. Every other line is
-    accumulated into a block (paragraph, list, quote, heading, rule, setext)
-    and printed when the block completes, so the renderer sees the whole
+    accumulated into a block (paragraph, list, quote, heading, rule, setext,
+    table) and printed when the block completes, so the renderer sees the whole
     construct: ATX/setext headings (magenta, tiered by level), bold/italic
     (`**`/`*` with backslash escapes, no in-word emphasis), ~~strikethrough~~
     via a per-character U+0336 combining stroke overlay (no WeeChat attribute
-    exists for it), yellow inline code, bulleted lists (`•`/`◦`/`▪`, hanging continuation), `│`-barred dim
-    quotes, and a fixed 20-column `─` rule (v1 does not query the window
-    width, so nothing is padded and the renderer never hard-wraps). A block
+    exists for it), yellow inline code, bulleted lists (`•`/`◦`/`▪`, hanging
+    continuation), `│`-barred dim quotes, a fixed 20-column `─` rule, and
+    GFM tables as a box-drawing grid (`┌─┬─┐` above, one rule under the header,
+    `│` at every column boundary, columns padded to their widest cell, colon
+    alignment, bold header, dim frame, cells rendered through the inline path,
+    escaped pipes and pipes inside code spans kept). A table inside a quote
+    keeps its grid behind the quote bar; inside a list item it stays text.
+    Column widths come from `weechat.strlen_screen` where the binding exists
+    (otherwise a local east-asian-width measure over the rendered text), so a
+    bold or struck cell reserves only the columns it displays. v1 does not query
+    the window width: nothing is padded to a guess, the renderer never
+    hard-wraps, and WeeChat's own word wrap breaks a grid wider than the window.
+    A table the stream never finishes still prints, as the grid of the rows that
+    made it; past `MD_TABLE_MAX_ROWS`/`MD_TABLE_MAX_BYTES` the block degrades to
+    the text as pi wrote it. A block
     remembers the mode it started under, so a live `!markdown` toggle never
     re-renders text already on screen; with markdown off, lines print as-is.
     Blank-line separators are deferred (printed before the NEXT block, so a
@@ -400,7 +412,7 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
 | `pi_bridge.tool_output` | WeeChat option (`/set plugins.var.python.pi_bridge.tool_output full\|summary\|off`, or `!tools <mode>` in the buffer) | `summary` |
 | `pi_bridge.highlight` | WeeChat option (`/set plugins.var.python.pi_bridge.highlight on\|off`, or `!highlight <mode>` in the buffer) — syntax highlighting of fenced code blocks in assistant messages | `on` |
 | `pi_bridge.nicks` | WeeChat option (`/set plugins.var.python.pi_bridge.nicks auto\|pi`, or `!nick <mode>` in the buffer) — `auto`: nick column names the tool on tool lines, `think` on thinking lines, `pi` on replies; `pi`: every pi-side line under the single nick `pi` | `auto` |
-| `pi_bridge.markdown` | WeeChat option (`/set plugins.var.python.pi_bridge.markdown on\|off`, or `!markdown <mode>` in the buffer) — block-level markdown rendering of assistant text (headings, emphasis, inline code, lists, quotes, rules) | `on` |
+| `pi_bridge.markdown` | WeeChat option (`/set plugins.var.python.pi_bridge.markdown on\|off`, or `!markdown <mode>` in the buffer) — block-level markdown rendering of assistant text (headings, emphasis, inline code, lists, quotes, rules, table grids) | `on` |
 | `irc.server_default.nicks` | WeeChat IRC option (read-only for the bridge): first non-empty entry = the user's nick for the `nick!me` prefix column; re-applied live via `hook_config`, no reload | the IRC plugin's `nicks` default |
 | `PI_WEECHAT_URL`     | pi extension env: `tcp://host:port` / `unix://<path>` / `host:port` / path | unset ⇒ config-file `url` ⇒ `PI_WEECHAT_SOCK` (deprecated) ⇒ default unix path |
 | `PI_WEECHAT_TOKEN`   | pi extension env: shared secret for the challenge (never in the URL) | unset (anonymous) ⇒ config-file `token` |

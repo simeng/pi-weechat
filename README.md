@@ -144,6 +144,17 @@ Assistant text is rendered as markdown, block by block (on by default; see
 - **Horizontal rules** — `---` / `***` / `___` alone on a line draw a fixed
   20-column `─` rule (v1 does not query the window width, so nothing is padded
   to a guessed width; the renderer never hard-wraps long lines).
+- **Tables** — a header row and its `|---|---:|` delimiter row become a
+  box-drawing grid: `┌─┬─┐` above, one rule under the header, `│` at every
+  column boundary, columns padded to their widest cell, alignment from the
+  colons, header bold and frame dim. Cells render their own inline markdown,
+  and a table inside a blockquote keeps its grid behind the quote bar. A grid
+  wider than the window is wrapped by WeeChat itself — the bridge never
+  hard-wraps or clips a cell, so nothing is lost (wrapped rows hang behind the
+  nick column). Relay clients wrap at their own width and may drop the spaces
+  that pad a row, so a grid can look ragged in Glowing Bear. A table inside a
+  list item stays plain text in v1, and `|---|---|` following a multi-line
+  paragraph is prose, not a header row.
 
 Fenced code blocks stream through as before (line by line, syntax-highlighted)
 and are the only assistant construct that never waits. Everything else is
@@ -152,7 +163,7 @@ streams — tool lines, thinking lines, and status lines always cut in at the
 right place, and switching `!markdown` off prints subsequent text exactly as pi
 wrote it (markers included) without re-rendering what is already on screen.
 
-Links, tables, and other constructs pass through as plain text in v1.
+Links and other constructs pass through as plain text in v1.
 
 ### pi-side config (`~/.pi/agent/pi-weechat.json`)
 
