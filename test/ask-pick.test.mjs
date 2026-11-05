@@ -144,7 +144,7 @@ test("integration: ask_user → WeeChat !pick (built-in fallback tool)", async (
   assert.equal(outs.length, 0, "no bridge → tool_call hook falls through");
 
   await mock.fire("session_start");
-  await wc.waitFor((m) => m.type === "print" && m.text.includes("pi connected"), "buffer: pi connected");
+  await wc.waitFor((m) => m.type === "print" && m.text.includes(" has joined "), "buffer: pi joins");
 
   // fallback ask_user registered (none provided by another extension)
   const tool = mock.registeredTools["ask_user"];

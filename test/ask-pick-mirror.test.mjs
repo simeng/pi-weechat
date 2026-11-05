@@ -59,7 +59,7 @@ async function startMirror(t, tag, ctx) {
   const mock = makePiMock(ctx, ["read", "bash", "ask_user_question"]);
   await loadExtension(mock);
   await mock.fire("session_start");
-  await wc.waitFor((m) => m.type === "print" && m.text.includes("pi connected"), "buffer: pi connected");
+  await wc.waitFor((m) => m.type === "print" && m.text.includes(" has joined "), "buffer: pi joins");
   return { mock, wc };
 }
 

@@ -236,9 +236,23 @@ Design:
     and re-applied live on change via `hook_config` (no reload). If that
     option is empty, missing, or the IRC plugin is not loaded, the localvar
     is cleared and user lines fall back to the legacy `> ` marker via
-    `prnt`. System lines (session info, connection state, command status,
-    errors) stay prefix-less (`prnt`). Message body colors are unchanged —
-    only the prefix column moves.
+    `prnt`. System lines (session info, command status, errors) stay
+    prefix-less (`prnt`). Message body colors are unchanged — only the prefix
+    column moves.
+  - **Join / quit lines (connection lifecycle):** an accepted `hello` prints a
+    join line and a closed connection prints a quit line, shaped the way the IRC
+    plugin shapes its own. WeeChat's own `prefix("join")` / `prefix("quit")`
+    (color + `-->` / `<--` + TAB) rides in front of the body in one
+    `prnt_date_tags`, so the line lands in the prefix column instead of the nick
+    column: `pi (~pi@172.16.36.212) has joined #pi:~/proj`. Tags are `irc_join` /
+    `irc_quit`, `nick_pi`, `host_pi@<host>`, `notify_none` — deliberately no
+    `irc_smart_filter`, so WeeChat can never fold these lines away. The hostmask
+    is the real peer address, or `localhost` for the Unix socket. The reason says
+    who closed: `(Client Quit)` when pi hung up, `(Connection reset by peer)` on
+    a socket error, `(Connection closed)` when the bridge dropped a client it
+    still owns. `Bridge.unloading` (set by `cleanup()`) stops the printing while
+    the script unloads, because those buffers are going away. A connection that
+    never authenticated owns no session, so a rejected handshake joins nothing.
   - `assistant_line`: rendered as markdown, block by block
     (`pi_bridge.markdown`, `!markdown`, on by default). Fenced code blocks
     are tracked per message (`msgId`) and stream straight through, line by
@@ -396,9 +410,10 @@ usage (`pi -p` per message or RPC). Guard any `ctx.ui.*` calls behind
   WeeChat's redrawing stays cheap.
 - Tool output > 8 KiB is truncated for display but chunked intact if the
   WeeChat side later requests it (`!tool <id>` → fetch full output; v2).
-- If pi reconnects mid-turn, WeeChat prints a `— reconnected —` separator and
-  pi sends fresh `session_info`, status, and timing snapshots. The Pi-owned
-  elapsed counters continue from Pi's monotonic state and stop when Pi reports
+- If pi reconnects mid-turn, WeeChat prints the quit line for the dead connection
+  and the join line for the reattached one, and pi sends fresh `session_info`,
+  status, and timing snapshots. The Pi-owned elapsed counters continue from
+  Pi's monotonic state and stop when Pi reports
   the run inactive; WeeChat does not extrapolate a stale snapshot while disconnected.
 
 ## 6. Security

@@ -37,7 +37,7 @@ test("integration: abandoned prompt is released with ui_cancel", async (t) => {
   const mock = makePiMock(MOCK_CTX, ["read", "bash"]);
   await loadExtension(mock);
   await mock.fire("session_start");
-  await wc.waitFor((m) => m.type === "print" && m.text.includes("pi connected"), "buffer: pi connected");
+  await wc.waitFor((m) => m.type === "print" && m.text.includes(" has joined "), "buffer: pi joins");
 
   // --- question with a short timeout, never answered --------------------
   const outs = await mock.fire(

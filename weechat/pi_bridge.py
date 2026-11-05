@@ -147,6 +147,16 @@ C_ERR = _theme("chat_prefix_error", "yellow")       # errors
 C_OK = _theme("chat_status_enabled", "green")       # successes
 C_DIM = _theme("chat_host", "cyan")                  # hints / 💭 thinking lines
 C_REJECT = _color("red")                             # auth failures / security
+# Join/quit lifecycle lines. They follow the theme slots the IRC plugin colors
+# its own join/quit prefixes with: irc.color.message_join / message_quit live in
+# irc.conf, but weechat.color() cannot name a plugin color, so chat_prefix_join
+# and chat_prefix_quit are the reachable equivalent of them.
+C_JOIN = _theme("chat_prefix_join", "lightgreen")      # `-->` line: nick + text
+C_QUIT = _theme("chat_prefix_quit", "lightred")        # `<--` line: nick + text
+C_CHAN = _theme("chat_channel", "white")               # the `#channel` of a join
+# Quit reason text: irc.color.reason_quit defaults to a dark gray and has no slot
+# in weechat.conf, so this one role keeps a fixed palette color.
+C_QUIT_REASON = _color("darkgray")
 # Tool *output* body: own color, deliberately a fixed palette color (no
 # canonical WeeChat [color] slot for this role; theme-following risks
 # collapsing back onto chat_host/cyan and looking identical to thinking).
@@ -199,6 +209,38 @@ def _nick_color(nick):
     except Exception:
         name = ""
     return _color(name) or C_NICK
+
+def _lifecycle_prefix(kind):
+    """WeeChat's own join/quit prefix: color + glyph + TAB.
+
+    `kind` is "join" or "quit". `weechat.prefix()` returns exactly what the IRC
+    plugin puts in the prefix column (`-->\t` in chat_prefix_join), so printing
+    it in front of a body gives a script buffer the same column a real join or
+    quit line has. A missing lookup (older WeeChat, the test stubs, no WeeChat
+    at all) or a prefix the user switched off falls back to the literal glyphs.
+    The result always carries exactly one TAB, because WeeChat reads everything
+    before the first TAB as the line's prefix.
+    """
+    fallback = (C_JOIN + "-->") if kind == "join" else (C_QUIT + "<--")
+    if weechat is None:
+        return fallback + "\t"
+    try:
+        prefix = weechat.prefix(kind) or ""
+    except Exception:
+        prefix = ""
+    if not prefix.strip():
+        return fallback + "\t"
+    return prefix if "\t" in prefix else prefix + "\t"
+
+# Bracketed quit reasons, keyed by who closed the socket: `peer` hung up (the pi
+# side), `error` is a socket error in either direction, `bridge` means the bridge
+# closed a client it still owns (clearing tcp_listen while the script stays
+# loaded).
+QUIT_REASONS = {
+    "peer": "Client Quit",
+    "error": "Connection reset by peer",
+    "bridge": "Connection closed",
+}
 
 # --------------------------------------------- syntax highlighting (fences)
 
@@ -2154,11 +2196,58 @@ class Session(object):
         # will send a fresh Pi-owned snapshot after the next handshake.
         self.timing_snapshot = None
         self.timing_received_at = None
-    def handle_disconnect(self):
-        """The connection went away; the buffer stays open."""
+    # ------------------------------------------------- join / quit lifecycle
+    LIFECYCLE_NICK = "pi"     # the nick a lifecycle line reports
+
+    def channel_name(self):
+        """`#` + this buffer's name: the channel a lifecycle line names."""
+        name = ""
+        if self.alive and self.buffer:
+            try:
+                name = weechat.buffer_get_string(self.buffer, "name") or ""
+            except Exception:
+                name = ""
+        return "#%s" % (name or "pi")
+
+    def _print_lifecycle(self, kind, ip=None, reason=None):
+        """Print one join or quit line, shaped like the IRC plugin's own.
+
+        WeeChat's join/quit prefix (`-->\t`, `<--\t`) rides in front of the body,
+        so the line takes the prefix column instead of the nick column. The body
+        reads `pi (~pi@10.0.0.2) has joined #pi:~/src/project`: nick in the
+        join/quit color, hostmask in chat_host, channel in chat_channel. The tags
+        mirror the IRC plugin (`irc_join` / `irc_quit`, `nick_<nick>`,
+        `host_<nick>@<host>`) so filters see a real join, minus
+        `irc_smart_filter`, which would let WeeChat fold these lines away.
+        `notify_none` keeps them quiet: the turn-settle `[x] ready!` banner stays
+        the only notification. Nothing prints while the script unloads — those
+        buffers are on their way out.
+        """
+        if self.bridge.unloading or not (self.alive and self.buffer):
+            return
+        who = self.LIFECYCLE_NICK
+        host = ip or "localhost"          # a unix socket has no address
+        mask = "~%s@%s" % (who, host)
+        if kind == "join":
+            tag, color = "irc_join", C_JOIN
+            body = (color + who + C_DIM + " (%s)" % mask
+                    + color + " has joined " + C_CHAN + self.channel_name())
+        else:
+            tag, color = "irc_quit", C_QUIT
+            body = (color + who + C_DIM + " (%s)" % mask + color
+                    + " has quit " + C_QUIT_REASON
+                    + "(" + (reason or QUIT_REASONS["peer"]) + ")")
+        weechat.prnt_date_tags(
+            self.buffer, int(time.time()),
+            "%s,nick_%s,host_%s@%s,notify_none" % (tag, who, who, host),
+            _lifecycle_prefix(kind) + body)
+
+    def handle_disconnect(self, conn=None, reason="peer"):
+        """The connection went away; the buffer stays open and the nick quits."""
         self._reset_transient()
         self.set_state("waiting")
-        self._print(C_DIM + "— pi disconnected —%s" % R)
+        self._print_lifecycle("quit", (conn or {}).get("ip"),
+                              QUIT_REASONS.get(reason, QUIT_REASONS["peer"]))
     def handle_reattach(self):
         """A reconnecting session reattaches to this buffer (history kept).
         "Stale per-connection state is flushed; if the user closed the
@@ -2180,6 +2269,7 @@ class Session(object):
 
 class Bridge(object):
     def __init__(self):
+        self.unloading = False      # cleanup() sets it: quit lines stop printing
         self.sock_path = default_socket_path()
         # unix listener (always on)
         self.listen_sock = None
@@ -2472,10 +2562,10 @@ class Bridge(object):
         if not keep_conns:
             for conn in list(self.pending):
                 if conn.get("ip") is not None:
-                    self.drop_conn(conn)
+                    self.drop_conn(conn, "bridge")
             for conn in list(self.clients):
                 if conn.get("ip") is not None:
-                    self.drop_conn(conn)
+                    self.drop_conn(conn, "bridge")
 
     # --------------------------------------------------------------- accept
 
@@ -2601,7 +2691,7 @@ class Bridge(object):
                 break
             except OSError as err:
                 dbg("recv error: %s" % err)
-                self.drop_conn(conn)
+                self.drop_conn(conn, "error")
                 return
             if not chunk:  # peer closed (recv == 0) → disconnect
                 dbg("recv 0 bytes — %s closed, dropping" % conn["peer"])
@@ -2742,10 +2832,7 @@ class Bridge(object):
         self._send_to(conn, {"type": "hello", "protocol": PROTOCOL,
                              "name": "weechat-pi-bridge"})
         session.set_state("idle")
-        if conn["ip"] is not None:
-            session._print(C_OK + "— pi connected from %s —%s" % (conn["ip"], R))
-        else:
-            session._print(C_OK + "— pi connected —%s" % R)
+        session._print_lifecycle("join", conn["ip"])
         dbg("client authed: %s (session_id=%s, reattach=%s)"
             % (conn["peer"], session_id or "-", reattach))
 
@@ -2757,7 +2844,12 @@ class Bridge(object):
         dbg("auth timeout: dropping %s" % conn["peer"])
         self.drop_conn(conn)
 
-    def drop_conn(self, conn):
+    def drop_conn(self, conn, reason="peer"):
+        """Close a connection and let its session print the matching quit line.
+
+        `reason` keys QUIT_REASONS and says who closed the socket. A connection
+        that never authenticated owns no session, so it prints nothing.
+        """
         dbg("drop_conn %s (authed=%s)" % (conn.get("peer"), conn.get("authed")))
         self._unhook_timer(conn)
         self._close_sock(conn["sock"])
@@ -2773,7 +2865,7 @@ class Bridge(object):
         if session is not None:
             session.conn = None
             conn["session"] = None
-            session.handle_disconnect()
+            session.handle_disconnect(conn, reason)
 
     def _unhook_timer(self, conn):
         if conn.get("timer"):
@@ -2816,7 +2908,7 @@ class Bridge(object):
                 return
             except OSError as err:
                 dbg("flush: send error %s — dropping client" % err)
-                self.drop_conn(conn)
+                self.drop_conn(conn, "error")
                 return
             conn["outq"] = conn["outq"][n:]
         if conn["write_hook"]:
@@ -2833,11 +2925,12 @@ class Bridge(object):
     # -------------------------------------------------------------- cleanup
 
     def cleanup(self):
+        self.unloading = True   # the buffers leave with the script: print no quit lines
         self.stop_tcp_server()
         for conn in list(self.pending):
-            self.drop_conn(conn)
+            self.drop_conn(conn, "bridge")
         for conn in list(self.clients):
-            self.drop_conn(conn)
+            self.drop_conn(conn, "bridge")
         if self.listen_sock is not None:
             try:
                 self.listen_sock.close()
