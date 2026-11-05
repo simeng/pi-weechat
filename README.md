@@ -5,6 +5,7 @@ Mirror a [pi](https://pi.dev) coding agent session into a WeeChat buffer — and
 - **WeeChat side**: Python script that creates a `pi` buffer and serves an NDJSON protocol (the _server_): always on a Unix socket, optionally also on TCP with shared-secret auth.
 - **pi side**: TypeScript extension installed as a pi package; dials as _client_, mirrors assistant output / tool calls / status into the buffer, and forwards lines you type back to pi as user input.
 - **Nick column**: every pi-side line is printed under the nick that names _who_ spoke — tool calls under their own tool name (`read`, `bash`, `memory_search`), thinking under `think`, replies under `pi` — each colored by WeeChat's own per-nick color. `!nick pi` restores the single legacy `pi` nick.
+- **Join / quit lines**: pi joining and leaving reads like an IRC nick on a channel — `-->  pi (~pi@172.16.36.212) has joined #pi` when the extension connects, `<--  pi (~pi@172.16.36.212) has quit (Client Quit)` when the socket closes. The prefix is WeeChat's own join/quit prefix, and the hostmask names the real peer address (`~pi@localhost` on the local Unix socket).
 
 Architecture and wire protocol: [PLAN.md](./PLAN.md).
 
@@ -137,7 +138,7 @@ is **24**; `0` turns cleanup off and keeps every buffer:
 - The sweep runs **once an hour**, and once more the moment you `/set` the option
   (so a `/set` shows its effect at once, no reload, no waiting).
 - Idle time comes from the buffer's **last printed line**. No per-buffer timers and
-  no bookkeeping: a disconnect prints a line, so for a disconnected buffer the idle
+  no bookkeeping: a disconnect prints the quit line, so for a disconnected buffer the
   time is the time since that line.
 - A buffer whose pi connection is **alive** is never closed, however quiet pi is.
 - A buffer is also skipped when it is shown in a window (the bridge prints a hint
@@ -397,8 +398,8 @@ export PI_WEECHAT_TOKEN=<token>
 [pi-side config](#pi-side-config-pi-weechatjson)) — no shell exports to
 remember, and edits apply on `/reload`.
 
-Then (re)start or `/reload` the pi session. The buffer on A shows
-`— pi connected from <B-ip> —`.
+Then (re)start or `/reload` the pi session. Buffer A prints
+`pi (~pi@<B-ip>) has joined #pi`.
 
 ### Caveats
 

@@ -43,7 +43,7 @@ test("integration: ask_user_question questions[] → WeeChat !pick", async (t) =
   const mock = makePiMock(MOCK_CTX, MOCK_TOOLS);
   await loadExtension(mock);
   await mock.fire("session_start");
-  await wc.waitFor((m) => m.type === "print" && m.text.includes("pi connected"), "buffer: pi connected");
+  await wc.waitFor((m) => m.type === "print" && m.text.includes(" has joined "), "buffer: pi joins");
 
   assert.equal(
     mock.registeredTools["ask_user"],

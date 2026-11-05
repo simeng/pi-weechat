@@ -79,7 +79,7 @@ class WeechatStub:
                 "yellow": "E", "green": "G", "red": "r", "236": "D",
                 # syntax-highlight palette (HL_TOKENS) + reset marker
                 "reset": "\x1c", "bold magenta": "K", "darkgray": "d",
-                "lightblue": "L", "lightgreen": "g",
+                "lightblue": "L", "lightgreen": "g", "lightred": "R",
                 # text attributes: exactly the codes real WeeChat 4.10.1
                 # returns (probed), which the TUI and relay clients decode
                 "bold": "\x1a\x01", "italic": "\x1a\x03",
@@ -538,7 +538,15 @@ def main():
     pump_and_drain(client)
     hello = json.loads(recv_lines.pop(0))
     assert hello["type"] == "hello" and hello["protocol"] == ns["PROTOCOL"], hello
-    assert "pi connected" in buffer_text(stub)
+    # an accepted hello reads as a nick joining the buffer's channel: WeeChat's
+    # join prefix in the prefix column, hostmask and channel in the body
+    join_rows = [(tg, p, b) for tg, p, b in stub.printf_tags if "irc_join" in tg]
+    assert len(join_rows) == 1, \
+        "only an authed client joins (handshake rejections joined nothing): %r" % (join_rows,)
+    tags, prefix, body = join_rows[0]
+    assert tags == "irc_join,nick_pi,host_pi@localhost,notify_none", tags
+    assert prefix == "g-->", prefix         # chat_prefix_join fallback; TAB splits it
+    assert body.startswith("gpiC (~pi@localhost)g has joined W#pi"), body
 
     # pi → weechat: mirror output into the buffer
     send({"type": "session_info", "cwd": "/home/x/proj", "model": "prov/model-a"})
@@ -981,7 +989,10 @@ def main():
     # assistant prose/fences → `pi`, tool lines + their output → the tool
     # name, thinking → `think`
     def nick_rows(tag):
-        return [(p, b) for tags, p, b in stub.printf_tags if tag in tags]
+        # the nick-column rows only: a lifecycle line also names `pi` (in its
+        # irc_join/irc_quit tags) but puts the join/quit prefix in the column
+        return [(p, b) for tags, p, b in stub.printf_tags
+                if tag in tags and "prefix_nick" in tags]
 
     pi_rows = nick_rows("nick_pi")
     assert pi_rows and all("pi" in p for p, _ in pi_rows), \
@@ -1977,6 +1988,7 @@ def main():
     assert not any("stranded by disconnect" in t for k, t in stub.prints), \
         "the block is still pending while the connection is up"
 
+    quit_seen_before = len(stub.printf_tags)
     client.close()
     stub.pump(0.3)
     assert "waiting for pi" in (stub.title or ""), stub.title
@@ -1987,6 +1999,14 @@ def main():
         "disconnect resets the block accumulator"
     assert SESSION.tool_nicks == {}, "disconnect must clear the toolCallId→nick map"
     assert SESSION.timing_snapshot is None, "disconnect must discard the stale snapshot"
+
+    # a peer-closed connection reads as the nick leaving the channel, with the
+    # reason WeeChat shows for a client that hung up
+    quit_rows = [(tg, p, b) for tg, p, b in stub.printf_tags[quit_seen_before:]
+                 if "irc_quit" in tg]
+    assert quit_rows == [("irc_quit,nick_pi,host_pi@localhost,notify_none",
+                          "R<--",
+                          "RpiC (~pi@localhost)R has quit d(Client Quit)")], quit_rows
 
     # ==================================================================
     # Phase D — TCP listener
@@ -2040,8 +2060,11 @@ def main():
     hello = json.loads(lines[0])
     assert hello["type"] == "hello" and hello["protocol"] == ns["PROTOCOL"], \
         "server hello only after a valid proof"
-    assert "pi connected from 127.0.0.1" in buffer_text(stub), \
-        "connect line names the TCP peer IP"
+    tcp_join = [b for tg, p, b in stub.printf_tags
+                if tg == "irc_join,nick_pi,host_pi@127.0.0.1,notify_none"]
+    assert tcp_join and "(~pi@127.0.0.1)" in tcp_join[-1] \
+        and " has joined " in tcp_join[-1], \
+        "join line names the TCP peer address"
 
     # ping/pong proves the dispatch path is live over TCP
     send_line(tc, {"type": "ping", "ts": 7})

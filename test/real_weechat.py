@@ -43,7 +43,7 @@ weechat.register("nick_capture", "tor", "1.0", "MIT", "capture", "", "")
 
 def on_print(*args):
     """WeeChat 4.10 hands hook_print eight arguments:
-    (pointer, buffer, date, tags, notification, ?, prefix, message)."""
+    (pointer, buffer, date, tags, print_buffer, notification, prefix, message)."""
     try:
         buffer = weechat.buffer_get_string(args[1], "full_name")
     except Exception:
@@ -53,6 +53,7 @@ def on_print(*args):
             f.write(json.dumps({
                 "buffer": buffer,
                 "tags": args[3] or "",
+                "notification": args[5] if len(args) >= 8 else None,
                 "prefix": weechat.string_remove_color(args[-2], "") if len(args) >= 8 else "",
                 "prefix_raw": args[-2] if len(args) >= 8 else "",
                 "message": weechat.string_remove_color(args[-1], ""),
@@ -152,6 +153,7 @@ def run_weechat(root: str, seed_conf: str | None,
         send({"type": "assistant_line", "msgId": 4, "text": "Bye."})
         time.sleep(1.5)
         c.close()
+        time.sleep(1.0)   # WeeChat must read the EOF and print the quit line first
         os.kill(proc.pid, signal.SIGTERM)
         try:
             proc.wait(timeout=15)
@@ -303,6 +305,11 @@ def run_autoclean(seed_conf: str | None, clean_values: tuple[str, ...],
 def has_nick(row: dict, nick: str) -> bool:
     return "nick_" + nick in row["tags"].split(",")
 
+def is_lifecycle(row: dict) -> bool:
+    """A join or quit line: its prefix is WeeChat's join/quit glyph, not a nick."""
+    tags = row["tags"].split(",")
+    return "irc_join" in tags or "irc_quit" in tags
+
 
 def check(label: str, ok: bool) -> bool:
     print(("PASS  " if ok else "FAIL  ") + label)
@@ -342,7 +349,8 @@ def main() -> int:
         results.append(check("auto mode drops the tool name from the body",
                              not any("⚙ read" in r["message"] or "⚙ bash" in r["message"] for r in pi)))
         results.append(check("status lines keep no nick",
-                             any(r["prefix"] == "" and "connected" in r["message"] for r in pi)))
+                             any(r["prefix"] == "" and "session: /tmp/proj" in r["message"]
+                                 for r in pi)))
         results.append(check("nick tags are nick_<name> + prefix_nick_chat_nick",
                              all(r["tags"] == "notify_none,nick_read,prefix_nick_chat_nick" for r in read)))
         results.append(check("nick column carries an inline color (tags alone do not color it)",
@@ -351,6 +359,27 @@ def main() -> int:
                              read[0]["prefix_raw"] != bash[0]["prefix_raw"]))
         results.append(check("WeeChat resolves a color for every nick we print",
                              all(colors.get(n) for n in ("pi", "read", "bash", "think", "memory_search"))))
+
+        joins = [r for r in pi if "irc_join" in r["tags"].split(",")]
+        quits = [r for r in pi if "irc_quit" in r["tags"].split(",")]
+        results.append(check("one join on hello, one quit when the peer closes",
+                             len(joins) == 1 and len(quits) == 1))
+        if joins and quits:
+            j, q = joins[0], quits[0]
+            results.append(check("join/quit lines store WeeChat's own join/quit prefixes",
+                                 j["prefix"] == "-->" and q["prefix"] == "<--"))
+            results.append(check("join tags are irc_join + nick_pi + host_pi@<host> + notify_none",
+                                 j["tags"] == "irc_join,nick_pi,host_pi@localhost,notify_none"))
+            results.append(check("join body reads as the pi nick joining the buffer's channel",
+                                 j["message"] == "pi (~pi@localhost) has joined #pi"))
+            results.append(check("quit body gives the reason for a peer hang-up",
+                                 q["message"].endswith("has quit (Client Quit)")))
+            results.append(check("lifecycle lines take no smart filter and notify nothing",
+                                 all("irc_smart_filter" not in r["tags"] and not r["notification"]
+                                     for r in (j, q))))
+        results.append(check("no line reads like the old connected / disconnected notice",
+                             not any("pi connected" in r["message"]
+                                     or "pi disconnected" in r["message"] for r in pi)))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -390,8 +419,9 @@ def main() -> int:
                              any(has_nick(r, "read") for r in before)))
         results.append(check("after the switch: no per-tool nick tags",
                              not any(has_nick(r, "grep") or has_nick(r, "read") for r in after)))
-        results.append(check("after the switch: everything under the single nick pi",
-                             all("pi" in r["prefix_raw"] for r in after if r["prefix_raw"])))
+        results.append(check("after the switch: every nick line is under the single nick pi",
+                             all("pi" in r["prefix_raw"] for r in after
+                                 if r["prefix_raw"] and not is_lifecycle(r))))
         results.append(check("after the switch: tool name back in the body",
                              any("⚙ grep" in r["message"] for r in after)))
     finally:
